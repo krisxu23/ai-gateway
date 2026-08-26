@@ -519,7 +519,28 @@ function modelPanelHeading(panelId) {
   return '<div class="panel-heading"><div>' +
     '<span class="panel-heading__mark"><i class="fas fa-cube" aria-hidden="true"></i></span>' +
     '<div><h3>可用模型</h3><p>点击“+”添加到配置。</p></div></div>' +
+    '<button class="btn btn-gh" type="button" onclick="addAllUpstream(\\'' + panelId + '\\')" title="把列表内全部模型合并进配置并立即保存">全部入库并保存</button>' +
     '<button class="icon-btn" type="button" onclick="hideMdlPanel(\\'' + panelId + '\\')" title="关闭可用模型" aria-label="关闭可用模型"><i class="fas fa-times" aria-hidden="true"></i></button></div>'
+}
+
+// 把当前发现列表里的全部模型合并进提供商配置（去重）并立即保存。
+async function addAllUpstream(panelId) {
+  const id = panelId.replace(/^mel-/, '')
+  if (!document.getElementById('ml-' + id)) { toast('该面板不支持一键入库', 'error'); return }
+  const grid = document.getElementById('melc-' + id)
+  if (!grid) { toast('请先点击「测试」拉取可用模型', 'error'); return }
+  const ids = Array.from(grid.querySelectorAll('.mdl-item .fx1'))
+    .map(s => s.textContent.trim()).filter(Boolean)
+  if (!ids.length) { toast('发现列表为空', 'error'); return }
+  const existing = {}
+  getMdl(id).forEach(m => { existing[m.id] = true })
+  let added = 0
+  ids.forEach(mid => {
+    if (!existing[mid]) { addMdlToEdit(id, mid); added++ }
+  })
+  if (!added) { toast('列表内模型均已存在，无需入库', 'error'); return }
+  toast('已加入 ' + added + ' 个模型，正在保存…')
+  await save(id)
 }
 
 // 关闭可用模型面板（仅隐藏，不清空已获取的模型数据）
@@ -730,9 +751,35 @@ function addMdl(id) {
   d.dataset.idx = cnt
   d.innerHTML = '<input type="text" value="' + escapeHtml(mid) + '" class="fx1" id="mid-' + escapeHtml(id) + '-' + cnt + '" placeholder="模型 ID"><label class="tg"><input type="checkbox" checked id="men-' + escapeHtml(id) + '-' + cnt + '"><span class="sl"></span></label><button class="icon-btn" onclick="copyRowVal(this)" title="复制模型 ID" aria-label="复制模型 ID"><i class="far fa-copy"></i></button><button class="icon-btn" id="tm-' + escapeHtml(id) + '-' + cnt + '" title="测试模型" aria-label="测试模型"><i class="fas fa-plug"></i></button><button class="icon-btn" id="rm-' + escapeHtml(id) + '-' + cnt + '" title="移除模型" aria-label="移除模型"><i class="fas fa-times"></i></button>'
   c.appendChild(d)
-  document.getElementById('tm-' + id + '-' + cnt).addEventListener('click', function() { testMdl(id, mid, cnt) })
+  // 新增行尚未保存进 KV：测试按钮走直连实测（/admin/api/test-model），
+  // 不再依赖服务端已保存配置，消灭“添加后立即测试报不存在”。
+  document.getElementById('tm-' + id + '-' + cnt).addEventListener('click', function() { testMdlDirect(id, mid) })
   document.getElementById('rm-' + id + '-' + cnt).addEventListener('click', function() { rmMdl(id, cnt) })
   inp.value = ''
+}
+
+// 直连实测：用当前表单里的地址与 Key 直接调用上游，不经已保存配置校验。
+async function testMdlDirect(id, mid) {
+  const tr = document.getElementById('tr-' + id)
+  showSpinner(tr)
+  const url = document.getElementById('url-' + id).value.trim()
+  if (!url) { showResult(tr, false, '请先填写 API 地址'); return }
+  const apiType = document.getElementById('at-' + id).value
+  const keys = getKeys(id)
+  const apiKey = keys.length > 0 ? keys[0].key : ''
+  try {
+    const r = await fetch('/admin/api/test-model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url, apiKey: apiKey, apiType: apiType, model: mid, providerId: id })
+    })
+    const d = await r.json()
+    if (d.success && d.data) {
+      showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || ('HTTP ' + d.data.statusCode)))
+    } else {
+      showResult(tr, false, d.message || '测试失败')
+    }
+  } catch (e) { showResult(tr, false, '请求失败') }
 }
 
 function rmMdl(id, idx) {
@@ -753,7 +800,12 @@ async function testMdl(id, mid, idx) {
     })
     const d = await r.json()
     if (d.success && d.data) {
-      showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'))
+      if (d.data.success && d.data.message) {
+        // 后端降级直测时会附带“尚未保存”提醒，成功态也要展示出来。
+        tr.innerHTML = '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功 <span class="mu">' + escapeHtml(d.data.message) + '</span></div>'
+      } else {
+        showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'))
+      }
     } else {
       showResult(tr, false, d.message || '测试失败')
     }

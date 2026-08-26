@@ -157,7 +157,22 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
 
   const modelConfig = provider.models.find((m) => m.id === modelId)
   if (!modelConfig) {
-    return c.json<ApiResponse>({ success: false, message: `模型 "${modelId}" 不存在于提供商 "${provider.name}"` }, 404)
+    // 模型尚未保存进配置：不再报“不存在”，降级为对该提供商 baseUrl 的直连实测，
+    // 让“先加行再测试”的工作流不被 KV 保存状态卡住（结果中附提醒）。
+    const enabledKeysEarly = provider.apiKeys.filter(k => k.enabled)
+    if (!isOpenCodeProvider(provider.id) && enabledKeysEarly.length === 0) {
+      return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
+    }
+    const fallbackResult = isOpenCodeProvider(provider.id)
+      ? await testOpenCodeModel(provider.baseUrl, enabledKeysEarly, modelId, resolveOpenCodeUrls(c.env))
+      : await testModelConnection(provider.baseUrl, enabledKeysEarly[0].key, modelId, provider.apiType)
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        ...fallbackResult,
+        message: `${fallbackResult.message ? fallbackResult.message + '；' : ''}提示：该模型尚未保存到提供商配置，点「保存」后才会生效`,
+      },
+    })
   }
 
   const enabledKeys = provider.apiKeys.filter(k => k.enabled)
