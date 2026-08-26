@@ -72,7 +72,9 @@ export async function testModelConnection(
       body: JSON.stringify({
         model: modelId,
         messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
+        // 思考型模型会把极小的 token 预算全部花在推理上，导致正文为空、
+        // 上游网关报 empty response content；64 足以产出可判定内容。
+        max_tokens: 64,
       }),
       signal: AbortSignal.timeout(15000),
     })

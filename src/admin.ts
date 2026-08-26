@@ -284,7 +284,7 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
     const response = await fetch(`${cleanBase}/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...buildAuthHeaders(apiKey, apiType) },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 64 }),
       signal: AbortSignal.timeout(15000),
     })
 
