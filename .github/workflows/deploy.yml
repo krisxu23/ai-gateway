@@ -28,17 +28,35 @@ jobs:
         run: npm ci
 
       - name: Generate wrangler.toml with admin credentials
+        env:
+          ADMIN_USERNAME_VAR: ${{ vars.ADMIN_USERNAME }}
+          ADMIN_PASSWORD_SECRET: ${{ secrets.ADMIN_PASSWORD }}
+          EXTRA_URLS: ${{ vars.OPENCODE_MIRRORS_URL }}
+          CF_TOKEN_PRESET: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_PRESET: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
+          # 缺凭据时给出可操作的中文指引，而不是让 wrangler 报 TOML 天书错
+          if [ -z "$CF_TOKEN_PRESET" ] || [ -z "$CF_ACCOUNT_PRESET" ]; then
+            echo "::error::缺少部署凭据：请在仓库 Settings → Secrets and variables → Actions 新增两个 Secrets：「CF_API_TOKEN」（Cloudflare API Token，权限需含 Workers Scripts:Edit）和「CF_ACCOUNT_ID」（账户 ID）"
+            exit 1
+          fi
+          if [ -z "$ADMIN_PASSWORD_SECRET" ]; then
+            echo "::error::缺少后台登录密码：请新增 Secret「ADMIN_PASSWORD」；（可选）Var「ADMIN_USERNAME」不配则默认 admin"
+            exit 1
+          fi
+          if [ -z "$ADMIN_USERNAME_VAR" ]; then ADMIN_USERNAME_VAR="admin"; fi
           DEFAULT_URLS=(
             "https://opencode.ai.cmliussss.net/zen/v1"
             "https://opencode.fastly.cmliussss.net/zen/v1"
             "https://opencode.gcore.cmliussss.net/zen/v1"
           )
-          MIRRORS_URL=$(printf '%s\\n' "${DEFAULT_URLS[@]}" | sed '$s/\\n$//')
-          EXTRA_URLS="${{ vars.OPENCODE_MIRRORS_URL }}"
-          if [ -n "$EXTRA_URLS" ]; then
-            MIRRORS_URL="${MIRRORS_URL}\n${EXTRA_URLS}"
-          fi
+          MIRRORS_URL=$(IFS=','; echo "${DEFAULT_URLS[*]}")
+          if [ -n "$EXTRA_URLS" ]; then MIRRORS_URL="$MIRRORS_URL,$EXTRA_URLS"; fi
+          # 转义 TOML 基本字符串中的反斜杠与双引号
+          esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+          USER_TOML=$(esc "$ADMIN_USERNAME_VAR")
+          PASS_TOML=$(esc "$ADMIN_PASSWORD_SECRET")
+          MIRRORS_TOML=$(esc "$MIRRORS_URL")
           cat > wrangler.toml << EOF
           name = "ai-gateway"
           main = "src/index.ts"
@@ -50,9 +68,9 @@ jobs:
           binding = "KV"
 
           [vars]
-          ADMIN_USERNAME = ${{ vars.ADMIN_USERNAME }}
-          ADMIN_PASSWORD = ${{ vars.ADMIN_PASSWORD }}
-          OPENCODE_MIRRORS_URL = "${MIRRORS_URL}"
+          ADMIN_USERNAME = "$USER_TOML"
+          ADMIN_PASSWORD = "$PASS_TOML"
+          OPENCODE_MIRRORS_URL = "${MIRRORS_TOML}"
           EOF
 
       - name: Build (dry-run)
