@@ -3,7 +3,7 @@ import type { ApiKeyEntry, Env } from './types'
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.17.8'
-const OPENCODE_TIMEOUT_MS = 60000
+const OPENCODE_TIMEOUT_MS = 300000
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -123,12 +123,24 @@ async function requestUpstream(
   requestId: string,
   sessionId: string
 ): Promise<Response> {
-  return fetcher(url, {
-    method: options.method,
-    headers: createRequestHeaders(apiKey, requestId, sessionId),
-    body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
-    signal: AbortSignal.timeout(OPENCODE_TIMEOUT_MS),
-  })
+  // 超时只约束"等待响应头"阶段；headers 到手后立即取消计时，body 流式
+  // 消费不再受硬顶限制——长回答不会在流中途被掐断（客户端侧的空闲
+  // 超时/取消自然兜底）。
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(new Error(`OpenCode 上游 ${OPENCODE_TIMEOUT_MS / 1000}s 内未返回响应头`)),
+    OPENCODE_TIMEOUT_MS
+  )
+  try {
+    return await fetcher(url, {
+      method: options.method,
+      headers: createRequestHeaders(apiKey, requestId, sessionId),
+      body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Promise<Response> {
