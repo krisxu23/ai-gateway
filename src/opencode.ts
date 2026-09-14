@@ -1,4 +1,10 @@
 import type { ApiKeyEntry, Env } from './types'
+import {
+  chatBodyToResponsesBody,
+  createResponsesToChatStream,
+  responsesToChatBody,
+  zenModelNeedsResponses,
+} from './opencode-responses'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
@@ -15,6 +21,8 @@ interface OpenCodeRequestOptions {
   body?: string
   fetcher?: typeof fetch
   random?: () => number
+  /** Responses 专用模型: 额外透传 x-opencode-model 头(内容为 zen 模型 ID) */
+  modelHeader?: string
 }
 
 interface StoredFailure {
@@ -132,9 +140,11 @@ async function requestUpstream(
     OPENCODE_TIMEOUT_MS
   )
   try {
+    const headers = createRequestHeaders(apiKey, requestId, sessionId)
+    if (options.modelHeader) headers.set('x-opencode-model', options.modelHeader)
     return await fetcher(url, {
       method: options.method,
-      headers: createRequestHeaders(apiKey, requestId, sessionId),
+      headers,
       body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
       signal: controller.signal,
     })
@@ -144,6 +154,53 @@ async function requestUpstream(
 }
 
 export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Promise<Response> {
+  // zen 的 muse-*-free 家族只在上游 /responses 端点提供服务, chat/completions
+  // 对它们崩成 500。这里把请求改写为 Responses 形态并把响应翻译回 chat 格式,
+  // 对调用方(代理路径与连通性测试)完全透明。
+  if (options.method === 'POST' && /(?:^|\/)chat\/completions$/.test(options.subPath) && options.body) {
+    try {
+      const parsed = JSON.parse(options.body) as Record<string, unknown>
+      const model = typeof parsed.model === 'string' ? parsed.model : ''
+      if (model && zenModelNeedsResponses(model)) {
+        return await proxyOpenCodeResponses(options, parsed, model)
+      }
+    } catch {
+      // body 不是合法 JSON: 按原样透传, 由上游给出错误
+    }
+  }
+  return proxyOpenCodeUpstream(options)
+}
+
+async function proxyOpenCodeResponses(
+  options: OpenCodeRequestOptions,
+  chatBody: Record<string, unknown>,
+  model: string
+): Promise<Response> {
+  const response = await proxyOpenCodeUpstream({
+    ...options,
+    subPath: options.subPath.replace(/chat\/completions$/, 'responses'),
+    body: JSON.stringify(chatBodyToResponsesBody(chatBody)),
+    modelHeader: model,
+  })
+  if (!response.ok) return response
+
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('text/event-stream') && response.body) {
+    return new Response(response.body.pipeThrough(createResponsesToChatStream(model)), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+  }
+  const data = await response.json() as Record<string, unknown>
+  return new Response(JSON.stringify(responsesToChatBody(data)), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<Response> {
   const fetcher = options.fetcher ?? fetch
   const random = options.random ?? Math.random
   const requestId = createOpenCodeId('msg')
