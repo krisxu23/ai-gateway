@@ -46,8 +46,10 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
   if (chat.top_p !== undefined) out.top_p = chat.top_p
   for (const key of ['max_tokens', 'max_completion_tokens'] as const) {
     if (chat[key] !== undefined) {
-      const n = Number(chat[key])
-      if (Number.isFinite(n) && n > 0) out.max_output_tokens = Math.floor(n)
+      const n = Math.floor(Number(chat[key]))
+      // Responses 端点要求 max_output_tokens >= 16: 推理模型低于 16 的预算
+      // 没有意义, 上游直接 400 invalid_request_error, 这里钳到下限。
+      if (Number.isFinite(n) && n > 0) out.max_output_tokens = Math.max(n, 16)
       break
     }
   }
