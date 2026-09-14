@@ -36,6 +36,18 @@ function contentText(content: unknown): string {
   return ''
 }
 
+const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh']
+
+// normalizeReasoningEffort 把客户端的 reasoning_effort 归一为 Responses 的
+// reasoning.effort; 未指定或非法时默认 low。
+// 原因: 上游默认 effort=high, 对简单提问也会把 max_output_tokens 全烧在推理上
+// (实测 800 预算正文为空), 客户端会以为模型坏了。low 能显著缩小推理占用,
+// 同样是 800 预算即可拿到正文(实测 455 tokens 出答案)。
+export function normalizeReasoningEffort(value: unknown): string {
+  const s = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return REASONING_EFFORTS.includes(s) ? s : 'low'
+}
+
 // ============ 请求转换: OpenAI chat -> Responses ============
 
 export function chatBodyToResponsesBody(chat: Rec): Rec {
@@ -120,6 +132,8 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
   } else if (typeof chat.tool_choice === 'string') {
     out.tool_choice = chat.tool_choice
   }
+  // 推理强度: 尊重客户端的 reasoning_effort(两种写法), 未指定时默认 low
+  out.reasoning = { effort: normalizeReasoningEffort(chat.reasoning_effort ?? chat.reasoningEffort) }
   return out
 }
 

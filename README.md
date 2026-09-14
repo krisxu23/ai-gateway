@@ -89,7 +89,7 @@ npm run dev
 
 OpenCode 默认不需要上游 Key。若在管理后台为 OpenCode 添加 Key，请求会先访问后台配置的官方 API 地址；未成功时再从随机起点依次尝试镜像地址，并使用内置的 `Bearer public`。镜像地址列表通过环境变量 `OPENCODE_MIRRORS_URL` 配置（多行，每行一个 URL），部署脚本默认写入三个公共镜像。用户可在 GitHub Actions Variables 中设置同名变量追加额外地址（全局去重）。已有 KV 数据不会被删除，升级时仅在缺少 OpenCode 的情况下补充该默认提供商。
 
-> **muse 系列模型说明**：`muse-*` 家族免费模型（如 `opencode/muse-spark-1.3-contributor-free`）在上游只提供 OpenAI **Responses** 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关已内置自动转换：该家族模型的请求自动改走上游 `/responses` 端点，响应（含流式）翻译回标准 chat 格式，照常调用即可，无需任何额外配置。注意这是推理型模型，`max_tokens` 建议给足（1000+），否则推理耗尽预算后正文为空；免费档有动态限额，遇 429 等待限额窗口刷新即可。
+> **muse 系列模型说明**：`muse-*` 家族免费模型（如 `opencode/muse-spark-1.3-contributor-free`）在上游只提供 OpenAI **Responses** 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关已内置自动转换：该家族模型的请求自动改走上游 `/responses` 端点，响应（含流式）翻译回标准 chat 格式，照常调用即可，无需任何额外配置。翻译时 `max_tokens` 会补足上游下限（<16 会被拒），推理强度默认降到 `low`（可用 `reasoning_effort` 覆盖为 minimal/low/medium/high/xhigh）；这是推理型模型，effort 不压低时容易把预算全花在思考上导致正文为空，建议 `max_tokens` 给到 512 以上。免费档有动态限额，遇 429 等待限额窗口刷新即可。
 
 ## 项目结构
 
