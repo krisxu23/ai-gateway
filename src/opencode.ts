@@ -8,7 +8,7 @@ import {
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
-const OPENCODE_VERSION = '1.17.8'
+const OPENCODE_VERSION = '1.19.0'
 const OPENCODE_TIMEOUT_MS = 300000
 
 interface OpenCodeRequestOptions {
@@ -71,17 +71,28 @@ function buildUrl(baseUrl: string, subPath: string, search = ''): string {
   return `${baseUrl.replace(/\/+$/, '')}/${subPath.replace(/^\/+/, '')}${search}`
 }
 
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+function randomHex(bytes: number): string {
+  const arr = new Uint8Array(bytes)
+  crypto.getRandomValues(arr)
+  return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function randomBase62(length: number): string {
+  const arr = new Uint8Array(length)
+  crypto.getRandomValues(arr)
+  return Array.from(arr, (b) => BASE62_ALPHABET[b % 62]).join('')
+}
+
+/**
+ * 官方 opencode session 形态: ses_ + 12位小写hex + 14位base62
+ * (上游按 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ 校验)。
+ * request id 用 req_ + 32位hex。
+ */
 function createOpenCodeId(prefix: string): string {
-  const bytes = new Uint8Array(12)
-  crypto.getRandomValues(bytes)
-  let binary = ''
-  for (const byte of bytes) binary += String.fromCharCode(byte)
-  const random = btoa(binary)
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '')
-    .slice(0, 16)
-  return `${prefix}_${Date.now().toString(16)}${random}`
+  if (prefix === 'ses') return `ses_${randomHex(6)}${randomBase62(14)}`
+  return `${prefix}_${randomHex(16)}`
 }
 
 function createRequestHeaders(apiKey: string, requestId: string, sessionId: string): Headers {
@@ -93,6 +104,8 @@ function createRequestHeaders(apiKey: string, requestId: string, sessionId: stri
     'x-opencode-project': 'global',
     'x-opencode-request': requestId,
     'x-opencode-session': sessionId,
+    'x-session-affinity': sessionId,
+    'X-Session-Id': sessionId,
   })
 }
 
@@ -203,7 +216,7 @@ async function proxyOpenCodeResponses(
 async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<Response> {
   const fetcher = options.fetcher ?? fetch
   const random = options.random ?? Math.random
-  const requestId = createOpenCodeId('msg')
+  const requestId = createOpenCodeId('req')
   const sessionId = createOpenCodeId('ses')
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
