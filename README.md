@@ -1,23 +1,44 @@
 # AI Gateway
 
-基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关，统一 `/v1` 接口转发，支持多 Key 轮询、健康检查与自动故障转移。
+基于 Cloudflare Workers + Hono 的 AI 提供商 API 代理网关：统一 `/v1` 接口，兼容 OpenAI / Anthropic 协议，支持多 Key 轮询、健康检查与自动故障转移。开箱即用 OpenCode 免费通道（含完整官方客户端伪装）。
 
 ## 功能与特性
 
-- **统一 API 接口** — 所有 AI 提供商通过 `https://你的域名/v1` 访问，兼容 OpenAI / Anthropic 协议
-- **多 Key 轮询 + 健康检查** — 每个提供商可配置多个 API Key，请求随机打乱；失败 Key 自动降权，连续失败 5 次后进入冷却
-- **Key 自动恢复** — 降权 Key 冷却 5 分钟后自动获得一次试用机会，成功则恢复权重，失败则重新冷却
-- **OpenCode 默认接入** — 默认启用 4 个免费模型，无需配置上游 API Key
-- **OpenCode 自动故障转移** — 配置 Key 时优先官方 API，失败后使用公共镜像；无 Key 时直接使用公共镜像
-- **多提供商管理** — 默认仅创建 OpenCode，支持自定义添加其他 OpenAI / Anthropic 兼容提供商
-- **OpenCode 创建智能填充** — 创建提供商时 ID 输入 `opencode` 自动填充官方 API 地址，API Key 可留空，空 Key 测试时自动走镜像获取可用模型（仅显示 `-free` 和 `big-pickle` 模型）
-- **OpenCode 编辑获取模型** — 编辑页可直接从镜像/官方获取模型列表，一键添加到表单
+- **统一 API 接口** — 所有提供商通过 `https://你的域名/v1` 访问，模型 ID 格式为 `提供商ID/模型ID`
+- **OpenCode 免费通道** — 默认启用，无需配置上游 Key；转发时自动完成官方客户端指纹伪装（见下）
+- **Free-lane Body Gate** — 上游匿名通道要求 `stream:true` 且 body 带 `bash`/`read` 工具，网关自动满足；`stream:false` 的客户端自动收流转 JSON，契约不断
+- **Responses 自动转换** — `muse-*` 免费家族只在上游 `/responses` 端点提供服务，网关自动改写请求并把响应（含流式）翻译回 chat 格式，调用方无感
+- **桩调用吞噬** — 模型误调网关注入的桩工具时，该调用不回传给客户端，避免空参数工具调用被执行
+- **多镜像故障转移** — 官方地址失败后按随机起点轮询镜像（`OPENCODE_MIRRORS_URL` 配置）；可按 [`opencode-cdn.md`](./opencode-cdn.md) 自建镜像
+- **多 Key 轮询 + 健康检查** — 每个提供商可配多个 Key，请求随机打乱；失败 Key 自动降权，连续失败 5 次后冷却 5 分钟，冷却到期自动试用恢复
 - **两级启用控制** — 提供商级别 + 模型级别的启用/禁用
 - **转发 Key 认证** — 生成 `sk_cf_*` 格式的 API Key，支持有效期管理
-- **模型连接测试** — 管理后台手动测试模型是否可连接（通过服务端代理，无跨域限制）
+- **模型连接测试** — 管理后台手动测试模型连通性（经服务端代理，无跨域限制）
 - **管理后台** — 卡片式 UI，移动端自适应，无需前端构建
 
-**如需看板及token使用统计功能，可以使用此 Fork 版：[DuoJLa/ai-gateway](https://github.com/DuoJLa/ai-gateway)**
+**如需看板及 token 使用统计功能，可以使用此 Fork 版：[DuoJLa/ai-gateway](https://github.com/DuoJLa/ai-gateway)**
+
+## OpenCode 免费通道原理
+
+上游 Zen 免费档只认官方 OpenCode 客户端：请求头、UA、body 形态缺一即 403 / FreeTierError。网关在转发时自动完成全套伪装，调用方按普通 OpenAI 客户端使用即可：
+
+| 层 | 做法 |
+|---|---|
+| 请求头 | `User-Agent: opencode/1.19.0`（裸 UA，版本须 ≥ 1.18.0 否则 426）；`x-opencode-client` / `x-opencode-session` / `x-opencode-request` / `x-opencode-project`；`x-session-affinity` / `X-Session-Id`；`Authorization: Bearer public` |
+| Session | `ses_` + 12 位小写 hex + 14 位 base62（官方格式）；同一会话确定性派生——优先复用客户端透传的会话头，否则按首条 user 消息哈希；request ID 用 `msg_` + 32 位 hex，每请求随机 |
+| Body 门禁 | 强制上游 `stream:true`；缺 `bash`/`read` 时注入桩 function tools（chat 路径在客户端无 tools 时补 `tool_choice:"none"`；responses 路径只认 `"auto"`，统一归一） |
+| 非流式兼容 | 客户端 `stream:false` 时，网关把上游 SSE 拼回单个 `chat.completion` JSON |
+| Responses 家族 | `muse-*-free` 在上游只提供 Responses 接口（走 chat 会 500），网关自动改写为 `/responses` 请求并双向翻译；`max_tokens` 自动补足上游下限 16；`reasoning_effort` 默认 `low`（可用 `reasoning_effort` 覆盖 minimal/low/medium/high/xhigh） |
+
+> 上游模型阵容经常变动（有模型会下线），可在管理后台从镜像/官方拉取最新模型列表一键添加。2026-10 已验证可用的免费模型：`mimo-v2.6-flash-free`、`step-5-preview-free`、`muse-spark-1.3-contributor-free`、`space-bunny-free`。
+>
+> 推理型模型注意：`max_tokens` 给太小（如个位数）时预算会被推理全吃掉导致正文为空，建议给到 512 以上。
+
+### 镜像与额度
+
+请求顺序：已配置的上游 Key（走官方地址）→ 失败（401/403/429/网络错误/超时）→ 按随机起点依次尝试 `OPENCODE_MIRRORS_URL` 中的镜像。镜像是到同一上游的不同反代，作用是**故障转移 + 换出口**。
+
+额度说明：Zen 免费档按**出口 IP** 计额度，不看 Key。网关跑在 Cloudflare Workers 上，出口是 CF 的共享 IP 池（会轮换，但不可控、且与全网 CF 用户共享）；每个镜像的出口网络则是独立的额度池。想加额度靠加出口：自建 CDN 镜像、VPS 转发做镜像等，教程见 [`opencode-cdn.md`](./opencode-cdn.md)。注意第三方公共镜像可能随时下线，关键业务建议自建。
 
 ## 技术栈
 
@@ -37,7 +58,7 @@ npm install
 # 创建 .dev.vars（已 .gitignore）
 echo ADMIN_USERNAME=admin >> .dev.vars
 echo ADMIN_PASSWORD=your-password >> .dev.vars
-echo OPENCODE_MIRRORS_URL=https://opencode.ai.cmliussss.net/zen/v1 >> .dev.vars
+echo OPENCODE_MIRRORS_URL=https://opencode.ai.cmliussss.net/zen/v1,https://opencode.fastly.cmliussss.net/zen/v1,https://opencode.gcore.cmliussss.net/zen/v1 >> .dev.vars
 
 # 启动本地开发服务器
 npm run dev
@@ -53,15 +74,15 @@ npm run dev
 4. 部署完成后，进入 Worker 页面 → **Settings** → **Variables**，添加：
   - `ADMIN_USERNAME` — 管理后台登录用户名
   - `ADMIN_PASSWORD` — 管理后台登录密码
-  - `OPENCODE_MIRRORS_URL` — OpenCode 镜像地址列表，每行一个 URL或用 `,` 分隔。填写以下三个地址：
-  
+  - `OPENCODE_MIRRORS_URL` — OpenCode 镜像地址列表，每行一个 URL 或用 `,` 分隔。默认三个公共镜像：
+
   ```
   https://opencode.ai.cmliussss.net/zen/v1
   https://opencode.fastly.cmliussss.net/zen/v1
   https://opencode.gcore.cmliussss.net/zen/v1
   ```
 
-  > 以上镜像地址来源于CM大佬，在此表示感谢！
+  > 以上镜像地址来源于 CM 大佬，在此表示感谢！也可按 [`opencode-cdn.md`](./opencode-cdn.md) 自建后替换。
 
 - 建议：绑定一个自定义域名
 
@@ -71,7 +92,7 @@ npm run dev
 
 2. 在 GitHub 仓库 Settings → **Secrets and variables** → **Actions** 中配置：
    - **Secrets**：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑）
-   - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个，默认已包含上述三个镜像地址）
+   - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个；默认已包含上述三个公共镜像）
 
 3. 在 GitHub 仓库 Actions 页面手动触发 **Deploy to Cloudflare Workers** 工作流
 
@@ -79,38 +100,38 @@ npm run dev
 
 ## 使用方法
 
-- **API BASE URL**：`https://你的域名/v1`
-- **API KEY**：在管理后台手动生成，格式为：`sk_cf_<KEY>`
-- **模型ID**：`提供商ID/模型ID`，默认 OpenCode 模型包括：
-  - `opencode/deepseek-v4-flash-free`
-  - `opencode/mimo-v2.5-free`
-  - `opencode/nemotron-3-ultra-free`
-  - `opencode/hy3-free`
+- **API Base URL**：`https://你的域名/v1`
+- **API Key**：在管理后台生成，格式为 `sk_cf_<KEY>`
+- **模型 ID**：`提供商ID/模型ID`，例如 `opencode/mimo-v2.6-flash-free`
 
-OpenCode 默认不需要上游 Key。若在管理后台为 OpenCode 添加 Key，请求会先访问后台配置的官方 API 地址；未成功时再从随机起点依次尝试镜像地址，并使用内置的 `Bearer public`。镜像地址列表通过环境变量 `OPENCODE_MIRRORS_URL` 配置（多行，每行一个 URL），部署脚本默认写入三个公共镜像。用户可在 GitHub Actions Variables 中设置同名变量追加额外地址（全局去重）。已有 KV 数据不会被删除，升级时仅在缺少 OpenCode 的情况下补充该默认提供商。
+OpenCode 提供商默认不需要上游 Key。若在管理后台为其添加了 Key，请求优先走官方 API 地址；失败时再从随机起点依次尝试镜像，并使用内置的 `Bearer public`。镜像列表由环境变量 `OPENCODE_MIRRORS_URL` 配置（多行/逗号分隔，全局去重）。已有 KV 数据不会被删除，升级时仅在缺少 OpenCode 提供商时补充默认项。
 
-> **muse 系列模型说明**：`muse-*` 家族免费模型（如 `opencode/muse-spark-1.3-contributor-free`）在上游只提供 OpenAI **Responses** 接口——直接请求 `chat/completions` 会被上游后端崩成 500。网关已内置自动转换：该家族模型的请求自动改走上游 `/responses` 端点，响应（含流式）翻译回标准 chat 格式，照常调用即可，无需任何额外配置。翻译时 `max_tokens` 会补足上游下限（<16 会被拒），推理强度默认降到 `low`（可用 `reasoning_effort` 覆盖为 minimal/low/medium/high/xhigh）；这是推理型模型，effort 不压低时容易把预算全花在思考上导致正文为空，建议 `max_tokens` 给到 512 以上。免费档有动态限额，遇 429 等待限额窗口刷新即可。
+接口细节见 [`API.md`](./API.md)，自建镜像教程见 [`opencode-cdn.md`](./opencode-cdn.md)。
 
 ## 项目结构
 
 ```
 ai-gateway/
 ├── src/
-│   ├── index.ts       # 入口，路由注册
-│   ├── types.ts       # 类型定义
-│   ├── config.ts      # 默认配置
-│   ├── storage.ts     # KV 存储层
-│   ├── auth.ts        # 认证系统
-│   ├── proxy.ts       # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
-│   ├── opencode.ts    # OpenCode 官方 API 与公共镜像故障转移
-│   ├── admin.ts       # 管理 API（含服务端 Key/模型测试代理）
-│   ├── pages.ts       # 前端页面模板
-│   ├── pages.css.ts   # 样式
-│   └── shared.js.ts   # 共享 JS 工具函数
+│   ├── index.ts            # 入口，路由注册
+│   ├── types.ts            # 类型定义
+│   ├── config.ts           # 默认配置
+│   ├── storage.ts          # KV 存储层
+│   ├── auth.ts             # 认证系统
+│   ├── proxy.ts            # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
+│   ├── opencode.ts         # OpenCode 伪装 / Body Gate / 镜像故障转移
+│   ├── opencode-responses.ts # Responses ↔ Chat 双向翻译
+│   ├── admin.ts            # 管理 API（含服务端 Key/模型测试代理）
+│   ├── pages.ts            # 前端页面模板
+│   ├── pages.css.ts        # 样式
+│   └── shared.js.ts        # 共享 JS 工具函数
+├── worker-proxy/           # 各场景反代 Worker 示例脚本
+├── API.md                  # 接口文档
+├── opencode-cdn.md         # 自建 OpenCode 镜像教程
+├── design.md               # 前端设计规范
 ├── wrangler.toml
 ├── package.json
-├── tsconfig.json
-└── .github/workflows/deploy.yml
+└── tsconfig.json
 ```
 
 ## License
