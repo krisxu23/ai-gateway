@@ -158,6 +158,22 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
 
     if (isOpenCodeProvider(providerId)) {
+      // 客户端会话标识透传: 官方格式则上游复用, 否则按会话内容确定性派生。
+      const sessionHeaderNames = [
+        'x-opencode-session',
+        'x-session-affinity',
+        'x-session-id',
+        'session_id',
+        'session-id',
+      ]
+      let clientSessionId: string | undefined
+      for (const name of sessionHeaderNames) {
+        const v = c.req.header(name)?.trim()
+        if (v) {
+          clientSessionId = v
+          break
+        }
+      }
       const response = await proxyOpenCodeRequest({
         baseUrl: provider.baseUrl,
         apiKeys: enabledKeys,
@@ -166,6 +182,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         search: url.search,
         body: JSON.stringify(forwardBody),
         mirrorUrls: resolveOpenCodeUrls(c.env),
+        clientSessionId,
       })
       return new Response(response.body, {
         status: response.status,

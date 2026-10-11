@@ -3,6 +3,7 @@ import {
   chatBodyToResponsesBody,
   createResponsesToChatStream,
   responsesToChatBody,
+  STUB_SWALLOW_NOTE,
   zenModelNeedsResponses,
 } from './opencode-responses'
 
@@ -23,6 +24,11 @@ interface OpenCodeRequestOptions {
   random?: () => number
   /** Responses 专用模型: 额外透传 x-opencode-model 头(内容为 zen 模型 ID) */
   modelHeader?: string
+  /**
+   * 客户端请求头透传的会话标识(x-opencode-session 等)。
+   * 符合官方格式则原样复用, 否则按会话内容确定性派生。
+   */
+  clientSessionId?: string
 }
 
 interface StoredFailure {
@@ -88,18 +94,105 @@ function randomBase62(length: number): string {
 /**
  * 官方 opencode session 形态: ses_ + 12位小写hex + 14位base62
  * (上游按 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ 校验)。
- * request id 用 req_ + 32位hex。
+ * request id 用 msg_ + 32位hex(官方格式, magpie 从 opencode 源码考证)。
  */
 function createOpenCodeId(prefix: string): string {
   if (prefix === 'ses') return `ses_${randomHex(6)}${randomBase62(14)}`
   return `${prefix}_${randomHex(16)}`
 }
 
+const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+
+/** xmur3 字符串哈希: 确定性派生的 seed 源。 */
+function xmur3Hash(str: string): number {
+  let h = 1779033703 ^ str.length
+  for (let i = 0; i < str.length; i++) {
+    h = Math.imul(h ^ str.charCodeAt(i), 3432918353)
+    h = (h << 13) | (h >>> 19)
+  }
+  h = Math.imul(h ^ (h >>> 16), 2246822507)
+  h = Math.imul(h ^ (h >>> 13), 3266489909)
+  return (h ^ (h >>> 16)) >>> 0
+}
+
+/** mulberry32 PRNG: 由哈希 seed 生成确定性随机数流。 */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a |= 0
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/**
+ * 会话确定性派生: 同一对话固定 x-opencode-session, 更贴近官方客户端行为,
+ * 也利于上游按会话路由/缓存。输出格式与官方一致: ses_ + 12位小写hex + 14位base62。
+ */
+function deriveSessionId(seed: string): string {
+  const rand = mulberry32(xmur3Hash(seed))
+  let hex = ''
+  for (let i = 0; i < 6; i++) hex += Math.floor(rand() * 256).toString(16).padStart(2, '0')
+  let b62 = ''
+  for (let i = 0; i < 14; i++) b62 += BASE62_ALPHABET[Math.floor(rand() * 62)]
+  return `ses_${hex}${b62}`
+}
+
+function textOfContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    let out = ''
+    for (const part of content) {
+      const p = (part !== null && typeof part === 'object' && !Array.isArray(part)
+        ? part as Record<string, unknown> : null)
+      if (p) {
+        if (typeof p.text === 'string') out += p.text
+        else if (typeof p.content === 'string') out += p.content
+      }
+    }
+    return out
+  }
+  return ''
+}
+
+/**
+ * 提取首条 user 文本: 兼容 chat 形态(messages[])与 Responses 形态(input[])。
+ */
+function firstUserText(parsed: Record<string, unknown> | null): string {
+  if (!parsed) return ''
+  for (const key of ['messages', 'input'] as const) {
+    const list = parsed[key]
+    if (!Array.isArray(list)) continue
+    for (const item of list) {
+      const rec = (item !== null && typeof item === 'object' && !Array.isArray(item)
+        ? item as Record<string, unknown> : null)
+      if (rec && rec.role === 'user') {
+        const text = textOfContent(rec.content)
+        if (text) return text
+      }
+    }
+  }
+  return ''
+}
+
+/**
+ * 会话 ID 解析: 客户端透传的符合官方格式则原样复用; 否则按首条 user 文本
+ * 确定性派生; 无文本时回退为每请求随机。
+ */
+function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
+  if (clientSessionId && SESSION_ID_RE.test(clientSessionId)) return clientSessionId
+  const text = firstUserText(parsed)
+  if (text) return deriveSessionId(`opencode-session:${text}`)
+  return createOpenCodeId('ses')
+}
+
 function createRequestHeaders(apiKey: string, requestId: string, sessionId: string): Headers {
   return new Headers({
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${apiKey}`,
-    'User-Agent': `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
+    'User-Agent': `opencode/${OPENCODE_VERSION}`,
     'x-opencode-client': 'cli',
     'x-opencode-project': 'global',
     'x-opencode-request': requestId,
@@ -130,9 +223,10 @@ function freeLaneGateTool(name: string) {
 /**
  * 上游匿名通道的 body 门禁: 强制 stream:true; 缺失 bash/read 时注入桩工具。
  * 客户端原本就没有 tools 时加 tool_choice:"none" 兜底(模型不会真调桩)。
- * 返回 { body, clientWantsStream }。
+ * 返回 { body, clientWantsStream, stubOnly }: stubOnly 为 true 表示桩全部由
+ * 我们注入(客户端零 tools), 下游可据此吞噬桩工具调用而不误伤真工具。
  */
-function applyFreeLaneGate(parsed: Record<string, unknown>): { body: Record<string, unknown>, clientWantsStream: boolean } {
+function applyFreeLaneGate(parsed: Record<string, unknown>): { body: Record<string, unknown>, clientWantsStream: boolean, stubOnly: boolean } {
   const clientWantsStream = parsed.stream === true
   const body: Record<string, unknown> = { ...parsed, stream: true }
   const rawTools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
@@ -147,7 +241,7 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): { body: Record<stri
   }
   body.tools = tools
   if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
-  return { body, clientWantsStream }
+  return { body, clientWantsStream, stubOnly: !hadTools }
 }
 
 function freeLaneGateResponsesTool(name: string) {
@@ -181,8 +275,10 @@ function ensureResponsesFreeLaneShape(body: Record<string, unknown>): void {
 /**
  * 把上游 chat completions SSE 流拼成单个非流式 chat.completion JSON。
  * 客户端要 stream:false 但上游被强制 stream:true 时用, 保证 OpenAI 契约不断。
+ * swallowStubs 为 true 时(桩全由我们注入): 过滤掉 bash/read 桩工具调用,
+ * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
  */
-async function collapseChatSseToJson(response: Response, model: string): Promise<Response> {
+async function collapseChatSseToJson(response: Response, model: string, swallowStubs = false): Promise<Response> {
   const text = await response.text()
   let content = ''
   let finishReason = 'stop'
@@ -224,8 +320,23 @@ async function collapseChatSseToJson(response: Response, model: string): Promise
   for (let i = 0; i < toolCalls.length; i++) {
     (toolCalls[i].function as Record<string, unknown>).arguments = argBufs[i] ?? ''
   }
+  const finalToolCalls = swallowStubs
+    ? toolCalls.filter((tc) => {
+        const fn = (tc.function ?? {}) as Record<string, unknown>
+        const name = typeof fn.name === 'string' ? fn.name : ''
+        return name !== 'bash' && name !== 'read'
+      })
+    : toolCalls
+  if (swallowStubs && finalToolCalls.length === 0 && finishReason === 'tool_calls') {
+    finishReason = 'stop'
+  }
   const message: Record<string, unknown> = { role: 'assistant', content: content === '' ? null : content }
-  if (toolCalls.length > 0) message.tool_calls = toolCalls
+  if (finalToolCalls.length > 0) {
+    message.tool_calls = finalToolCalls
+  } else if (swallowStubs && content === '') {
+    message.content = STUB_SWALLOW_NOTE
+    finishReason = 'stop'
+  }
   const payload: Record<string, unknown> = {
     id: `chatcmpl-${Date.now().toString(36)}`,
     object: 'chat.completion',
@@ -237,6 +348,99 @@ async function collapseChatSseToJson(response: Response, model: string): Promise
   return new Response(JSON.stringify(payload), {
     status: response.status,
     headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+/**
+ * 流式 stub 吞噬(客户端要 stream:true 且桩全由我们注入时用)。
+ * 上游 SSE 里任何 tool_calls 增量都只能是桩 bash/read 的调用: 按 index 跟踪,
+ * 一旦某 index 被识别为桩命名, 该 index 的后续增量全部丢弃; 其他内容原样
+ * 重序列化透传。全是桩调用时 finish_reason tool_calls → stop。
+ */
+function createStubSwallowingChatStream(): TransformStream<Uint8Array, Uint8Array> {
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder()
+  let buf = ''
+  const stubIndexes = new Set<number>()
+  const seenIndexes = new Set<number>()
+
+  /** 处理单个 SSE data 载荷: 返回重序列化后的 data, 或 null 表示丢弃整事件。 */
+  const handleData = (data: string): string | null => {
+    let evt: Record<string, unknown>
+    try {
+      evt = JSON.parse(data) as Record<string, unknown>
+    } catch {
+      return data // 非 JSON 行原样透传
+    }
+    const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
+    if (choice) {
+      const delta = choice.delta as Record<string, unknown> | undefined
+      if (delta && typeof delta === 'object') {
+        const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
+        if (Array.isArray(tc)) {
+          const kept: Array<Record<string, unknown>> = []
+          for (const call of tc) {
+            const idx = typeof call.index === 'number' ? call.index : -1
+            const fn = (call.function ?? {}) as Record<string, unknown>
+            const name = typeof fn.name === 'string' ? fn.name : ''
+            if (idx >= 0) {
+              seenIndexes.add(idx)
+              if (name === 'bash' || name === 'read') stubIndexes.add(idx)
+              if (stubIndexes.has(idx)) continue
+            } else if (name === 'bash' || name === 'read') {
+              continue
+            }
+            kept.push(call)
+          }
+          if (kept.length > 0) delta.tool_calls = kept
+          else delete delta.tool_calls
+        }
+      }
+      if (choice.finish_reason === 'tool_calls' && seenIndexes.size > 0
+        && [...seenIndexes].every((i) => stubIndexes.has(i))) {
+        choice.finish_reason = 'stop'
+      }
+      // delta 被掏空、又无 finish_reason/usage: 整事件无信息量, 丢弃。
+      const deltaKeys = delta && typeof delta === 'object' ? Object.keys(delta) : []
+      if (deltaKeys.length === 0 && !choice.finish_reason && (evt as Record<string, unknown>).usage === undefined) {
+        return null
+      }
+    }
+    return JSON.stringify(evt)
+  }
+
+  const emitLine = (controller: TransformStreamDefaultController<Uint8Array>, line: string) => {
+    const t = line.trim()
+    if (!t) return
+    if (!t.startsWith('data:')) {
+      controller.enqueue(encoder.encode(`${t}\n`))
+      return
+    }
+    const data = t.slice(5).trim()
+    if (data === '[DONE]') {
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      return
+    }
+    if (!data) return
+    const out = handleData(data)
+    if (out !== null) controller.enqueue(encoder.encode(`data: ${out}\n\n`))
+  }
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buf += decoder.decode(chunk, { stream: true })
+      let sep: number
+      while ((sep = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, sep)
+        buf = buf.slice(sep + 2)
+        for (const line of raw.split('\n')) emitLine(controller, line)
+      }
+    },
+    flush(controller) {
+      const tail = buf
+      buf = ''
+      for (const line of tail.split('\n')) emitLine(controller, line)
+    },
   })
 }
 
@@ -325,6 +529,13 @@ async function proxyOpenCodeResponses(
   // bash/read 工具, 缺一即 FreeTierError。
   responsesBody.stream = true
   ensureResponsesFreeLaneShape(responsesBody)
+  // 上游 /responses 只支持 tool_choice:"auto"; 客户端传 "none"/"required"/
+  // 命名函数会被 400, 这里统一归一为 "auto"。
+  if (responsesBody.tool_choice !== undefined && responsesBody.tool_choice !== 'auto') {
+    responsesBody.tool_choice = 'auto'
+  }
+  // 客户端原本零 tools 时桩全由我们注入, 下游可据此吞噬桩工具调用。
+  const stubOnly = !Array.isArray(chatBody.tools) || chatBody.tools.length === 0
   const clientWantsStream = chatBody.stream === true
   const response = await proxyOpenCodeUpstream({
     ...options,
@@ -336,17 +547,17 @@ async function proxyOpenCodeResponses(
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('text/event-stream') && response.body) {
-    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model)), {
+    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     })
     // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
     if (clientWantsStream) return translated
-    return collapseChatSseToJson(translated, model)
+    return collapseChatSseToJson(translated, model, stubOnly)
   }
   const data = await response.json() as Record<string, unknown>
-  return new Response(JSON.stringify(responsesToChatBody(data)), {
+  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly)), {
     status: response.status,
     statusText: response.statusText,
     headers: { 'Content-Type': 'application/json' },
@@ -356,8 +567,22 @@ async function proxyOpenCodeResponses(
 async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<Response> {
   const fetcher = options.fetcher ?? fetch
   const random = options.random ?? Math.random
-  const requestId = createOpenCodeId('req')
-  const sessionId = createOpenCodeId('ses')
+
+  // body 只解析一次: gate 与 session 派生共用, 行为与之前逐处解析一致。
+  let parsedBody: Record<string, unknown> | null = null
+  if (options.method === 'POST' && typeof options.body === 'string') {
+    try {
+      const p = JSON.parse(options.body) as Record<string, unknown>
+      if (p && typeof p === 'object' && !Array.isArray(p)) parsedBody = p
+    } catch {
+      // body 不是合法 JSON: 按原样透传, 由上游给出错误
+    }
+  }
+
+  const requestId = createOpenCodeId('msg')
+  // 会话确定性: 客户端透传官方格式 session 则复用, 否则按首条 user 文本派生,
+  // 无文本回退随机。requestId 仍每请求随机。
+  const sessionId = resolveSessionId(options.clientSessionId, parsedBody)
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
   let lastTransportError: unknown = null
@@ -368,26 +593,29 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   let upstreamOptions = options
   let clientWantsStream = true
   let gateModel = 'opencode'
-  if (options.method === 'POST' && typeof options.body === 'string') {
-    try {
-      const parsed = JSON.parse(options.body) as Record<string, unknown>
-      if (parsed && Array.isArray(parsed.messages)) {
-        const gated = applyFreeLaneGate(parsed)
-        upstreamOptions = { ...options, body: JSON.stringify(gated.body) }
-        clientWantsStream = gated.clientWantsStream
-        if (typeof parsed.model === 'string' && parsed.model) gateModel = parsed.model
-      }
-    } catch {
-      // body 不是合法 JSON: 按原样透传, 由上游给出错误
-    }
+  let stubOnly = false
+  if (parsedBody && Array.isArray(parsedBody.messages)) {
+    const gated = applyFreeLaneGate(parsedBody)
+    upstreamOptions = { ...options, body: JSON.stringify(gated.body) }
+    clientWantsStream = gated.clientWantsStream
+    stubOnly = gated.stubOnly
+    if (typeof parsedBody.model === 'string' && parsedBody.model) gateModel = parsedBody.model
   }
 
   // 上游被强制 stream:true; 客户端要的是非流式时把 SSE 拼回单个 JSON,
-  // 保证 OpenAI 非流式契约不断。
+  // 保证 OpenAI 非流式契约不断。stubOnly 时吞噬桩工具调用。
   const passthroughOk = (response: Response): Promise<Response> | Response => {
     const contentType = response.headers.get('content-type') || ''
-    if (!clientWantsStream && contentType.includes('text/event-stream')) {
-      return collapseChatSseToJson(response, gateModel)
+    const isSse = contentType.includes('text/event-stream') && !!response.body
+    if (!clientWantsStream && isSse) {
+      return collapseChatSseToJson(response, gateModel, stubOnly)
+    }
+    if (clientWantsStream && stubOnly && isSse) {
+      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream()), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
     }
     return response
   }

@@ -38,6 +38,17 @@ function contentText(content: unknown): string {
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh']
 
+/**
+ * 桩工具调用被吞噬后, 空回复的替代正文(与 magpie 的 zenReply 行为一致):
+ * 模型调了我们注入的桩 bash/read, 不把空调用透给客户端, 而以普通 stop 结束。
+ */
+export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn\'t have.)'
+
+/** 桩工具名(吞噬判定用, 与 opencode.ts 的 FREE_LANE_GATE_TOOL_NAMES 同构)。 */
+function isStubToolName(name: unknown): boolean {
+  return name === 'bash' || name === 'read'
+}
+
 // normalizeReasoningEffort 把客户端的 reasoning_effort 归一为 Responses 的
 // reasoning.effort; 未指定或非法时默认 low。
 // 原因: 上游默认 effort=high, 对简单提问也会把 max_output_tokens 全烧在推理上
@@ -139,7 +150,7 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
 
 // ============ 响应转换: Responses -> OpenAI chat ============
 
-export function responsesToChatBody(resp: Rec): Rec {
+export function responsesToChatBody(resp: Rec, swallowStubs = false): Rec {
   const model = typeof resp.model === 'string' ? resp.model : ''
   let text = ''
   const toolCalls: Rec[] = []
@@ -162,15 +173,25 @@ export function responsesToChatBody(resp: Rec): Rec {
     }
   }
 
+  // swallowStubs: 桩全由我们注入时过滤掉 bash/read 桩调用, 不透给客户端。
+  const finalToolCalls = swallowStubs
+    ? toolCalls.filter((tc) => !isStubToolName(asRecord(tc.function)?.name))
+    : toolCalls
+
   let finish = 'stop'
   const inc = asRecord(resp.incomplete_details)
   if (inc && inc.reason === 'max_output_tokens') finish = 'length'
   // tool_calls 优先于 length: 截断前已产生完整函数调用项, 客户端需要执行它
-  if (toolCalls.length > 0) finish = 'tool_calls'
+  if (finalToolCalls.length > 0) finish = 'tool_calls'
 
   const message: Rec = { role: 'assistant' }
-  if (toolCalls.length > 0) message.tool_calls = toolCalls
-  else message.content = text
+  if (finalToolCalls.length > 0) {
+    message.tool_calls = finalToolCalls
+  } else if (swallowStubs && !text) {
+    message.content = STUB_SWALLOW_NOTE
+  } else {
+    message.content = text
+  }
 
   const chat: Rec = {
     id: resp.id ?? '',
@@ -200,12 +221,13 @@ function sseChunk(model: string, id: string, delta: Rec, finish?: string, usage?
   return `data: ${JSON.stringify(o)}\n\n`
 }
 
-export function createResponsesToChatStream(model: string): TransformStream<Uint8Array, Uint8Array> {
+export function createResponsesToChatStream(model: string, swallowStubs = false): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
   const chunkId = `chatcmpl-${Date.now().toString(16)}`
   const toolIdx: Record<string, number> = {}
+  const swallowedIds = new Set<string>()
   let nextIdx = 0
   let finished = false
 
@@ -221,6 +243,12 @@ export function createResponsesToChatStream(model: string): TransformStream<Uint
         const item = asRecord(ev.item)
         if (item && item.type === 'function_call') {
           const itemID = typeof item.id === 'string' ? item.id : ''
+          const name = typeof item.name === 'string' ? item.name : ''
+          // 桩全由我们注入时: 吞掉 bash/read 桩调用, 不下发给客户端。
+          if (swallowStubs && isStubToolName(name)) {
+            swallowedIds.add(itemID)
+            break
+          }
           const idx = nextIdx++
           toolIdx[itemID] = idx
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
@@ -236,6 +264,7 @@ export function createResponsesToChatStream(model: string): TransformStream<Uint
       }
       case 'response.function_call_arguments.delta': {
         const itemID = typeof ev.item_id === 'string' ? ev.item_id : ''
+        if (swallowStubs && swallowedIds.has(itemID)) break
         const idx = toolIdx[itemID] ?? 0
         if (typeof ev.delta === 'string' && ev.delta) {
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
