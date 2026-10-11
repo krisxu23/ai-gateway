@@ -170,12 +170,12 @@ function ensureResponsesFreeLaneShape(body: Record<string, unknown>): void {
     const rec = (t !== null && typeof t === 'object' ? t : null) as Record<string, unknown> | null
     return typeof rec?.name === 'string' ? rec.name : undefined
   }))
-  const hadTools = tools.length > 0
   for (const name of FREE_LANE_GATE_TOOL_NAMES) {
     if (!names.has(name)) tools.push(freeLaneGateResponsesTool(name))
   }
   body.tools = tools
-  if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
+  // 注意: /responses 端点只支持 tool_choice:"auto", 不支持 "none",
+  // 这里只注入桩工具, 不碰 tool_choice。
 }
 
 /**
