@@ -327,13 +327,16 @@ async function collapseChatSseToJson(response: Response, model: string, swallowS
         return name !== 'bash' && name !== 'read'
       })
     : toolCalls
-  if (swallowStubs && finalToolCalls.length === 0 && finishReason === 'tool_calls') {
+  // 只有真实观察到桩调用并被过滤掉时, 才算"模型调了桩": 空正文也可能是
+  // 推理吃光 token 预算(finish_reason length) 等原因, 此时不能误报提示句。
+  const swallowedAny = swallowStubs && toolCalls.length > finalToolCalls.length
+  if (swallowedAny && finalToolCalls.length === 0 && finishReason === 'tool_calls') {
     finishReason = 'stop'
   }
   const message: Record<string, unknown> = { role: 'assistant', content: content === '' ? null : content }
   if (finalToolCalls.length > 0) {
     message.tool_calls = finalToolCalls
-  } else if (swallowStubs && content === '') {
+  } else if (swallowedAny && content === '') {
     message.content = STUB_SWALLOW_NOTE
     finishReason = 'stop'
   }

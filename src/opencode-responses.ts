@@ -174,20 +174,24 @@ export function responsesToChatBody(resp: Rec, swallowStubs = false): Rec {
   }
 
   // swallowStubs: 桩全由我们注入时过滤掉 bash/read 桩调用, 不透给客户端。
+  // 只有真实观察到桩调用时才提示; 空正文也可能是推理吃光预算等原因, 不误报。
   const finalToolCalls = swallowStubs
     ? toolCalls.filter((tc) => !isStubToolName(asRecord(tc.function)?.name))
     : toolCalls
+  const swallowedAny = swallowStubs && toolCalls.length > finalToolCalls.length
 
   let finish = 'stop'
   const inc = asRecord(resp.incomplete_details)
   if (inc && inc.reason === 'max_output_tokens') finish = 'length'
   // tool_calls 优先于 length: 截断前已产生完整函数调用项, 客户端需要执行它
   if (finalToolCalls.length > 0) finish = 'tool_calls'
+  // 整轮只调了桩: 以普通 stop + 提示句结束, 不把空调用透给客户端。
+  if (swallowedAny && finalToolCalls.length === 0 && !text) finish = 'stop'
 
   const message: Rec = { role: 'assistant' }
   if (finalToolCalls.length > 0) {
     message.tool_calls = finalToolCalls
-  } else if (swallowStubs && !text) {
+  } else if (swallowedAny && !text) {
     message.content = STUB_SWALLOW_NOTE
   } else {
     message.content = text
