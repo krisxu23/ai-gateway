@@ -11,7 +11,7 @@ import {
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
-const OPENCODE_VERSION = '1.19.0'
+const OPENCODE_VERSION = '1.18.31'
 // 响应头超时（毫秒）：镜像逐个串行尝试，单个镜像最坏等待。30000ms（30s）足够
 // 一个正常上游返回响应头，又能让挂掉的镜像快速放弃、换下一个出口。
 const OPENCODE_TIMEOUT_MS = 30000
@@ -89,61 +89,63 @@ function getRandomBytes(len: number): Uint8Array {
   return arr
 }
 
-function randomHex(bytes: number): string {
-  return Array.from(getRandomBytes(bytes), (b) => b.toString(16).padStart(2, '0')).join('')
-}
-
 function randomBase62(length: number): string {
   return Array.from(getRandomBytes(length), (b) => BASE62_ALPHABET[b % 62]).join('')
 }
 
-/**
- * 官方 opencode session 形态: ses_ + 12位小写hex + 14位base62
- * (上游按 ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$ 校验)。
- * request id 用 msg_ + 32位hex(官方格式, magpie 从 opencode 源码考证)。
- */
-function createOpenCodeId(prefix: string): string {
-  if (prefix === 'ses') return `ses_${randomHex(6)}${randomBase62(14)}`
-  return `${prefix}_${randomHex(16)}`
-}
-
 const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 
-/** xmur3 字符串哈希: 确定性派生的 seed 源。 */
-function xmur3Hash(str: string): number {
-  let h = 1779033703 ^ str.length
-  for (let i = 0; i < str.length; i++) {
-    h = Math.imul(h ^ str.charCodeAt(i), 3432918353)
-    h = (h << 13) | (h >>> 19)
-  }
-  h = Math.imul(h ^ (h >>> 16), 2246822507)
-  h = Math.imul(h ^ (h >>> 13), 3266489909)
-  return (h ^ (h >>> 16)) >>> 0
-}
+let lastSessionTimestamp = 0
+let sessionCounter = 0
 
-/** mulberry32 PRNG: 由哈希 seed 生成确定性随机数流。 */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0
-  return () => {
-    a |= 0
-    a = (a + 0x6d2b79f5) | 0
-    let t = Math.imul(a ^ (a >>> 15), 1 | a)
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+/**
+ * 官方 opencode 规范时间序 ID 生成器 (对齐 packages/schema/src/identifier.ts):
+ * - ses_: 降序 (~current), 12 位小写 hex + 14 位 base62 (用于会话与按时间排序)
+ * - msg_: 升序 (current), 12 位小写 hex + 14 位 base62 (用于请求与消息)
+ * 上游免费通道严格校验 ses_ 前 12 位时间戳与 ~current 倒序合法性, 伪随机 hex 会触发 403 FreeTierError。
+ */
+export function generateOpenCodeId(prefix: 'ses' | 'msg', timestamp = Date.now()): string {
+  let sequence = 1
+  if (prefix === 'ses') {
+    if (timestamp === lastSessionTimestamp) {
+      sessionCounter += 1
+    } else {
+      lastSessionTimestamp = timestamp
+      sessionCounter = 1
+    }
+    sequence = sessionCounter
   }
+
+  const rawValue = BigInt(timestamp) * 0x1000n + BigInt(sequence)
+  const value = prefix === 'ses' ? ~rawValue : rawValue
+  const encodedTimestamp = Array.from({ length: 6 }, (_, index) =>
+    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, '0')
+  ).join('')
+
+  return `${prefix}_${encodedTimestamp}${randomBase62(14)}`
 }
 
 /**
- * 会话确定性派生: 同一对话固定 x-opencode-session, 更贴近官方客户端行为,
- * 也利于上游按会话路由/缓存。输出格式与官方一致: ses_ + 12位小写hex + 14位base62。
+ * 会话缓存 (内存 Map): 同一对话有效窗口内复用同一个合法时间戳派生的 ses_ ID,
+ * 既保证上游时间戳风控校验通过, 又保持对话上下文一致性与上游 Prompt 缓存命中。
  */
-function deriveSessionId(seed: string): string {
-  const rand = mulberry32(xmur3Hash(seed))
-  let hex = ''
-  for (let i = 0; i < 6; i++) hex += Math.floor(rand() * 256).toString(16).padStart(2, '0')
-  let b62 = ''
-  for (let i = 0; i < 14; i++) b62 += BASE62_ALPHABET[Math.floor(rand() * 62)]
-  return `ses_${hex}${b62}`
+const sessionCache = new Map<string, { id: string; expiresAt: number }>()
+
+function getOrCreateConversationSession(seed: string): string {
+  const now = Date.now()
+  const cached = sessionCache.get(seed)
+  if (cached && cached.expiresAt > now) {
+    return cached.id
+  }
+  const id = generateOpenCodeId('ses', now)
+  sessionCache.set(seed, { id, expiresAt: now + 30 * 60 * 1000 })
+  if (sessionCache.size > 1000) {
+    const firstKey = sessionCache.keys().next().value
+    if (firstKey) sessionCache.delete(firstKey)
+  }
+  return id
 }
 
 /**
@@ -166,13 +168,13 @@ function firstUserText(parsed: Record<string, unknown> | null): string {
 
 /**
  * 会话 ID 解析: 客户端透传的符合官方格式则原样复用; 否则按首条 user 文本
- * 确定性派生; 无文本时回退为每请求随机。
+ * 保持会话稳定; 无文本时每请求生成合法时间序 ID。
  */
-function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
+export function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
   if (clientSessionId && SESSION_ID_RE.test(clientSessionId)) return clientSessionId
   const text = firstUserText(parsed)
-  if (text) return deriveSessionId(`opencode-session:${text}`)
-  return createOpenCodeId('ses')
+  if (text) return getOrCreateConversationSession(`opencode-session:${text}`)
+  return generateOpenCodeId('ses')
 }
 
 function createRequestHeaders(apiKey: string, requestId: string, sessionId: string): Headers {
@@ -760,7 +762,7 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     }
   }
 
-  const requestId = createOpenCodeId('msg')
+  const requestId = generateOpenCodeId('msg')
   // 会话确定性: 客户端透传官方格式 session 则复用, 否则按首条 user 文本派生,
   // 无文本回退随机。requestId 仍每请求随机。
   const sessionId = resolveSessionId(options.clientSessionId, parsedBody)

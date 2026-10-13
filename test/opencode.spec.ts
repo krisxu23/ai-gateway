@@ -6,6 +6,8 @@ import {
   resolveOpenCodeUrls,
   filterOpenCodeModels,
   isOpenCodeProvider,
+  generateOpenCodeId,
+  resolveSessionId,
   type OpenCodeTestResult,
 } from '../src/opencode'
 
@@ -355,5 +357,42 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     const out = await res.text()
     expect(out).toContain('hello')
     expect(out).toContain('world')
+  })
+})
+
+describe('generateOpenCodeId & resolveSessionId', () => {
+  it('生成符合官方规范的时间序 ses_ 与 msg_ 标识', () => {
+    const now = 1791898000000
+    const ses = generateOpenCodeId('ses', now)
+    const msg = generateOpenCodeId('msg', now)
+
+    expect(ses).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(msg).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+
+    // 官方 6 字节 (48-bit, 其中低 12-bit 为序号, 36-bit 为时间戳低位) 降序与正序解码
+    const expectedMod36 = Number(BigInt(now) % (1n << 36n))
+
+    // 校验 ses 倒序时间戳 (~current) 解码
+    const sesHex = ses.slice(4, 16)
+    const sesVal = BigInt('0x' + sesHex)
+    const decodedMsFromSes = ((~sesVal & 0xffffffffffffn) >> 12n)
+    expect(Number(decodedMsFromSes)).toBe(expectedMod36)
+
+    // 校验 msg 正序时间戳 (current) 解码
+    const msgHex = msg.slice(4, 16)
+    const msgVal = BigInt('0x' + msgHex)
+    const decodedMsFromMsg = (msgVal >> 12n)
+    expect(Number(decodedMsFromMsg)).toBe(expectedMod36)
+  })
+
+  it('resolveSessionId 保持会话稳定且格式合法', () => {
+    const nativeSes = 'ses_eca971329ffeVVACPYm6ZjF6tv'
+    expect(resolveSessionId(nativeSes, null)).toBe(nativeSes)
+
+    // 同一对话的首条 user 文本在有效时间内复用同一个合法时间戳 ID
+    const ses1 = resolveSessionId(undefined, { messages: [{ role: 'user', content: 'hello conversation' }] })
+    const ses2 = resolveSessionId(undefined, { messages: [{ role: 'user', content: 'hello conversation' }, { role: 'assistant', content: 'hi' }] })
+    expect(ses1).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(ses1).toBe(ses2)
   })
 })
