@@ -15,6 +15,26 @@ type HealthMap = Record<string, KeyHealth>
 
 const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
+// isolate 内存缓存: Cloudflare KV 每读 10~50ms 且串行，Worker isolate 通常存活
+// 数百到上千个请求。健康数据读多写少，缓存 60s 可消除每请求一次的 KV 读；
+// 任何写操作都会同步刷新缓存，保证同一 isolate 内的写后读一致。
+const HEALTH_CACHE_TTL_MS = 60 * 1000
+const healthMemCache = new Map<string, { value: HealthMap; expiresAt: number }>()
+
+function healthCacheGet(key: string): HealthMap | undefined {
+  const entry = healthMemCache.get(key)
+  if (!entry) return undefined
+  if (Date.now() >= entry.expiresAt) {
+    healthMemCache.delete(key)
+    return undefined
+  }
+  return entry.value
+}
+
+function healthCacheSet(key: string, value: HealthMap): void {
+  healthMemCache.set(key, { value, expiresAt: Date.now() + HEALTH_CACHE_TTL_MS })
+}
+
 // 上游响应头超时（毫秒）。只约束“等待响应头”阶段：headers 到手后立即取消
 // 计时，body 流式消费不再受硬顶限制——长回答不会在流中途被掐断（客户端侧的
 // 空闲超时/取消自然兜底）。这与 opencode 通道的 requestUpstream 同构。
@@ -38,8 +58,13 @@ async function fetchWithHeaderTimeout(
 }
 
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
-  const raw = await env.KV.get(HEALTH_KEY(providerId))
-  return raw ? JSON.parse(raw) : {}
+  const cacheKey = HEALTH_KEY(providerId)
+  const cached = healthCacheGet(cacheKey)
+  if (cached) return cached
+  const raw = await env.KV.get(cacheKey)
+  const parsed: HealthMap = raw ? JSON.parse(raw) : {}
+  healthCacheSet(cacheKey, parsed)
+  return parsed
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
@@ -48,6 +73,8 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   for (const [k, v] of Object.entries(health)) {
     if (v.failures > 0) filtered[k] = v
   }
+  // 同步刷新内存缓存（含空对象，覆盖过期旧值），再落 KV。
+  healthCacheSet(HEALTH_KEY(providerId), filtered)
   if (Object.keys(filtered).length > 0) {
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
   } else {
@@ -138,7 +165,15 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }, 405)
     }
 
-    const body = await c.req.json<ProxyRequestBody>()
+    let body: ProxyRequestBody
+    try {
+      body = await c.req.json<ProxyRequestBody>()
+    } catch {
+      // 请求体不是合法 JSON（或为空）：返回 400 而非 onError 的 500
+      return c.json({
+        error: { message: '请求体必须是合法的 JSON', type: 'invalid_request_error' },
+      }, 400)
+    }
     const model = body.model
 
     if (!model) {
@@ -185,7 +220,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
     const forwardBody = { ...body, model: modelId }
     const url = new URL(c.req.url)
-    const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+    const subPath = url.pathname.replace(/^\/v1\/?/, '') || 'chat/completions'
 
     if (isOpenCodeProvider(providerId)) {
       // 客户端会话标识透传: 官方格式则上游复用, 否则按会话内容确定性派生。
@@ -281,6 +316,10 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     let lastError: Response | null = null
     let healthUpdated = false
+    // 中间失败（未达降权阈值）默认只更新内存缓存，不触发 KV 写，避免上游抖动时
+    // 烧穿写配额。但若完全持久化，跨 isolate 会丢失失败计数导致降权失效。
+    // 折中：本请求内已有失败时，在循环末尾补写一次 KV（见下方 failFlush 点）。
+    let failuresSeen = false
 
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
@@ -307,7 +346,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
             delete healthData[apiKey]
             healthUpdated = true
           }
-          if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+          if (healthUpdated || failuresSeen) {
+            await writeHealth(c.env, providerId, healthData)
+          }
 
           const responseHeaders: Record<string, string> = {
             'Content-Type': response.headers.get('Content-Type') || 'application/json',
@@ -329,19 +370,16 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         if (response.status === 401 || response.status === 403 || response.status >= 500) {
           const isNew = !healthData[apiKey]
           const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          const reachedThreshold = !isNew && h.failures >= KEY_HEALTH_MAX_FAILURES
           h.failures++
           h.lastFailed = true
           if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
             h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-            // 仅在“刚达到降权阈值”这一刻写 KV，避免上游抖动时每请求一次烧穿写配额。
-            // 普通失败（未达阈值）只更新内存中的 healthData，不触发 KV 写。
-            if (!reachedThreshold) healthUpdated = true
+            healthUpdated = true
           } else if (isNew) {
-            // 首条失败也记录一次，便于后续在同一 isolate 内保持累计一致。
             healthUpdated = true
           }
           healthData[apiKey] = h
+          failuresSeen = true
           lastError = response
           continue
         }
@@ -354,16 +392,16 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         // 网络错误也标记为失败
         const isNew = !healthData[apiKey]
         const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-        const reachedThreshold = !isNew && h.failures >= KEY_HEALTH_MAX_FAILURES
         h.failures++
         h.lastFailed = true
         if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
           h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-          if (!reachedThreshold) healthUpdated = true
+          healthUpdated = true
         } else if (isNew) {
           healthUpdated = true
         }
         healthData[apiKey] = h
+        failuresSeen = true
         lastError = new Response(JSON.stringify({
           error: { message: error.message || '请求失败', type: 'proxy_error' },
         }), { status: 502 })
@@ -371,8 +409,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
     }
 
-    // 写回健康状态
-    if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+    // 写回健康状态。失败时无论是否达到阈值都补写一次 KV，
+    // 保证中间失败计数跨 isolate 可见（每个失败请求至多一次 KV 写）。
+    if (healthUpdated || failuresSeen) await writeHealth(c.env, providerId, healthData)
 
     // 所有 key 均失败
     if (lastError) {

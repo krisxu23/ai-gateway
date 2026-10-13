@@ -29,12 +29,17 @@ app.use('*', cors())
 // tail 日志足够排查问题。
 
 // 首次请求时填充虚拟数据
-let seeded = false
+// 用共享 Promise 串行化冷启动初始化：并发请求同时到达时只会执行一次 seeding，
+// 避免竞态导致的重复写入或键冲突；seeding 失败时允许下次请求重试。
+let seedPromise: Promise<void> | null = null
 app.use('*', async (c, next) => {
-  if (!seeded) {
-    await seedInitialData(c.env)
-    seeded = true
+  if (!seedPromise) {
+    seedPromise = seedInitialData(c.env).catch((err) => {
+      seedPromise = null
+      throw err
+    })
   }
+  await seedPromise
   return next()
 })
 
@@ -89,6 +94,10 @@ app.notFound((c) => {
 
 // ===== 错误处理 =====
 app.onError((err, c) => {
+  // 请求体非法 JSON (c.req.json() 抛 SyntaxError) 是客户端错误，应返 400 而非 500
+  if (err instanceof SyntaxError) {
+    return c.json({ error: { message: '请求体必须是合法的 JSON', type: 'invalid_request_error' } }, 400)
+  }
   console.error('未捕获的错误:', err)
   return c.json({ error: { message: '服务器内部错误', type: 'server_error' } }, 500)
 })

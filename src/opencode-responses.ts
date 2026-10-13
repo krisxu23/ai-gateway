@@ -46,7 +46,11 @@ export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn
 
 /** 桩工具名(吞噬判定用, 与 opencode.ts 的 FREE_LANE_GATE_TOOL_NAMES 同构)。 */
 function isStubToolName(name: unknown): boolean {
-  return name === 'bash' || name === 'read'
+  if (typeof name !== 'string') return false
+  // 大小写归一: 上游模型可能输出首字母大写的 Bash/Read, 与 opencode.ts 的
+  // lower 归一对齐, 避免大写桩调用透给客户端。
+  const lower = name.toLowerCase()
+  return lower === 'bash' || lower === 'read'
 }
 
 // normalizeReasoningEffort 把客户端的 reasoning_effort 归一为 Responses 的
@@ -182,7 +186,12 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
 
 // ============ 响应转换: Responses -> OpenAI chat ============
 
-export function responsesToChatBody(resp: Rec, swallowStubs = false, back: Record<string, string> = {}): Rec {
+export function responsesToChatBody(
+  resp: Rec,
+  swallowStubs = false,
+  back: Record<string, string> = {},
+  injectedStubs: ReadonlySet<string> = new Set()
+): Rec {
   const model = typeof resp.model === 'string' ? resp.model : ''
   let text = ''
   const toolCalls: Rec[] = []
@@ -199,7 +208,9 @@ export function responsesToChatBody(resp: Rec, swallowStubs = false, back: Recor
         // 客户端改名来的 bash/read(back 有映射)改回原名; 桩(back 无映射)保持原名,
         // 交给下面的 swallowStubs 过滤。
         let name = typeof item.name === 'string' ? item.name : ''
-        if (name && back[name]) name = back[name]
+        // 大小写归一后再查改名映射: back 键为小写, 上游可能输出大写 Bash/Read。
+        const lower = name.toLowerCase()
+        if (name && (back[lower] || back[name])) name = back[lower] || back[name]
         toolCalls.push({
           id: item.call_id ?? item.id ?? '',
           type: 'function',
@@ -209,15 +220,18 @@ export function responsesToChatBody(resp: Rec, swallowStubs = false, back: Recor
     }
   }
 
-  // swallowStubs: 桩全由我们注入时过滤掉 bash/read 桩调用, 不透给客户端。
+  // swallowStubs: 客户端原本零 tools 时过滤掉全部 bash/read 桩调用; 混合场景下
+  // (客户端带自己的工具)只按 injectedStubs 过滤我们注入的桩, 不透给客户端。
   // 只有真实观察到桩调用时才提示; 空正文也可能是推理吃光预算等原因, 不误报。
-  const finalToolCalls = swallowStubs
-    ? toolCalls.filter((tc) => {
-        const name = asRecord(tc.function)?.name
-        return !isStubToolName(name) || typeof name === 'string' && !!back[name]
-      })
-    : toolCalls
-  const swallowedAny = swallowStubs && toolCalls.length > finalToolCalls.length
+  const finalToolCalls = toolCalls.filter((tc) => {
+    const name = asRecord(tc.function)?.name
+    if (typeof name !== 'string') return true
+    const lower = name.toLowerCase()
+    if (back[lower] || back[name]) return true
+    if (injectedStubs.size > 0) return !injectedStubs.has(lower) && !injectedStubs.has(name)
+    return !(swallowStubs && isStubToolName(name))
+  })
+  const swallowedAny = toolCalls.length > finalToolCalls.length
 
   let finish = 'stop'
   const inc = asRecord(resp.incomplete_details)
@@ -267,7 +281,8 @@ function sseChunk(model: string, id: string, delta: Rec, finish?: string, usage?
 export function createResponsesToChatStream(
   model: string,
   swallowStubs = false,
-  back: Record<string, string> = {}
+  back: Record<string, string> = {},
+  injectedStubs: ReadonlySet<string> = new Set()
 ): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
@@ -292,10 +307,19 @@ export function createResponsesToChatStream(
           const itemID = typeof item.id === 'string' ? item.id : ''
           let name = typeof item.name === 'string' ? item.name : ''
           // 客户端改名来的 bash/read(back 有映射)改回原名透传;
-          // 桩(back 无映射)在 swallowStubs 时吞掉, 不下发给客户端。
-          const isRenamed = !!(name && back[name])
-          if (isRenamed) name = back[name]
-          if (swallowStubs && isStubToolName(name) && !isRenamed) {
+          // 我们注入的桩(back 无映射且名在 injectedStubs 里)吞掉, 不下发给
+          // 客户端 —— 混合场景(客户端带自己的工具)下同样生效。
+          // 大小写归一: back 键为小写, 上游可能输出大写 Bash/Read。
+          const lower = name.toLowerCase()
+          const isRenamed = !!(name && (back[lower] || back[name]))
+          if (isRenamed) name = back[lower] || back[name]
+          const isInjectedStub =
+            isStubToolName(name) &&
+            !isRenamed &&
+            (injectedStubs.size > 0
+              ? injectedStubs.has(lower) || injectedStubs.has(name)
+              : swallowStubs)
+          if (isInjectedStub) {
             swallowedIds.add(itemID)
             break
           }
@@ -314,7 +338,7 @@ export function createResponsesToChatStream(
       }
       case 'response.function_call_arguments.delta': {
         const itemID = typeof ev.item_id === 'string' ? ev.item_id : ''
-        if (swallowStubs && swallowedIds.has(itemID)) break
+        if (swallowedIds.has(itemID)) break
         const idx = toolIdx[itemID] ?? 0
         if (typeof ev.delta === 'string' && ev.delta) {
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
@@ -327,8 +351,9 @@ export function createResponsesToChatStream(
       case 'response.incomplete': {
         // 与非流式路径(responsesToChatBody)对齐: 本轮发过 function_call 时以
         // tool_calls 结束, 客户端才能识别为“需要执行工具”; 但桩全被吞光时仍为
-        // stop。incomplete 始终为 length。
-        const hasToolCalls = nextIdx > swallowedIds.size
+        // stop。nextIdx 只计真实下发的工具调用(桩不递增), 与被吞数量无关。
+        // incomplete 始终为 length。
+        const hasToolCalls = nextIdx > 0
         const finish = type === 'response.incomplete'
           ? 'length'
           : hasToolCalls ? 'tool_calls' : 'stop'
@@ -347,18 +372,33 @@ export function createResponsesToChatStream(
         break
       }
       case 'response.failed':
-      case 'error':
-        controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, 'stop')))
+      case 'error': {
+        // 上游错误必须透传给客户端，不能伪装成干净的 finish_reason:stop
+        // (客户端会误认为模型正常返回了空回答)。以 OpenAI 兼容的 error 事件
+        // 下发，随后 [DONE] 结束。
+        const errObj = asRecord(ev.error) || asRecord(asRecord(ev.response)?.error) || asRecord(ev.response) || {}
+        const rawMsg = errObj.message ?? errObj.code ?? ''
+        const msg = typeof rawMsg === 'string' && rawMsg ? rawMsg : '上游推理失败'
+        controller.enqueue(encoder.encode(
+          `data: ${JSON.stringify({ error: { message: msg, type: 'upstream_error', code: 'upstream_error' } })}\n\n`
+        ))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         finished = true
         break
+      }
     }
   }
 
   const handleLine = (line: string, controller: TransformStreamDefaultController<Uint8Array>) => {
     if (finished) return
-    if (!line.startsWith('data: ')) return
-    const payload = line.slice(6).trim()
+    // SSE 注释行 (: keep-alive 等心跳) 直接透传给下游, 保持连接活跃语义
+    if (line.startsWith(':')) {
+      controller.enqueue(encoder.encode(line + '\n\n'))
+      return
+    }
+    // 兼容无空格的 "data:{json}" (RFC 7230 宽松解析)
+    if (!line.startsWith('data: ') && !line.startsWith('data:')) return
+    const payload = line.startsWith('data: ') ? line.slice(6).trim() : line.slice(5).trim()
     if (!payload || payload === '[DONE]') return
     try {
       handleEvent(controller, JSON.parse(payload) as Rec)
@@ -381,7 +421,8 @@ export function createResponsesToChatStream(
     },
     flush(controller) {
       if (finished) return
-      if (buf.startsWith('data: ')) handleLine(buf.replace(/\r$/, ''), controller)
+      // 与 handleLine 一致的宽松解析: 兼容无空格的 data:{...} 紧凑格式。
+      if (buf.startsWith('data: ') || buf.startsWith('data:')) handleLine(buf.replace(/\r$/, ''), controller)
       if (!finished) controller.enqueue(encoder.encode('data: [DONE]\n\n'))
     },
   })

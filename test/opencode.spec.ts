@@ -180,4 +180,180 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     expect(choice.finish_reason).toBe('stop')
     expect((choice.message as Record<string, unknown>).tool_calls).toBeUndefined()
   })
+
+  it('无 tools 客户端流式调用时桩调用的参数增量也被彻底吞噬且 finish_reason 转为 stop', async () => {
+    const fetcher = async () => {
+      return sseResponse([
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"ls"}' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
+        'data: [DONE]\n\n',
+      ])
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const out = await res.text()
+    expect(out).not.toContain('command')
+    expect(out).not.toContain('bash')
+    expect(out).toContain('"finish_reason":"stop"')
+  })
+
+  it('混合工具调用时桩调用被吞而真实工具被保留且 finish_reason 为 tool_calls', async () => {
+    const fetcher = async () => {
+      return sseResponse([
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '' } }, { index: 1, id: 'call_calc', type: 'function', function: { name: 'calc', arguments: '{"expr"' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }, { index: 1, function: { arguments: ':"1+1"}' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
+        'data: [DONE]\n\n',
+      ])
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'calc 1+1' }],
+        tools: [{ type: 'function', function: { name: 'calc', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const out = await res.text()
+    expect(out).not.toContain('bash')
+    expect(out).toContain('calc')
+    expect(out).toContain('1+1')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  it('muse-* Responses 路径混合场景: 桩被吞、真实工具保留且 finish_reason 为 tool_calls', async () => {
+    let upstreamBody: Record<string, unknown> | null = null
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return sseResponse([
+        'data: ' + JSON.stringify({ type: 'response.output_item.added', item: { type: 'function_call', id: 'i0', call_id: 'c0', name: 'bash' } }) + '\n\n',
+        'data: ' + JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: 'i0', delta: '{}' }) + '\n\n',
+        'data: ' + JSON.stringify({ type: 'response.output_item.added', item: { type: 'function_call', id: 'i1', call_id: 'c1', name: 'calc' } }) + '\n\n',
+        'data: ' + JSON.stringify({ type: 'response.function_call_arguments.delta', item_id: 'i1', delta: '{"expr":"1+1"}' }) + '\n\n',
+        'data: ' + JSON.stringify({ type: 'response.completed', response: {} }) + '\n\n',
+        'data: [DONE]\n\n',
+      ])
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'muse-spark-1.2-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'calc 1+1' }],
+        tools: [{ type: 'function', function: { name: 'calc', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    // 上游 body 仍是 Responses 形态, 且注入了 bash/read 桩
+    const tools = upstreamBody!.tools as Array<{ name?: string }>
+    const toolNames = tools.map((t) => t.name).filter(Boolean)
+    expect(toolNames).toEqual(expect.arrayContaining(['bash', 'read']))
+    const out = await res.text()
+    expect(out).not.toContain('bash')
+    expect(out).toContain('calc')
+    expect(out).toContain('1+1')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  it('非流式混合工具调用时桩工具被过滤且用户自定义工具与 finish_reason:tool_calls 被保留', async () => {
+    const fetcher = async () => {
+      return sseResponse([
+        // 上游强制 stream: true 返回 SSE
+        'data: ' + JSON.stringify({
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [
+                { index: 0, id: 'call_bash', function: { name: 'bash', arguments: '{"cmd":"ls"}' } },
+                { index: 1, id: 'call_calc', function: { name: 'calc', arguments: '{"x":2}' } },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          }],
+        }) + '\n\n',
+        'data: [DONE]\n\n',
+      ])
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: false, // 客户端非流式请求
+        messages: [{ role: 'user', content: 'compute' }],
+        tools: [{ type: 'function', function: { name: 'calc', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const json = await res.json() as {
+      choices: Array<{
+        message: {
+          role: string
+          content: string | null
+          tool_calls?: Array<{ function: { name: string; arguments: string } }>
+        }
+        finish_reason: string
+      }>
+    }
+    expect(json.choices[0].finish_reason).toBe('tool_calls')
+    const tcs = json.choices[0].message.tool_calls || []
+    expect(tcs).toHaveLength(1)
+    expect(tcs[0].function.name).toBe('calc')
+    expect(tcs[0].function.arguments).toBe('{"x":2}')
+  })
+
+  it('CRLF (\\r\\n\\r\\n) 分隔的 SSE 流能正常解析与保活流式转发', async () => {
+    const fetcher = async () => {
+      return sseResponse([
+        'data: ' + JSON.stringify({
+          choices: [{ index: 0, delta: { content: 'hello ' } }],
+        }) + '\r\n\r\n',
+        'data: ' + JSON.stringify({
+          choices: [{ index: 0, delta: { content: 'world' }, finish_reason: 'stop' }],
+        }) + '\r\n\r\n',
+        'data: [DONE]\r\n\r\n',
+      ])
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const out = await res.text()
+    expect(out).toContain('hello')
+    expect(out).toContain('world')
+  })
 })

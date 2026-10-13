@@ -237,6 +237,30 @@ describe('createResponsesToChatStream', () => {
     expect(out).not.toContain('"name":"bash"')
   })
 
+  it('上游输出大写 Bash 桩调用时也被归一吞噬 (不透给零 tools 客户端)', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"Bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse', true)))
+    expect(out).not.toContain('"name":"Bash"')
+    expect(out).not.toContain('"name":"bash"')
+    expect(out).toContain('"finish_reason":"stop"')
+  })
+
+  it('非流式: 上游输出大写 Bash 桩调用时也被过滤且 finish_reason 为 stop', async () => {
+    const body = {
+      output: [
+        { type: 'function_call', id: 'i1', call_id: 'c1', name: 'Bash', arguments: '{}' },
+      ],
+      incomplete_details: null,
+    }
+    const result = responsesToChatBody(body as unknown as Parameters<typeof responsesToChatBody>[0], 'muse', true)
+    expect(result.choices[0].message.tool_calls).toBeUndefined()
+    expect(result.choices[0].finish_reason).toBe('stop')
+  })
+
   it('多行/分块输入正确重组', async () => {
     const encoder = new TextEncoder()
     const part1 = encoder.encode('data: {"type":"response.output_text.delt')
@@ -247,5 +271,46 @@ describe('createResponsesToChatStream', () => {
     const out = await readAll(stream.pipeThrough(createResponsesToChatStream('muse')))
     expect(out).toContain('"content":"hi"')
     expect(out).toContain('data: [DONE]')
+  })
+
+  it('上游 error 事件透传为 OpenAI 兼容 error 块而非干净的 stop', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+      'data: {"type":"error","error":{"message":"boom upstream","code":"server_error"}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"content":"partial"')
+    expect(out).toContain('boom upstream')
+    expect(out).toContain('"type":"upstream_error"')
+    expect(out).not.toContain('"finish_reason"')
+  })
+
+  it('response.failed 事件也透传错误而非空 stop', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.failed","response":{"error":{"message":"quota exceeded"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('quota exceeded')
+    expect(out).toContain('"type":"upstream_error"')
+  })
+
+  it('SSE 注释行 (: keep-alive) 穿透到下游', async () => {
+    const upstream = sseChunks([
+      ': keep-alive\n\n',
+      'data: {"type":"response.output_text.delta","delta":"hi"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain(': keep-alive')
+    expect(out).toContain('"content":"hi"')
+  })
+
+  it('无空格的 data:{json} 行也能解析', async () => {
+    const upstream = sseChunks([
+      'data:{"type":"response.output_text.delta","delta":"compact"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"content":"compact"')
   })
 })

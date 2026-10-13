@@ -53,23 +53,28 @@ export async function getProvider(env: Env, id: string): Promise<Provider | null
 }
 
 export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
-  cacheSet(KV_KEYS.PROVIDERS, providers)
+  // 先写 KV，成功后才刷新内存缓存：KV.put 失败（配额/抖动）时 isolate 内
+  // 缓存不会残留未持久化的脏数据，与真实存储保持一致。
   await env.KV.put(KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  cacheSet(KV_KEYS.PROVIDERS, providers)
 }
 
 export async function addProvider(env: Env, provider: Provider): Promise<void> {
   const providers = await getProviders(env)
-  providers.push(provider)
-  await setProviders(env, providers)
+  // 不可变操作: getProviders 返回 memCache 内部数组引用, 直接 push 会在
+  // KV.put 失败时原地污染缓存, 违背 setProviders 先写 KV 成功再刷新的初衷。
+  await setProviders(env, [...providers, provider])
 }
 
 export async function updateProvider(env: Env, id: string, updates: Partial<Provider>): Promise<Provider | null> {
   const providers = await getProviders(env)
   const index = providers.findIndex((p) => p.id === id)
   if (index === -1) return null
-  providers[index] = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
-  await setProviders(env, providers)
-  return providers[index]
+  // 不可变更新: 避免原地改写 memCache 内的数组元素 (同 addProvider 注释)。
+  const updated: Provider = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
+  const next = providers.map((p, i) => (i === index ? updated : p))
+  await setProviders(env, next)
+  return updated
 }
 
 export async function deleteProvider(env: Env, id: string): Promise<boolean> {
@@ -122,14 +127,15 @@ export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
 }
 
 export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
-  cacheSet(KV_KEYS.PROXY_KEYS, keys)
+  // 同 setProviders: KV 写成功后再刷新缓存，失败时缓存不污染
   await env.KV.put(KV_KEYS.PROXY_KEYS, JSON.stringify(keys))
+  cacheSet(KV_KEYS.PROXY_KEYS, keys)
 }
 
 export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {
   const keys = await getProxyKeys(env)
-  keys.push(key)
-  await setProxyKeys(env, keys)
+  // 不可变操作: 同 addProvider 注释, 防止 KV 写失败时污染内存缓存。
+  await setProxyKeys(env, [...keys, key])
 }
 
 export async function deleteProxyKey(env: Env, id: string): Promise<boolean> {
@@ -144,9 +150,10 @@ export async function updateProxyKey(env: Env, id: string, updates: Partial<Prox
   const keys = await getProxyKeys(env)
   const idx = keys.findIndex(k => k.id === id)
   if (idx === -1) return null
-  keys[idx] = { ...keys[idx], ...updates }
-  await setProxyKeys(env, keys)
-  return keys[idx]
+  // 不可变更新: 同 updateProvider 注释。
+  const updated: ProxyKey = { ...keys[idx], ...updates }
+  await setProxyKeys(env, keys.map((k, i) => (i === idx ? updated : k)))
+  return updated
 }
 
 export async function validateProxyKey(env: Env, key: string): Promise<boolean> {
@@ -168,6 +175,9 @@ import { DEFAULT_PROVIDERS, PROXY_KEY_PREFIX } from './config'
 
 export async function seedInitialData(env: Env): Promise<void> {
   const providers = await getProviders(env)
+  // 性能: opencode 已存在时迁移必定完成过，跳过迁移标记 KV 读，
+  // 省掉每次冷启动的一次 KV 读配额。
+  if (providers.some((provider) => provider.id === 'opencode')) return
   const migrationCompleted = await env.KV.get(KV_KEYS.OPENCODE_MIGRATION)
   const opencode = DEFAULT_PROVIDERS.find((provider) => provider.id === 'opencode')
 

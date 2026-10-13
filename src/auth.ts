@@ -57,14 +57,21 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
     return c.json({ success: false, message: '请输入用户名和密码' }, 400)
   }
 
-  if (username !== adminUser) {
-    return c.json({ success: false, message: '用户名或密码错误' }, 401)
-  }
+  // 常量时间比较：无论用户名/密码是否正确，都执行完整的哈希计算与比较，
+  // 避免时序差异被用于用户名枚举；哈希比较也用常量时间比较防时序侧信道。
+  const usernameBuf = new TextEncoder().encode(String(username))
+  const adminUserBuf = new TextEncoder().encode(String(adminUser))
+  const passwordHash = await hashPassword(String(password))
+  const adminPassHash = await hashPassword(String(adminPass))
+  const hashBuf = new TextEncoder().encode(passwordHash)
+  const adminHashBuf = new TextEncoder().encode(adminPassHash)
 
-  const passwordHash = await hashPassword(password)
-  const adminPassHash = await hashPassword(adminPass)
+  const userMatches = usernameBuf.byteLength === adminUserBuf.byteLength &&
+    crypto.subtle.timingSafeEqual(usernameBuf, adminUserBuf)
+  const passMatches = hashBuf.byteLength === adminHashBuf.byteLength &&
+    crypto.subtle.timingSafeEqual(hashBuf, adminHashBuf)
 
-  if (passwordHash !== adminPassHash) {
+  if (!userMatches || !passMatches) {
     return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
 

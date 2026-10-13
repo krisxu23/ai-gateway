@@ -234,7 +234,7 @@ function freeLaneGateTool(name: string) {
  *
  * 返回:
  *  - clientWantsStream: 客户端是否要求流式
- *  - stubOnly: 桩是否全部由我们注入(客户端零 tools), 下游据此吞噬桩调用
+ *  - stubOnly: 桩是否全部由我们注入(客户端零 tools), 下游据此启用桩吞噬
  *  - back: 上游名(bash/read) → 客户端原名 的映射, 下游把模型调用改回原名
  */
 function applyFreeLaneGate(parsed: Record<string, unknown>): {
@@ -242,6 +242,7 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
   clientWantsStream: boolean
   stubOnly: boolean
   back: Record<string, string>
+  injectedStubs: Set<string>
 } {
   const clientWantsStream = parsed.stream === true
   const body: Record<string, unknown> = { ...parsed, stream: true }
@@ -252,6 +253,10 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
     return typeof fn?.name === 'string' ? fn.name : undefined
   }))
   const back: Record<string, string> = {}
+  // injectedStubs: 我们注入的桩名(仅当客户端没有同名/变体工具时才注入)。
+  // 吞噬按名判定: 无论客户端是否带了自己的工具，只要这个 bash/read 是我们注入
+  // 的桩，模型对它的调用都必须被吞，混合场景下才不会把残缺调用泄给客户端。
+  const injectedStubs = new Set<string>()
   for (const gateName of FREE_LANE_GATE_TOOL_NAMES) {
     // 已有恰好小写名的工具: 直接命中, 不改名。
     if (names.has(gateName)) continue
@@ -270,11 +275,12 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
     // 完全没有: 注入桩。
     tools.push(freeLaneGateTool(gateName))
     names.add(gateName)
+    injectedStubs.add(gateName)
   }
   body.tools = tools
   const hadTools = Array.isArray(parsed.tools) ? (parsed.tools as unknown[]).length > 0 : false
   if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
-  return { body, clientWantsStream, stubOnly: !hadTools, back }
+  return { body, clientWantsStream, stubOnly: !hadTools, back, injectedStubs }
 }
 
 function freeLaneGateResponsesTool(name: string) {
@@ -306,16 +312,52 @@ function ensureResponsesFreeLaneShape(body: Record<string, unknown>): void {
 }
 
 /**
+ * 计算我们实际注入的桩名集合(客户端没有 bash/read 或其大小写变体时才注入)。
+ * 与 mapFreeLaneClientTools 的改名逻辑对齐: 改名的不算注入, 只有桩才算。
+ */
+function computeInjectedStubs(chatBody: Record<string, unknown>): ReadonlySet<string> {
+  const injected = new Set<string>()
+  if (!Array.isArray(chatBody.tools)) {
+    for (const n of FREE_LANE_GATE_TOOL_NAMES) injected.add(n)
+    return injected
+  }
+  const tools = chatBody.tools as unknown[]
+  const names = new Set(tools.map((t) => {
+    const fn = (t !== null && typeof t === 'object' ? (t as Record<string, unknown>) : null)?.function as Record<string, unknown> | undefined
+    return typeof fn?.name === 'string' ? fn.name : undefined
+  }))
+  for (const gateName of FREE_LANE_GATE_TOOL_NAMES) {
+    if (names.has(gateName)) continue
+    const hasVariant = tools.some((t) => {
+      const fn = (t !== null && typeof t === 'object' ? (t as Record<string, unknown>) : null)?.function as Record<string, unknown> | undefined
+      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
+    })
+    if (!hasVariant) injected.add(gateName)
+  }
+  return injected
+}
+
+/** 查找 SSE 块的结束边界 (兼容 \n\n 与 CRLF \r\n\r\n) */
+function findSseBoundary(buf: string): { index: number; length: number } | null {
+  const lf = buf.indexOf('\n\n')
+  const crlf = buf.indexOf('\r\n\r\n')
+  if (lf === -1 && crlf === -1) return null
+  if (lf !== -1 && (crlf === -1 || lf < crlf)) return { index: lf, length: 2 }
+  return { index: crlf, length: 4 }
+}
+
+/**
  * 把上游 chat completions SSE 流拼成单个非流式 chat.completion JSON。
  * 客户端要 stream:false 但上游被强制 stream:true 时用, 保证 OpenAI 契约不断。
- * swallowStubs 为 true 时(桩全由我们注入): 过滤掉 bash/read 桩工具调用,
+ * swallowStubs 为 true 时(客户端原本零 tools): 启用按名过滤 bash/read 桩,
  * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
  */
 async function collapseChatSseToJson(
   response: Response,
   model: string,
   swallowStubs = false,
-  back: Record<string, string> = {}
+  back: Record<string, string> = {},
+  injectedStubs: ReadonlySet<string> = new Set()
 ): Promise<Response> {
   const text = await response.text()
   let content = ''
@@ -323,50 +365,64 @@ async function collapseChatSseToJson(
   let usage: unknown
   const toolCalls: Array<Record<string, unknown>> = []
   const argBufs: string[] = []
-  for (const chunk of text.split('\n\n')) {
-    const line = chunk.trim()
-    if (!line.startsWith('data:')) continue
-    const data = line.slice(5).trim()
-    if (data === '[DONE]') break
-    let evt: Record<string, unknown>
-    try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
-    const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
-    if (choice) {
-      const delta = choice.delta as Record<string, unknown> | undefined
-      if (delta) {
-        if (typeof delta.content === 'string') content += delta.content
-        const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
-        if (Array.isArray(tc)) {
-          for (const call of tc) {
-            const idx = typeof call.index === 'number' ? call.index : toolCalls.length
-            if (!toolCalls[idx]) {
-              toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
-              argBufs[idx] = ''
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  for (const chunk of normalized.split('\n\n')) {
+    for (const rawLine of chunk.split('\n')) {
+      const line = rawLine.trim()
+      if (!line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (data === '[DONE]') break
+      let evt: Record<string, unknown>
+      try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
+      const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
+      if (choice) {
+        const delta = choice.delta as Record<string, unknown> | undefined
+        if (delta) {
+          if (typeof delta.content === 'string') content += delta.content
+          const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
+          if (Array.isArray(tc)) {
+            for (const call of tc) {
+              const idx = typeof call.index === 'number' ? call.index : toolCalls.length
+              if (!toolCalls[idx]) {
+                toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
+                argBufs[idx] = ''
+              }
+              if (typeof call.id === 'string' && call.id) toolCalls[idx].id = call.id
+              const fn = (call.function ?? {}) as Record<string, unknown>
+              const target = toolCalls[idx].function as Record<string, unknown>
+              if (typeof fn.name === 'string' && fn.name) target.name = fn.name
+              if (typeof fn.arguments === 'string') argBufs[idx] += fn.arguments
             }
-            if (typeof call.id === 'string' && call.id) toolCalls[idx].id = call.id
-            const fn = (call.function ?? {}) as Record<string, unknown>
-            const target = toolCalls[idx].function as Record<string, unknown>
-            if (typeof fn.name === 'string' && fn.name) target.name = fn.name
-            if (typeof fn.arguments === 'string') argBufs[idx] += fn.arguments
           }
         }
+        if (typeof choice.finish_reason === 'string' && choice.finish_reason) finishReason = choice.finish_reason
       }
-      if (typeof choice.finish_reason === 'string' && choice.finish_reason) finishReason = choice.finish_reason
+      if (evt.usage && typeof evt.usage === 'object') usage = evt.usage
     }
-    if (evt.usage && typeof evt.usage === 'object') usage = evt.usage
   }
   for (let i = 0; i < toolCalls.length; i++) {
     const fn = toolCalls[i].function as Record<string, unknown>
     const name = typeof fn.name === 'string' ? fn.name : ''
+    const lower = name.toLowerCase()
     // 模型对 bash/read 的调用: 若来自客户端改名(back 有映射)则改回原名透传;
-    // 若是桩(我们注入的、back 无映射)则在 swallowStubs 时丢弃。
-    if (name && back[name]) {
-      fn.name = back[name]
+    // 若是桩(我们注入的、back 无映射)则在过滤时丢弃。
+    if (name && (back[lower] || back[name])) {
+      fn.name = back[lower] || back[name]
     }
     (toolCalls[i].function as Record<string, unknown>).arguments = argBufs[i] ?? ''
   }
-  const isStub = (name: string) => (name === 'bash' || name === 'read') && !back[name]
-  const finalToolCalls = swallowStubs
+  // 桩判定: bash/read 且不在改名映射里。
+  // 既支持纯桩场景 (swallowStubs)，也支持混合场景 (injectedStubs.has)。
+  const isStub = (name: string) => {
+    const lower = name.toLowerCase()
+    if (lower !== 'bash' && lower !== 'read') return false
+    if (back[lower] || back[name]) return false
+    return injectedStubs.size > 0
+      ? (injectedStubs.has(lower) || injectedStubs.has(name))
+      : swallowStubs
+  }
+  const shouldFilter = swallowStubs || injectedStubs.size > 0
+  const finalToolCalls = shouldFilter
     ? toolCalls.filter((tc) => {
         const fn = (tc.function ?? {}) as Record<string, unknown>
         const name = typeof fn.name === 'string' ? fn.name : ''
@@ -375,7 +431,7 @@ async function collapseChatSseToJson(
     : toolCalls
   // 只有真实观察到桩调用并被过滤掉时, 才算"模型调了桩": 空正文也可能是
   // 推理吃光 token 预算(finish_reason length) 等原因, 此时不能误报提示句。
-  const swallowedAny = swallowStubs && toolCalls.length > finalToolCalls.length
+  const swallowedAny = shouldFilter && toolCalls.length > finalToolCalls.length
   if (swallowedAny && finalToolCalls.length === 0 && finishReason === 'tool_calls') {
     finishReason = 'stop'
   }
@@ -409,7 +465,11 @@ async function collapseChatSseToJson(
  *    让 agent 客户端的本地执行工具真正被调用。
  * 其他内容原样重序列化透传。
  */
-function createStubSwallowingChatStream(back: Record<string, string> = {}): TransformStream<Uint8Array, Uint8Array> {
+function createStubSwallowingChatStream(
+  back: Record<string, string> = {},
+  injectedStubs: ReadonlySet<string> = new Set(),
+  hadClientTools = false
+): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
@@ -435,22 +495,24 @@ function createStubSwallowingChatStream(back: Record<string, string> = {}): Tran
             const idx = typeof call.index === 'number' ? call.index : -1
             const fn = (call.function ?? {}) as Record<string, unknown>
             const name = typeof fn.name === 'string' ? fn.name : ''
+            const lower = name.toLowerCase()
+            const isStubCandidate = lower === 'bash' || lower === 'read'
             if (idx >= 0) {
               seenIndexes.add(idx)
               // 桩(我们注入、back 无映射) → 吞噬; 客户端改名来的 → 改回原名保留。
-              if (name === 'bash' || name === 'read') {
-                if (back[name]) {
-                  fn.name = back[name]
-                } else {
+              if (isStubCandidate) {
+                if (back[lower] || back[name]) {
+                  fn.name = back[lower] || back[name]
+                } else if (injectedStubs.has(lower) || injectedStubs.has(name) || !hadClientTools) {
                   stubIndexes.add(idx)
-                  if (stubIndexes.has(idx)) continue
                 }
               }
-            } else if (name === 'bash' || name === 'read') {
+              if (stubIndexes.has(idx)) continue
+            } else if (isStubCandidate) {
               // 无 index 的调用: 桩直接丢弃; 改名来的改回原名。
-              if (back[name]) {
-                fn.name = back[name]
-              } else {
+              if (back[lower] || back[name]) {
+                fn.name = back[lower] || back[name]
+              } else if (injectedStubs.has(lower) || injectedStubs.has(name) || !hadClientTools) {
                 continue
               }
             }
@@ -493,17 +555,17 @@ function createStubSwallowingChatStream(back: Record<string, string> = {}): Tran
   return new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       buf += decoder.decode(chunk, { stream: true })
-      let sep: number
-      while ((sep = buf.indexOf('\n\n')) >= 0) {
-        const raw = buf.slice(0, sep)
-        buf = buf.slice(sep + 2)
-        for (const line of raw.split('\n')) emitLine(controller, line)
+      let boundary: { index: number; length: number } | null
+      while ((boundary = findSseBoundary(buf)) !== null) {
+        const raw = buf.slice(0, boundary.index)
+        buf = buf.slice(boundary.index + boundary.length)
+        for (const line of raw.replace(/\r/g, '').split('\n')) emitLine(controller, line)
       }
     },
     flush(controller) {
       const tail = buf
       buf = ''
-      for (const line of tail.split('\n')) emitLine(controller, line)
+      for (const line of tail.replace(/\r/g, '').split('\n')) emitLine(controller, line)
     },
   })
 }
@@ -590,8 +652,12 @@ function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
 
   const setupTimer = (controller: TransformStreamDefaultController<Uint8Array>) => {
     timer = setTimeout(() => {
-      controller.enqueue(encoder.encode(': keep-alive\n\n'))
-      setupTimer(controller)
+      try {
+        controller.enqueue(encoder.encode(': keep-alive\n\n'))
+        setupTimer(controller)
+      } catch {
+        timer = null
+      }
     }, KEEPALIVE_INTERVAL_MS)
   }
 
@@ -601,11 +667,11 @@ function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
     },
     transform(chunk, controller) {
       buf += decoder.decode(chunk, { stream: true })
-      let nl: number
+      let boundary: { index: number; length: number } | null
       // 只在事件边界（空行）处注入心跳，避免把一个 data 事件拆成两半。
-      while ((nl = buf.indexOf('\n\n')) >= 0) {
-        const raw = buf.slice(0, nl + 2)
-        buf = buf.slice(nl + 2)
+      while ((boundary = findSseBoundary(buf)) !== null) {
+        const raw = buf.slice(0, boundary.index + boundary.length)
+        buf = buf.slice(boundary.index + boundary.length)
         controller.enqueue(encoder.encode(raw))
       }
     },
@@ -614,6 +680,15 @@ function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
       const tail = decoder.decode()
       if (buf) controller.enqueue(encoder.encode(buf))
       if (tail) controller.enqueue(encoder.encode(tail))
+    },
+    cancel() {
+      // 客户端提前断开时 Workers 触发的是 cancel 而非 flush; 不清定时器会在
+      // 随后的 enqueue 上抛 TypeError(向已关闭的 controller 写入), 在 isolate
+      // 里变成未捕获的后台异常。
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
     },
   })
 }
@@ -642,8 +717,10 @@ async function proxyOpenCodeResponses(
   model: string
 ): Promise<Response> {
   // 工具改名: 客户端的 Bash/Read 先改名为上游要的 bash/read, back 记录
-  // 上游名→客户端原名, 下游把模型调用改回原名。
+  // 上游名→客户端原名, 下游把模型调用改回原名。injectedStubs 是我们注入的
+  // 桩名(客户端缺对应工具时才注入), 下游据此按名吞桩 —— 混合场景下同样生效。
   const back = mapFreeLaneClientTools(chatBody)
+  const injectedStubs = computeInjectedStubs(chatBody)
   const responsesBody = chatBodyToResponsesBody(chatBody)
   // Free-lane body gate (Responses 形态): 上游同样要求 stream:true 且带
   // bash/read 工具, 缺一即 FreeTierError。
@@ -667,17 +744,17 @@ async function proxyOpenCodeResponses(
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('text/event-stream') && response.body) {
-    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly, back)), {
+    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly, back, injectedStubs)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     })
     // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
     if (clientWantsStream) return translated
-    return collapseChatSseToJson(translated, model, stubOnly, back)
+    return collapseChatSseToJson(translated, model, stubOnly, back, injectedStubs)
   }
   const data = await response.json() as Record<string, unknown>
-  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly, back)), {
+  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly, back, injectedStubs)), {
     status: response.status,
     statusText: response.statusText,
     headers: { 'Content-Type': 'application/json' },
@@ -715,25 +792,27 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   let gateModel = 'opencode'
   let stubOnly = false
   let back: Record<string, string> = {}
+  let injectedStubs: ReadonlySet<string> = new Set()
   if (parsedBody && Array.isArray(parsedBody.messages)) {
     const gated = applyFreeLaneGate(parsedBody)
     upstreamOptions = { ...options, body: JSON.stringify(gated.body) }
     clientWantsStream = gated.clientWantsStream
     stubOnly = gated.stubOnly
     back = gated.back
+    injectedStubs = gated.injectedStubs
     if (typeof parsedBody.model === 'string' && parsedBody.model) gateModel = parsedBody.model
   }
 
   // 上游被强制 stream:true; 客户端要的是非流式时把 SSE 拼回单个 JSON,
-  // 保证 OpenAI 非流式契约不断。stubOnly 时吞噬桩工具调用。
+  // 保证 OpenAI 非流式契约不断。注入过桩时按名吞噬桩工具调用。
   const passthroughOk = (response: Response): Promise<Response> | Response => {
     const contentType = response.headers.get('content-type') || ''
     const isSse = contentType.includes('text/event-stream') && !!response.body
     if (!clientWantsStream && isSse) {
-      return collapseChatSseToJson(response, gateModel, stubOnly, back)
+      return collapseChatSseToJson(response, gateModel, stubOnly, back, injectedStubs)
     }
-    if (clientWantsStream && (stubOnly || Object.keys(back).length > 0) && isSse) {
-      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back)), {
+    if (clientWantsStream && (injectedStubs.size > 0 || Object.keys(back).length > 0) && isSse) {
+      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back, injectedStubs, stubOnly === false)), {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
@@ -786,7 +865,11 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   // 官方地址本身接受 `Bearer public`，等价于一个匿名镜像。这避免了全新部署在配置
   // 镜像前完全不可用；也覆盖了“Key 被 401、匿名额度仍可用”的场景。
   // 仅在尚未拿到任何响应（含失败响应）时才试，避免重复请求已健康的端点。
-  if (!officialFailure && !mirrorFailure) {
+  // 鉴权类失败 (401/403) 时也降级到匿名额度重试，而不是把 401 直接返给客户端。
+  const shouldTryAnonymous =
+    (!officialFailure && !mirrorFailure) ||
+    ((officialFailure?.status === 401 || officialFailure?.status === 403) && !mirrorFailure)
+  if (shouldTryAnonymous) {
     try {
       const response = await requestUpstream(
         fetcher,
@@ -824,7 +907,9 @@ export async function testOpenCodeModel(
     body: JSON.stringify({
       model: modelId,
       messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 1,
+      // 思考类模型 (muse-* 等) max_tokens:1 会全部消耗在推理上, 返回空正文,
+      // 客户端易误判为失败; 给到 64 保证有可见输出。
+      max_tokens: 64,
     }),
     fetcher,
   })
