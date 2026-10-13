@@ -2,6 +2,7 @@ import type { ApiKeyEntry, Env } from './types'
 import {
   chatBodyToResponsesBody,
   createResponsesToChatStream,
+  mapFreeLaneClientTools,
   responsesToChatBody,
   STUB_SWALLOW_NOTE,
   zenModelNeedsResponses,
@@ -10,7 +11,9 @@ import {
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.19.0'
-const OPENCODE_TIMEOUT_MS = 300000
+// 响应头超时（毫秒）：镜像逐个串行尝试，单个镜像最坏等待。30000ms（30s）足够
+// 一个正常上游返回响应头，又能让挂掉的镜像快速放弃、换下一个出口。
+const OPENCODE_TIMEOUT_MS = 30000
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -223,10 +226,23 @@ function freeLaneGateTool(name: string) {
 /**
  * 上游匿名通道的 body 门禁: 强制 stream:true; 缺失 bash/read 时注入桩工具。
  * 客户端原本就没有 tools 时加 tool_choice:"none" 兜底(模型不会真调桩)。
- * 返回 { body, clientWantsStream, stubOnly }: stubOnly 为 true 表示桩全部由
- * 我们注入(客户端零 tools), 下游可据此吞噬桩工具调用而不误伤真工具。
+ *
+ * 与 magpie 同构的「工具改名」: 客户端的 Bash/Read(大写/任意大小写变体)会被
+ * 改名为小写的 bash/read 发给上游, 下游再改回原名透传给客户端 —— 这样 agent
+ * 客户端(Claude Code / Codex 等)的本地执行工具能真正被模型调用并执行, 而不是
+ * 被桩吞噬。客户端没有该工具时才注入「桩」(stub), 桩调用一律吞噬。
+ *
+ * 返回:
+ *  - clientWantsStream: 客户端是否要求流式
+ *  - stubOnly: 桩是否全部由我们注入(客户端零 tools), 下游据此吞噬桩调用
+ *  - back: 上游名(bash/read) → 客户端原名 的映射, 下游把模型调用改回原名
  */
-function applyFreeLaneGate(parsed: Record<string, unknown>): { body: Record<string, unknown>, clientWantsStream: boolean, stubOnly: boolean } {
+function applyFreeLaneGate(parsed: Record<string, unknown>): {
+  body: Record<string, unknown>
+  clientWantsStream: boolean
+  stubOnly: boolean
+  back: Record<string, string>
+} {
   const clientWantsStream = parsed.stream === true
   const body: Record<string, unknown> = { ...parsed, stream: true }
   const rawTools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
@@ -235,13 +251,30 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): { body: Record<stri
     const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
     return typeof fn?.name === 'string' ? fn.name : undefined
   }))
-  const hadTools = tools.length > 0
-  for (const name of FREE_LANE_GATE_TOOL_NAMES) {
-    if (!names.has(name)) tools.push(freeLaneGateTool(name))
+  const back: Record<string, string> = {}
+  for (const gateName of FREE_LANE_GATE_TOOL_NAMES) {
+    // 已有恰好小写名的工具: 直接命中, 不改名。
+    if (names.has(gateName)) continue
+    // 大小写不敏感变体(如 Bash / READ): 改名为标准小写, 记回映射。
+    const variant = tools.find((t) => {
+      const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
+      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
+    })
+    if (variant) {
+      const fn = (variant as Record<string, unknown>).function as Record<string, unknown>
+      back[gateName] = String(fn.name)
+      fn.name = gateName
+      names.add(gateName)
+      continue
+    }
+    // 完全没有: 注入桩。
+    tools.push(freeLaneGateTool(gateName))
+    names.add(gateName)
   }
   body.tools = tools
+  const hadTools = Array.isArray(parsed.tools) ? (parsed.tools as unknown[]).length > 0 : false
   if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
-  return { body, clientWantsStream, stubOnly: !hadTools }
+  return { body, clientWantsStream, stubOnly: !hadTools, back }
 }
 
 function freeLaneGateResponsesTool(name: string) {
@@ -278,7 +311,12 @@ function ensureResponsesFreeLaneShape(body: Record<string, unknown>): void {
  * swallowStubs 为 true 时(桩全由我们注入): 过滤掉 bash/read 桩工具调用,
  * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
  */
-async function collapseChatSseToJson(response: Response, model: string, swallowStubs = false): Promise<Response> {
+async function collapseChatSseToJson(
+  response: Response,
+  model: string,
+  swallowStubs = false,
+  back: Record<string, string> = {}
+): Promise<Response> {
   const text = await response.text()
   let content = ''
   let finishReason = 'stop'
@@ -318,13 +356,21 @@ async function collapseChatSseToJson(response: Response, model: string, swallowS
     if (evt.usage && typeof evt.usage === 'object') usage = evt.usage
   }
   for (let i = 0; i < toolCalls.length; i++) {
+    const fn = toolCalls[i].function as Record<string, unknown>
+    const name = typeof fn.name === 'string' ? fn.name : ''
+    // 模型对 bash/read 的调用: 若来自客户端改名(back 有映射)则改回原名透传;
+    // 若是桩(我们注入的、back 无映射)则在 swallowStubs 时丢弃。
+    if (name && back[name]) {
+      fn.name = back[name]
+    }
     (toolCalls[i].function as Record<string, unknown>).arguments = argBufs[i] ?? ''
   }
+  const isStub = (name: string) => (name === 'bash' || name === 'read') && !back[name]
   const finalToolCalls = swallowStubs
     ? toolCalls.filter((tc) => {
         const fn = (tc.function ?? {}) as Record<string, unknown>
         const name = typeof fn.name === 'string' ? fn.name : ''
-        return name !== 'bash' && name !== 'read'
+        return !isStub(name)
       })
     : toolCalls
   // 只有真实观察到桩调用并被过滤掉时, 才算"模型调了桩": 空正文也可能是
@@ -355,12 +401,15 @@ async function collapseChatSseToJson(response: Response, model: string, swallowS
 }
 
 /**
- * 流式 stub 吞噬(客户端要 stream:true 且桩全由我们注入时用)。
- * 上游 SSE 里任何 tool_calls 增量都只能是桩 bash/read 的调用: 按 index 跟踪,
- * 一旦某 index 被识别为桩命名, 该 index 的后续增量全部丢弃; 其他内容原样
- * 重序列化透传。全是桩调用时 finish_reason tool_calls → stop。
+ * 流式 stub 吞噬 / 工具改名还原(客户端要 stream:true 时用)。
+ * 上游 SSE 里任何 tool_calls 增量:
+ *  - 桩 bash/read(back 无映射, 我们注入的): 一旦某 index 被识别为桩命名, 该
+ *    index 的后续增量全部丢弃, 直到结束; 全是桩调用时 finish_reason tool_calls → stop。
+ *  - 客户端改名来的 bash/read(back 有映射): 把名字改回客户端原名后原样透传,
+ *    让 agent 客户端的本地执行工具真正被调用。
+ * 其他内容原样重序列化透传。
  */
-function createStubSwallowingChatStream(): TransformStream<Uint8Array, Uint8Array> {
+function createStubSwallowingChatStream(back: Record<string, string> = {}): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
@@ -388,10 +437,22 @@ function createStubSwallowingChatStream(): TransformStream<Uint8Array, Uint8Arra
             const name = typeof fn.name === 'string' ? fn.name : ''
             if (idx >= 0) {
               seenIndexes.add(idx)
-              if (name === 'bash' || name === 'read') stubIndexes.add(idx)
-              if (stubIndexes.has(idx)) continue
+              // 桩(我们注入、back 无映射) → 吞噬; 客户端改名来的 → 改回原名保留。
+              if (name === 'bash' || name === 'read') {
+                if (back[name]) {
+                  fn.name = back[name]
+                } else {
+                  stubIndexes.add(idx)
+                  if (stubIndexes.has(idx)) continue
+                }
+              }
             } else if (name === 'bash' || name === 'read') {
-              continue
+              // 无 index 的调用: 桩直接丢弃; 改名来的改回原名。
+              if (back[name]) {
+                fn.name = back[name]
+              } else {
+                continue
+              }
             }
             kept.push(call)
           }
@@ -490,10 +551,11 @@ async function requestUpstream(
     () => controller.abort(new Error(`OpenCode 上游 ${OPENCODE_TIMEOUT_MS / 1000}s 内未返回响应头`)),
     OPENCODE_TIMEOUT_MS
   )
+  let response: Response
   try {
     const headers = createRequestHeaders(apiKey, requestId, sessionId)
     if (options.modelHeader) headers.set('x-opencode-model', options.modelHeader)
-    return await fetcher(url, {
+    response = await fetcher(url, {
       method: options.method,
       headers,
       body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
@@ -502,6 +564,58 @@ async function requestUpstream(
   } finally {
     clearTimeout(timer)
   }
+  // 等待响应头期间，上游可能迟迟不发第一个 token（思考/排队）。边发心跳边等待，
+  // 让下游连接保持活跃，避免客户端或中间层因“长时间静默”判定超时断开。
+  if (response.ok && response.body) {
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('text/event-stream')) {
+      return new Response(response.body.pipeThrough(createKeepAliveStream()), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      })
+    }
+  }
+  return response
+}
+
+// 心跳保活：每隔固定间隔向 SSE 流注入一条注释行。注释行（以冒号开头）对
+// 客户端透明，仅用于重置空闲计时，不影响任意下游解析器。
+const KEEPALIVE_INTERVAL_MS = 15000
+function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  const setupTimer = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    timer = setTimeout(() => {
+      controller.enqueue(encoder.encode(': keep-alive\n\n'))
+      setupTimer(controller)
+    }, KEEPALIVE_INTERVAL_MS)
+  }
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      setupTimer(controller)
+    },
+    transform(chunk, controller) {
+      buf += decoder.decode(chunk, { stream: true })
+      let nl: number
+      // 只在事件边界（空行）处注入心跳，避免把一个 data 事件拆成两半。
+      while ((nl = buf.indexOf('\n\n')) >= 0) {
+        const raw = buf.slice(0, nl + 2)
+        buf = buf.slice(nl + 2)
+        controller.enqueue(encoder.encode(raw))
+      }
+    },
+    flush(controller) {
+      if (timer) clearTimeout(timer)
+      const tail = decoder.decode()
+      if (buf) controller.enqueue(encoder.encode(buf))
+      if (tail) controller.enqueue(encoder.encode(tail))
+    },
+  })
 }
 
 export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Promise<Response> {
@@ -527,6 +641,9 @@ async function proxyOpenCodeResponses(
   chatBody: Record<string, unknown>,
   model: string
 ): Promise<Response> {
+  // 工具改名: 客户端的 Bash/Read 先改名为上游要的 bash/read, back 记录
+  // 上游名→客户端原名, 下游把模型调用改回原名。
+  const back = mapFreeLaneClientTools(chatBody)
   const responsesBody = chatBodyToResponsesBody(chatBody)
   // Free-lane body gate (Responses 形态): 上游同样要求 stream:true 且带
   // bash/read 工具, 缺一即 FreeTierError。
@@ -550,17 +667,17 @@ async function proxyOpenCodeResponses(
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('text/event-stream') && response.body) {
-    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly)), {
+    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly, back)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     })
     // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
     if (clientWantsStream) return translated
-    return collapseChatSseToJson(translated, model, stubOnly)
+    return collapseChatSseToJson(translated, model, stubOnly, back)
   }
   const data = await response.json() as Record<string, unknown>
-  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly)), {
+  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly, back)), {
     status: response.status,
     statusText: response.statusText,
     headers: { 'Content-Type': 'application/json' },
@@ -597,11 +714,13 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   let clientWantsStream = true
   let gateModel = 'opencode'
   let stubOnly = false
+  let back: Record<string, string> = {}
   if (parsedBody && Array.isArray(parsedBody.messages)) {
     const gated = applyFreeLaneGate(parsedBody)
     upstreamOptions = { ...options, body: JSON.stringify(gated.body) }
     clientWantsStream = gated.clientWantsStream
     stubOnly = gated.stubOnly
+    back = gated.back
     if (typeof parsedBody.model === 'string' && parsedBody.model) gateModel = parsedBody.model
   }
 
@@ -611,10 +730,10 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     const contentType = response.headers.get('content-type') || ''
     const isSse = contentType.includes('text/event-stream') && !!response.body
     if (!clientWantsStream && isSse) {
-      return collapseChatSseToJson(response, gateModel, stubOnly)
+      return collapseChatSseToJson(response, gateModel, stubOnly, back)
     }
-    if (clientWantsStream && stubOnly && isSse) {
-      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream()), {
+    if (clientWantsStream && (stubOnly || Object.keys(back).length > 0) && isSse) {
+      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back)), {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
@@ -658,6 +777,27 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
       )
       if (response.ok) return passthroughOk(response)
       mirrorFailure = await storeFailure(response)
+    } catch (error) {
+      lastTransportError = error
+    }
+  }
+
+  // 兜底：官方匿名额度。当“无配置 Key 且未配镜像”或前面的尝试都没给到可用响应时，
+  // 官方地址本身接受 `Bearer public`，等价于一个匿名镜像。这避免了全新部署在配置
+  // 镜像前完全不可用；也覆盖了“Key 被 401、匿名额度仍可用”的场景。
+  // 仅在尚未拿到任何响应（含失败响应）时才试，避免重复请求已健康的端点。
+  if (!officialFailure && !mirrorFailure) {
+    try {
+      const response = await requestUpstream(
+        fetcher,
+        officialUrl,
+        'public',
+        upstreamOptions,
+        requestId,
+        sessionId
+      )
+      if (response.ok) return passthroughOk(response)
+      officialFailure = await storeFailure(response)
     } catch (error) {
       lastTransportError = error
     }

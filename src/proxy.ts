@@ -15,6 +15,28 @@ type HealthMap = Record<string, KeyHealth>
 
 const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
+// 上游响应头超时（毫秒）。只约束“等待响应头”阶段：headers 到手后立即取消
+// 计时，body 流式消费不再受硬顶限制——长回答不会在流中途被掐断（客户端侧的
+// 空闲超时/取消自然兜底）。这与 opencode 通道的 requestUpstream 同构。
+const FORWARD_HEADER_TIMEOUT_MS = 30000
+
+async function fetchWithHeaderTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = FORWARD_HEADER_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(new Error(`上游在 ${timeoutMs / 1000}s 内未返回响应头`)),
+    timeoutMs
+  )
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   const raw = await env.KV.get(HEALTH_KEY(providerId))
   return raw ? JSON.parse(raw) : {}
@@ -108,6 +130,14 @@ export async function testModelConnection(
 /** 处理 /v1/chat/completions 等 API 转发 */
 export async function handleProxy(c: Context<{ Bindings: Env }>) {
   try {
+    // GET / HEAD 无请求体: 直接给出明确错误而不是让 c.req.json() 抛
+    // SyntaxError 落进 500。其余方法再尝试解析 JSON body。
+    if (c.req.method === 'GET' || c.req.method === 'HEAD') {
+      return c.json({
+        error: { message: '该端点仅支持 POST（GET 请求请使用 /v1/models）', type: 'invalid_request_error' },
+      }, 405)
+    }
+
     const body = await c.req.json<ProxyRequestBody>()
     const model = body.model
 
@@ -265,11 +295,10 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           forwardHeaders['Authorization'] = `Bearer ${apiKey}`
         }
 
-        const response = await fetch(forwardUrl, {
+        const response = await fetchWithHeaderTimeout(forwardUrl, {
           method: c.req.method,
           headers: forwardHeaders,
           body: JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(60000),
         })
 
         if (response.ok) {
@@ -298,14 +327,21 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 401/403/5xx 尝试下一个 key（标记失败）
         if (response.status === 401 || response.status === 403 || response.status >= 500) {
+          const isNew = !healthData[apiKey]
           const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+          const reachedThreshold = !isNew && h.failures >= KEY_HEALTH_MAX_FAILURES
           h.failures++
           h.lastFailed = true
           if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
             h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+            // 仅在“刚达到降权阈值”这一刻写 KV，避免上游抖动时每请求一次烧穿写配额。
+            // 普通失败（未达阈值）只更新内存中的 healthData，不触发 KV 写。
+            if (!reachedThreshold) healthUpdated = true
+          } else if (isNew) {
+            // 首条失败也记录一次，便于后续在同一 isolate 内保持累计一致。
+            healthUpdated = true
           }
           healthData[apiKey] = h
-          healthUpdated = true
           lastError = response
           continue
         }
@@ -316,14 +352,18 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       } catch (err) {
         const error = err as Error
         // 网络错误也标记为失败
+        const isNew = !healthData[apiKey]
         const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+        const reachedThreshold = !isNew && h.failures >= KEY_HEALTH_MAX_FAILURES
         h.failures++
         h.lastFailed = true
         if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
           h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+          if (!reachedThreshold) healthUpdated = true
+        } else if (isNew) {
+          healthUpdated = true
         }
         healthData[apiKey] = h
-        healthUpdated = true
         lastError = new Response(JSON.stringify({
           error: { message: error.message || '请求失败', type: 'proxy_error' },
         }), { status: 502 })

@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { logger } from 'hono/logger'
+import { getCookie } from 'hono/cookie'
 import type { Env } from './types'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels } from './proxy'
@@ -25,7 +25,8 @@ const app = new Hono<{ Bindings: Env }>()
 
 // ===== 全局中间件 =====
 app.use('*', cors())
-app.use('*', logger())
+// 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
+// tail 日志足够排查问题。
 
 // 首次请求时填充虚拟数据
 let seeded = false
@@ -39,11 +40,10 @@ app.use('*', async (c, next) => {
 
 // ===== 首页 =====
 app.get('/', async (c) => {
-  const { getCookie } = await import('hono/cookie')
   const sessionId = getCookie(c, 'session_id')
   let isLoggedIn = false
   if (sessionId) {
-const session = await getSession(c.env, sessionId)
+    const session = await getSession(c.env, sessionId)
     isLoggedIn = session !== null
   }
   return renderHomePage(c, isLoggedIn)

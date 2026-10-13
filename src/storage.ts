@@ -1,11 +1,50 @@
 import { KV_KEYS } from './config'
 import type { Env, Provider, ProxyKey, Session } from './types'
 
+// ===== isolate 内存缓存 =====
+// Cloudflare KV 是磁盘后端，每读 10~50ms 且串行。Worker isolate 通常存活数百到
+// 上千个请求，把热点配置（providers / proxy keys / 健康状态）缓存在内存里可显著
+// 降低首字节延迟。TTL 较短（默认 60s），且任何写操作都会立即失效对应缓存，
+// 因此管理后台的变更最迟在 TTL 内对新请求生效，可接受的取舍。
+const CACHE_TTL_MS = 60 * 1000
+
+interface CacheEntry<T> {
+  value: T
+  expiresAt: number
+}
+
+// 模块级单例：跨请求共享同一 isolate 内的缓存。
+const memCache = new Map<string, CacheEntry<unknown>>()
+
+function cacheGet<T>(key: string): T | undefined {
+  const entry = memCache.get(key)
+  if (!entry) return undefined
+  if (Date.now() >= entry.expiresAt) {
+    memCache.delete(key)
+    return undefined
+  }
+  return entry.value as T
+}
+
+function cacheSet<T>(key: string, value: T): void {
+  memCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS })
+}
+
+// 写后立即失效：保证后续读拿到的是 KV 里的新值，而不是过期的缓存副本。
+function cacheDelete(key: string): void {
+  memCache.delete(key)
+}
+
 // ===== 提供商 CRUD =====
 
 export async function getProviders(env: Env): Promise<Provider[]> {
-  const data = await env.KV.get(KV_KEYS.PROVIDERS)
-  return data ? JSON.parse(data) : []
+  const cacheKey = KV_KEYS.PROVIDERS
+  const cached = cacheGet<Provider[]>(cacheKey)
+  if (cached) return cached
+  const data = await env.KV.get(cacheKey)
+  const parsed = data ? JSON.parse(data) as Provider[] : []
+  cacheSet(cacheKey, parsed)
+  return parsed
 }
 
 export async function getProvider(env: Env, id: string): Promise<Provider | null> {
@@ -14,6 +53,7 @@ export async function getProvider(env: Env, id: string): Promise<Provider | null
 }
 
 export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
+  cacheSet(KV_KEYS.PROVIDERS, providers)
   await env.KV.put(KV_KEYS.PROVIDERS, JSON.stringify(providers))
 }
 
@@ -72,11 +112,17 @@ export async function deleteSession(env: Env, sessionId: string): Promise<void> 
 // ===== 转发 Key =====
 
 export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
-  const data = await env.KV.get(KV_KEYS.PROXY_KEYS)
-  return data ? JSON.parse(data) : []
+  const cacheKey = KV_KEYS.PROXY_KEYS
+  const cached = cacheGet<ProxyKey[]>(cacheKey)
+  if (cached) return cached
+  const data = await env.KV.get(cacheKey)
+  const parsed = data ? JSON.parse(data) as ProxyKey[] : []
+  cacheSet(cacheKey, parsed)
+  return parsed
 }
 
 export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
+  cacheSet(KV_KEYS.PROXY_KEYS, keys)
   await env.KV.put(KV_KEYS.PROXY_KEYS, JSON.stringify(keys))
 }
 

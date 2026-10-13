@@ -61,6 +61,36 @@ export function normalizeReasoningEffort(value: unknown): string {
 
 // ============ 请求转换: OpenAI chat -> Responses ============
 
+// 与 magpie 同构的「工具改名」: 客户端工具名 Bash/Read(任意大小写变体)会被改名为
+// 小写的 bash/read 发给上游, 返回值里的 back 记录 上游名→客户端原名 映射, 供下游
+// 把模型调用改回原名透传。客户端没有该工具时才注入桩(在 opencode.ts 的 gate 里做)。
+export function mapFreeLaneClientTools(chat: Rec): Record<string, string> {
+  const back: Record<string, string> = {}
+  if (!Array.isArray(chat.tools)) return back
+  const FREE_LANE_NAMES = ['bash', 'read']
+  const tools = chat.tools as unknown[]
+  const names = new Set(
+    tools.map((t) => {
+      const fn = asRecord(t)?.function as Rec | undefined
+      return typeof fn?.name === 'string' ? fn.name : undefined
+    }).filter((n): n is string => typeof n === 'string')
+  )
+  for (const gateName of FREE_LANE_NAMES) {
+    if (names.has(gateName)) continue
+    const variant = tools.find((t) => {
+      const fn = asRecord(t)?.function as Rec | undefined
+      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
+    })
+    if (variant) {
+      const fn = asRecord(variant)!.function as Rec
+      back[gateName] = String(fn.name)
+      fn.name = gateName
+      names.add(gateName)
+    }
+  }
+  return back
+}
+
 export function chatBodyToResponsesBody(chat: Rec): Rec {
   const out: Rec = {}
   if (typeof chat.model === 'string' && chat.model) out.model = chat.model
@@ -96,14 +126,16 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
       case 'assistant': {
         if (text) input.push({ role: 'assistant', content: text })
         if (Array.isArray(m.tool_calls)) {
-          for (const ti of m.tool_calls) {
+          const calls = m.tool_calls as unknown[]
+          for (const ti of calls) {
             const tc = asRecord(ti)
             if (!tc) continue
             const fn = asRecord(tc.function)
+            const name = typeof fn?.name === 'string' ? String(fn.name) : ''
             input.push({
               type: 'function_call',
               call_id: tc.id ?? '',
-              name: fn?.name ?? '',
+              name,
               arguments: typeof fn?.arguments === 'string' ? fn.arguments : '',
             })
           }
@@ -150,7 +182,7 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
 
 // ============ 响应转换: Responses -> OpenAI chat ============
 
-export function responsesToChatBody(resp: Rec, swallowStubs = false): Rec {
+export function responsesToChatBody(resp: Rec, swallowStubs = false, back: Record<string, string> = {}): Rec {
   const model = typeof resp.model === 'string' ? resp.model : ''
   let text = ''
   const toolCalls: Rec[] = []
@@ -164,10 +196,14 @@ export function responsesToChatBody(resp: Rec, swallowStubs = false): Rec {
           if (p && p.type === 'output_text' && typeof p.text === 'string') text += p.text
         }
       } else if (item.type === 'function_call') {
+        // 客户端改名来的 bash/read(back 有映射)改回原名; 桩(back 无映射)保持原名,
+        // 交给下面的 swallowStubs 过滤。
+        let name = typeof item.name === 'string' ? item.name : ''
+        if (name && back[name]) name = back[name]
         toolCalls.push({
           id: item.call_id ?? item.id ?? '',
           type: 'function',
-          function: { name: item.name ?? '', arguments: typeof item.arguments === 'string' ? item.arguments : '' },
+          function: { name, arguments: typeof item.arguments === 'string' ? item.arguments : '' },
         })
       }
     }
@@ -176,7 +212,10 @@ export function responsesToChatBody(resp: Rec, swallowStubs = false): Rec {
   // swallowStubs: 桩全由我们注入时过滤掉 bash/read 桩调用, 不透给客户端。
   // 只有真实观察到桩调用时才提示; 空正文也可能是推理吃光预算等原因, 不误报。
   const finalToolCalls = swallowStubs
-    ? toolCalls.filter((tc) => !isStubToolName(asRecord(tc.function)?.name))
+    ? toolCalls.filter((tc) => {
+        const name = asRecord(tc.function)?.name
+        return !isStubToolName(name) || typeof name === 'string' && !!back[name]
+      })
     : toolCalls
   const swallowedAny = swallowStubs && toolCalls.length > finalToolCalls.length
 
@@ -225,7 +264,11 @@ function sseChunk(model: string, id: string, delta: Rec, finish?: string, usage?
   return `data: ${JSON.stringify(o)}\n\n`
 }
 
-export function createResponsesToChatStream(model: string, swallowStubs = false): TransformStream<Uint8Array, Uint8Array> {
+export function createResponsesToChatStream(
+  model: string,
+  swallowStubs = false,
+  back: Record<string, string> = {}
+): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
@@ -247,9 +290,12 @@ export function createResponsesToChatStream(model: string, swallowStubs = false)
         const item = asRecord(ev.item)
         if (item && item.type === 'function_call') {
           const itemID = typeof item.id === 'string' ? item.id : ''
-          const name = typeof item.name === 'string' ? item.name : ''
-          // 桩全由我们注入时: 吞掉 bash/read 桩调用, 不下发给客户端。
-          if (swallowStubs && isStubToolName(name)) {
+          let name = typeof item.name === 'string' ? item.name : ''
+          // 客户端改名来的 bash/read(back 有映射)改回原名透传;
+          // 桩(back 无映射)在 swallowStubs 时吞掉, 不下发给客户端。
+          const isRenamed = !!(name && back[name])
+          if (isRenamed) name = back[name]
+          if (swallowStubs && isStubToolName(name) && !isRenamed) {
             swallowedIds.add(itemID)
             break
           }
@@ -260,7 +306,7 @@ export function createResponsesToChatStream(model: string, swallowStubs = false)
               index: idx,
               id: item.call_id ?? itemID,
               type: 'function',
-              function: { name: item.name ?? '', arguments: '' },
+              function: { name, arguments: '' },
             }],
           })))
         }
@@ -279,7 +325,13 @@ export function createResponsesToChatStream(model: string, swallowStubs = false)
       }
       case 'response.completed':
       case 'response.incomplete': {
-        const finish = type === 'response.incomplete' ? 'length' : 'stop'
+        // 与非流式路径(responsesToChatBody)对齐: 本轮发过 function_call 时以
+        // tool_calls 结束, 客户端才能识别为“需要执行工具”; 但桩全被吞光时仍为
+        // stop。incomplete 始终为 length。
+        const hasToolCalls = nextIdx > swallowedIds.size
+        const finish = type === 'response.incomplete'
+          ? 'length'
+          : hasToolCalls ? 'tool_calls' : 'stop'
         const resp = asRecord(ev.response)
         const usage = asRecord(resp?.usage)
         const usageOut = usage
