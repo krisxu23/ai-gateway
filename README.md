@@ -9,7 +9,7 @@
 - **Free-lane Body Gate** — 上游匿名通道要求 `stream:true` 且 body 带 `bash`/`read` 工具，网关自动满足；`stream:false` 的客户端自动收流转 JSON，契约不断
 - **Responses 自动转换** — `muse-*` 免费家族只在上游 `/responses` 端点提供服务，网关自动改写请求并把响应（含流式）翻译回 chat 格式，调用方无感
 - **桩调用吞噬** — 模型误调网关注入的桩工具时，该调用不回传给客户端，避免空参数工具调用被执行
-- **多镜像故障转移** — 官方地址失败后按随机起点轮询镜像（`OPENCODE_MIRRORS_URL` 配置）；可按 [`opencode-cdn.md`](./opencode-cdn.md) 自建镜像
+- **多镜像故障转移** — 官方地址失败后按随机起点轮询镜像（`OPENCODE_MIRRORS_URL` 配置）；可按 [`docs/opencode-cdn.md`](./docs/opencode-cdn.md) 自建镜像
 - **多 Key 轮询 + 健康检查** — 每个提供商可配多个 Key，请求随机打乱；失败 Key 自动降权，连续失败 5 次后冷却 5 分钟，冷却到期自动试用恢复
 - **两级启用控制** — 提供商级别 + 模型级别的启用/禁用
 - **转发 Key 认证** — 生成 `sk_cf_*` 格式的 API Key，支持有效期管理
@@ -38,7 +38,7 @@
 
 请求顺序：已配置的上游 Key（走官方地址）→ 失败（401/403/429/网络错误/超时）→ 按随机起点依次尝试 `OPENCODE_MIRRORS_URL` 中的镜像。镜像是到同一上游的不同反代，作用是**故障转移 + 换出口**。
 
-额度说明：Zen 免费档按**出口 IP** 计额度，不看 Key。网关跑在 Cloudflare Workers 上，出口是 CF 的共享 IP 池（会轮换，但不可控、且与全网 CF 用户共享）；每个镜像的出口网络则是独立的额度池。想加额度靠加出口：自建 CDN 镜像、VPS 转发做镜像等，教程见 [`opencode-cdn.md`](./opencode-cdn.md)。注意第三方公共镜像可能随时下线，关键业务建议自建。
+额度说明：Zen 免费档按**出口 IP** 计额度，不看 Key。网关跑在 Cloudflare Workers 上，出口是 CF 的共享 IP 池（会轮换，但不可控、且与全网 CF 用户共享）；每个镜像的出口网络则是独立的额度池。想加额度靠加出口：自建 CDN 镜像、VPS 转发做镜像等，教程见 [`docs/opencode-cdn.md`](./docs/opencode-cdn.md)。注意第三方公共镜像可能随时下线，关键业务建议自建。
 
 ## 技术栈
 
@@ -82,7 +82,7 @@ npm run dev
   https://opencode.gcore.cmliussss.net/zen/v1
   ```
 
-  > 以上镜像地址来源于 CM 大佬，在此表示感谢！也可按 [`opencode-cdn.md`](./opencode-cdn.md) 自建后替换。
+  > 以上镜像地址来源于 CM 大佬，在此表示感谢！也可按 [`docs/opencode-cdn.md`](./docs/opencode-cdn.md) 自建后替换。
 
 - 建议：绑定一个自定义域名
 
@@ -106,7 +106,7 @@ npm run dev
 
 OpenCode 提供商默认不需要上游 Key。若在管理后台为其添加了 Key，请求优先走官方 API 地址；失败时再从随机起点依次尝试镜像，并使用内置的 `Bearer public`。镜像列表由环境变量 `OPENCODE_MIRRORS_URL` 配置（多行/逗号分隔，全局去重）。已有 KV 数据不会被删除，升级时仅在缺少 OpenCode 提供商时补充默认项。
 
-接口细节见 [`API.md`](./API.md)，自建镜像教程见 [`opencode-cdn.md`](./opencode-cdn.md)。
+接口细节见 [`docs/API.md`](./docs/API.md)，自建镜像教程见 [`docs/opencode-cdn.md`](./docs/opencode-cdn.md)。
 
 ## 项目结构
 
@@ -116,20 +116,21 @@ ai-gateway/
 │   ├── index.ts            # 入口，路由注册
 │   ├── types.ts            # 类型定义
 │   ├── config.ts           # 默认配置
-│   ├── storage.ts          # KV 存储层
-│   ├── auth.ts             # 认证系统
-│   ├── proxy.ts            # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
-│   ├── opencode.ts         # OpenCode 伪装 / Body Gate / 镜像故障转移
+│   ├── storage.ts          # KV 存储层（内存缓存 + 容灾）
+│   ├── auth.ts             # 认证系统（常量时间比较防时序攻击）
+│   ├── proxy.ts            # API 转发核心（Key 轮询 + 熔断降权 + 自动恢复）
+│   ├── opencode.ts         # OpenCode 伪装 / 桩吞噬 / 镜像故障转移
 │   ├── opencode-responses.ts # Responses ↔ Chat 双向翻译
-│   ├── admin.ts            # 管理 API（含服务端 Key/模型测试代理）
+│   ├── admin.ts            # 管理 API（SSRF 防护 + Key/模型测试代理）
 │   ├── pages.ts            # 前端页面模板
 │   ├── pages.css.ts        # 样式
 │   └── shared.js.ts        # 共享 JS 工具函数
-├── worker-proxy/           # 各场景反代 Worker 示例脚本
-├── API.md                  # 接口文档
-├── opencode-cdn.md         # 自建 OpenCode 镜像教程
-├── design.md               # 前端设计规范
-├── wrangler.toml
+├── docs/
+│   ├── API.md              # 完整接口文档与调用示例
+│   └── opencode-cdn.md     # 自建 OpenCode CDN 镜像教程
+├── test/                   # 自动化测试用例（Vitest + Workers Pool）
+├── worker.js               # 极简单文件生产级部署产物（可直接粘贴部署）
+├── wrangler.toml           # Cloudflare Workers 配置
 ├── package.json
 └── tsconfig.json
 ```

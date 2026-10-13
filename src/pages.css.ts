@@ -1,8 +1,5 @@
 export const CSS_CONTENT = `
-/* 中文说明：方案 A「Cloud Workbench」统一首页、登录页和管理页的设计语言；不涉及后端逻辑。 */
-/* Hallmark · genre: modern-minimal · macrostructure: Workbench · design-system: design.md · designed-as-app
- * Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V5
- */
+/* 中文说明：统一首页、登录页和管理页的设计语言（现代简约工程师工作台风格）。 */
 :root {
   --color-paper: oklch(98.5% 0.004 250);
   --color-paper-a: oklch(98.5% 0.004 250 / .94);
