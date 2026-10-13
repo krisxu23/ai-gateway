@@ -221,53 +221,29 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const { modelId } = await c.req.json<TestModelRequest>()
-
-  if (!modelId) {
-    return c.json<ApiResponse>({ success: false, message: 'modelId 为必填项' }, 400)
-  }
+  if (!modelId) return c.json<ApiResponse>({ success: false, message: 'modelId 为必填项' }, 400)
 
   const provider = await getProvider(c.env, id)
-  if (!provider) {
-    return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
-  }
+  if (!provider) return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
 
-  const modelConfig = provider.models.find((m) => m.id === modelId)
-  if (!modelConfig) {
-    // 模型尚未保存进配置：不再报“不存在”，降级为对该提供商 baseUrl 的直连实测，
-    // 让“先加行再测试”的工作流不被 KV 保存状态卡住（结果中附提醒）。
-    const ssrfError = checkSafeUpstreamUrl(provider.baseUrl)
-    if (ssrfError) return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
-    const enabledKeysEarly = provider.apiKeys.filter(k => k.enabled)
-    if (!isOpenCodeProvider(provider.id) && enabledKeysEarly.length === 0) {
-      return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
-    }
-    const fallbackResult = isOpenCodeProvider(provider.id)
-      ? await testOpenCodeModel(provider.baseUrl, enabledKeysEarly, modelId, resolveOpenCodeUrls(c.env))
-      : await testModelConnection(provider.baseUrl, enabledKeysEarly[0].key, modelId, provider.apiType)
-    return c.json<ApiResponse>({
-      success: true,
-      data: {
-        ...fallbackResult,
-        message: `${fallbackResult.message ? fallbackResult.message + '；' : ''}提示：该模型尚未保存到提供商配置，点「保存」后才会生效`,
-      },
-    })
-  }
+  const ssrfError = checkSafeUpstreamUrl(provider.baseUrl)
+  if (ssrfError) return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
 
-  const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
   if (!isOpenCodeProvider(provider.id) && enabledKeys.length === 0) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
   }
-  const ssrfError = checkSafeUpstreamUrl(provider.baseUrl)
-  if (ssrfError) return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
 
   const result = isOpenCodeProvider(provider.id)
     ? await testOpenCodeModel(provider.baseUrl, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
     : await testModelConnection(provider.baseUrl, enabledKeys[0].key, modelId, provider.apiType)
 
-  return c.json<ApiResponse>({
-    success: true,
-    data: result,
-  })
+  const modelConfig = provider.models.find((m) => m.id === modelId)
+  if (!modelConfig) {
+    result.message = `${result.message ? result.message + '；' : ''}提示：该模型尚未保存到提供商配置，点「保存」后才会生效`
+  }
+
+  return c.json<ApiResponse>({ success: true, data: result })
 }
 
 // ===== Key / 模型连通性测试（通过服务端代理，避免 CORS） =====

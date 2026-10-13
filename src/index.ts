@@ -46,23 +46,19 @@ app.use('*', async (c, next) => {
 // ===== 首页 =====
 app.get('/', async (c) => {
   const sessionId = getCookie(c, 'session_id')
-  let isLoggedIn = false
-  if (sessionId) {
-    const session = await getSession(c.env, sessionId)
-    isLoggedIn = session !== null
-  }
-  return renderHomePage(c, isLoggedIn)
+  const session = sessionId ? await getSession(c.env, sessionId) : null
+  return renderHomePage(c, session !== null)
 })
 
 // ===== 登录/退出 =====
-app.get('/admin/login', async (c) => renderLoginPage(c))
+app.get('/admin/login', renderLoginPage)
 app.post('/admin/login', handleLogin)
 app.get('/admin/logout', handleLogout)
 
 // ===== 管理后台（需 Session 验证） =====
 app.use('/admin/*', adminAuthMiddleware)
 
-app.get('/admin', async (c) => renderAdminPage(c))
+app.get('/admin', renderAdminPage)
 
 // 系统状态
 app.get('/admin/api/status', handleStatus)

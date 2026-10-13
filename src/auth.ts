@@ -13,27 +13,29 @@ export async function hashPassword(password: string): Promise<string> {
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+/** 常量时间比较两组 Buffer，防止时序侧信道 */
+function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  return a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b)
+}
+
 /** 管理后台 Session 验证中间件 */
 export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
   const sessionId = getCookie(c, 'session_id')
+  const path = c.req.path
 
   if (!sessionId) {
-    const url = new URL(c.req.url)
-    if (url.pathname === '/admin/login') return next()
-    if (url.pathname.startsWith('/admin/api/')) {
-      return c.json({ success: false, message: '未登录' }, 401)
-    }
-    return c.redirect('/admin/login')
+    if (path === '/admin/login') return next()
+    return path.startsWith('/admin/api/')
+      ? c.json({ success: false, message: '未登录' }, 401)
+      : c.redirect('/admin/login')
   }
 
   const session = await getSession(c.env, sessionId)
   if (!session) {
     deleteCookie(c, 'session_id')
-    const url = new URL(c.req.url)
-    if (url.pathname.startsWith('/admin/api/')) {
-      return c.json({ success: false, message: 'Session 已过期' }, 401)
-    }
-    return c.redirect('/admin/login')
+    return path.startsWith('/admin/api/')
+      ? c.json({ success: false, message: 'Session 已过期' }, 401)
+      : c.redirect('/admin/login')
   }
 
   ;(c as any).set('username', session.username)
@@ -43,8 +45,7 @@ export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: N
 /** 管理员登录 */
 export async function handleLogin(c: Context<{ Bindings: Env }>) {
   const { username, password } = await c.req.json()
-  const adminUser = c.env.ADMIN_USERNAME
-  const adminPass = c.env.ADMIN_PASSWORD
+  const { ADMIN_USERNAME: adminUser, ADMIN_PASSWORD: adminPass } = c.env
 
   if (!adminUser || !adminPass) {
     return c.json({
@@ -59,19 +60,16 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
 
   // 常量时间比较：无论用户名/密码是否正确，都执行完整的哈希计算与比较，
   // 避免时序差异被用于用户名枚举；哈希比较也用常量时间比较防时序侧信道。
-  const usernameBuf = new TextEncoder().encode(String(username))
+  const userBuf = new TextEncoder().encode(String(username))
   const adminUserBuf = new TextEncoder().encode(String(adminUser))
-  const passwordHash = await hashPassword(String(password))
-  const adminPassHash = await hashPassword(String(adminPass))
-  const hashBuf = new TextEncoder().encode(passwordHash)
+  const [passHash, adminPassHash] = await Promise.all([
+    hashPassword(String(password)),
+    hashPassword(String(adminPass)),
+  ])
+  const hashBuf = new TextEncoder().encode(passHash)
   const adminHashBuf = new TextEncoder().encode(adminPassHash)
 
-  const userMatches = usernameBuf.byteLength === adminUserBuf.byteLength &&
-    crypto.subtle.timingSafeEqual(usernameBuf, adminUserBuf)
-  const passMatches = hashBuf.byteLength === adminHashBuf.byteLength &&
-    crypto.subtle.timingSafeEqual(hashBuf, adminHashBuf)
-
-  if (!userMatches || !passMatches) {
+  if (!timingSafeEqual(userBuf, adminUserBuf) || !timingSafeEqual(hashBuf, adminHashBuf)) {
     return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
 

@@ -20,16 +20,15 @@ function asRecord(v: unknown): Rec | null {
   return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Rec) : null
 }
 
-function contentText(content: unknown): string {
+export function contentText(content: unknown): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
     let out = ''
     for (const part of content) {
       const p = asRecord(part)
       if (!p) continue
-      if (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') {
-        if (typeof p.text === 'string') out += p.text
-      }
+      if (typeof p.text === 'string') out += p.text
+      else if (typeof p.content === 'string') out += p.content
     }
     return out
   }

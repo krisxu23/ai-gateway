@@ -93,6 +93,33 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
   }
 }
 
+/** 统一构建上游认证请求头（OpenAI Bearer 或 Anthropic x-api-key） */
+function buildAuthHeaders(apiKey: string, apiType?: 'openai' | 'anthropic'): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (apiType === 'anthropic') {
+    headers['x-api-key'] = apiKey
+    headers['anthropic-version'] = '2023-06-01'
+  } else {
+    headers['Authorization'] = `Bearer ${apiKey}`
+  }
+  return headers
+}
+
+/** 记录单个 Key 调用失败状态，返回是否需要立即触发 KV 写入 */
+function recordKeyFailure(healthData: HealthMap, apiKey: string): boolean {
+  const isNew = !healthData[apiKey]
+  const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+  h.failures++
+  h.lastFailed = true
+  if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
+    h.demotedAt = Date.now()
+    healthData[apiKey] = h
+    return true
+  }
+  healthData[apiKey] = h
+  return isNew
+}
+
 /** 测试模型连接，发送最小请求验证 */
 export async function testModelConnection(
   baseUrl: string,
@@ -105,24 +132,13 @@ export async function testModelConnection(
     const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
     const url = `${cleanBase}/${endpoint}`
 
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (apiType === 'anthropic') {
-      headers['x-api-key'] = apiKey
-      headers['anthropic-version'] = '2023-06-01'
-    } else {
-      headers['Authorization'] = `Bearer ${apiKey}`
-    }
-
     const response = await fetch(url, {
       method: 'POST',
-      headers,
+      headers: buildAuthHeaders(apiKey, apiType),
       body: JSON.stringify({
         model: modelId,
         messages: [{ role: 'user', content: 'hi' }],
-        // 思考型模型会把极小的 token 预算全部花在推理上，导致正文为空、
-        // 上游网关报 empty response content；64 足以产出可判定内容。
+        // 思考型模型会把极小的 token 预算全部花在推理上，导致正文为空；64 满足判定需求
         max_tokens: 64,
       }),
       signal: AbortSignal.timeout(15000),
@@ -134,7 +150,7 @@ export async function testModelConnection(
 
     let errorBody = ''
     try {
-      const errorData = await response.json() as { error?: { message?: string } }
+      const errorData = (await response.json()) as { error?: { message?: string } }
       errorBody = errorData?.error?.message || JSON.stringify(errorData)
     } catch {
       errorBody = await response.text()
@@ -224,21 +240,8 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     if (isOpenCodeProvider(providerId)) {
       // 客户端会话标识透传: 官方格式则上游复用, 否则按会话内容确定性派生。
-      const sessionHeaderNames = [
-        'x-opencode-session',
-        'x-session-affinity',
-        'x-session-id',
-        'session_id',
-        'session-id',
-      ]
-      let clientSessionId: string | undefined
-      for (const name of sessionHeaderNames) {
-        const v = c.req.header(name)?.trim()
-        if (v) {
-          clientSessionId = v
-          break
-        }
-      }
+      const sessionHeaders = ['x-opencode-session', 'x-session-affinity', 'x-session-id', 'session_id', 'session-id']
+      const clientSessionId = sessionHeaders.map((h) => c.req.header(h)?.trim()).find(Boolean)
       const response = await proxyOpenCodeRequest({
         baseUrl: provider.baseUrl,
         apiKeys: enabledKeys,
@@ -273,27 +276,22 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     const demoted: number[] = []
 
     if (enabledKeys.length === 1) {
-      // 只有一个 key，跳过健康检查，直接使用
       healthy.push(0)
     } else {
-      for (let i = 0; i < enabledKeys.length; i++) {
-        const h = healthData[enabledKeys[i].key]
-        if (h && h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          // 兼容旧数据：无 demotedAt 视为现在刚降权，统一走冷却逻辑
-          if (!h.demotedAt) {
-            h.demotedAt = Date.now()
-          }
-          if (Date.now() - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
-            probation.push(i)  // 冷却到期，进入试用组
-          } else {
-            demoted.push(i)    // 仍在冷却，继续保持降权
-          }
-        } else if (h && h.lastFailed) {
+      const now = Date.now()
+      enabledKeys.forEach((key, i) => {
+        const h = healthData[key.key]
+        if (!h) {
+          healthy.push(i)
+        } else if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
+          h.demotedAt = h.demotedAt || now
+          ;(now - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS ? probation : demoted).push(i)
+        } else if (h.lastFailed) {
           unhealthy.push(i)
         } else {
           healthy.push(i)
         }
-      }
+      })
     }
 
     // Fisher-Yates 洗牌（仅健康 key）
@@ -316,27 +314,14 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     let lastError: Response | null = null
     let healthUpdated = false
-    // 中间失败（未达降权阈值）默认只更新内存缓存，不触发 KV 写，避免上游抖动时
-    // 烧穿写配额。但若完全持久化，跨 isolate 会丢失失败计数导致降权失效。
-    // 折中：本请求内已有失败时，在循环末尾补写一次 KV（见下方 failFlush 点）。
     let failuresSeen = false
 
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
       try {
-        const forwardHeaders: Record<string, string> = {
-          'Content-Type': 'application/json',
-        }
-        if (provider.apiType === 'anthropic') {
-          forwardHeaders['x-api-key'] = apiKey
-          forwardHeaders['anthropic-version'] = '2023-06-01'
-        } else {
-          forwardHeaders['Authorization'] = `Bearer ${apiKey}`
-        }
-
         const response = await fetchWithHeaderTimeout(forwardUrl, {
           method: c.req.method,
-          headers: forwardHeaders,
+          headers: buildAuthHeaders(apiKey, provider.apiType),
           body: JSON.stringify(forwardBody),
         })
 
@@ -350,13 +335,12 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
             await writeHealth(c.env, providerId, healthData)
           }
 
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': response.headers.get('Content-Type') || 'application/json',
-            'Cache-Control': 'no-store',
-          }
           return new Response(response.body, {
             status: response.status,
-            headers: responseHeaders,
+            headers: {
+              'Content-Type': response.headers.get('Content-Type') || 'application/json',
+              'Cache-Control': 'no-store',
+            },
           })
         }
 
@@ -368,17 +352,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 401/403/5xx 尝试下一个 key（标记失败）
         if (response.status === 401 || response.status === 403 || response.status >= 500) {
-          const isNew = !healthData[apiKey]
-          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          h.failures++
-          h.lastFailed = true
-          if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-            h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-            healthUpdated = true
-          } else if (isNew) {
-            healthUpdated = true
-          }
-          healthData[apiKey] = h
+          if (recordKeyFailure(healthData, apiKey)) healthUpdated = true
           failuresSeen = true
           lastError = response
           continue
@@ -389,18 +363,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         const error = err as Error
-        // 网络错误也标记为失败
-        const isNew = !healthData[apiKey]
-        const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-        h.failures++
-        h.lastFailed = true
-        if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-          healthUpdated = true
-        } else if (isNew) {
-          healthUpdated = true
-        }
-        healthData[apiKey] = h
+        if (recordKeyFailure(healthData, apiKey)) healthUpdated = true
         failuresSeen = true
         lastError = new Response(JSON.stringify({
           error: { message: error.message || '请求失败', type: 'proxy_error' },
@@ -409,8 +372,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
     }
 
-    // 写回健康状态。失败时无论是否达到阈值都补写一次 KV，
-    // 保证中间失败计数跨 isolate 可见（每个失败请求至多一次 KV 写）。
+    // 写回健康状态。失败时无论是否达到阈值都补写一次 KV，保证跨 isolate 可见
     if (healthUpdated || failuresSeen) await writeHealth(c.env, providerId, healthData)
 
     // 所有 key 均失败
@@ -439,33 +401,22 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
 export async function handleModels(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
+  const created = Math.floor(Date.now() / 1000)
 
-  const models: Array<{
-    id: string
-    provider: string
-    provider_name: string
-    object: string
-    created: number
-    owned_by: string
-  }> = []
+  const data = providers
+    .filter((p) => p.enabled)
+    .flatMap((p) =>
+      p.models
+        .filter((m) => m.enabled)
+        .map((m) => ({
+          id: `${p.id}/${m.id}`,
+          provider: p.id,
+          provider_name: p.name,
+          object: 'model',
+          created,
+          owned_by: p.id,
+        }))
+    )
 
-  for (const provider of providers) {
-    if (!provider.enabled) continue
-    for (const model of provider.models) {
-      if (!model.enabled) continue
-      models.push({
-        id: `${provider.id}/${model.id}`,
-        provider: provider.id,
-        provider_name: provider.name,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: provider.id,
-      })
-    }
-  }
-
-  return c.json({
-    object: 'list',
-    data: models,
-  })
+  return c.json({ object: 'list', data })
 }

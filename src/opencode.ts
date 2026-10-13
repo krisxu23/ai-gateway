@@ -1,6 +1,7 @@
 import type { ApiKeyEntry, Env } from './types'
 import {
   chatBodyToResponsesBody,
+  contentText,
   createResponsesToChatStream,
   mapFreeLaneClientTools,
   responsesToChatBody,
@@ -82,16 +83,18 @@ function buildUrl(baseUrl: string, subPath: string, search = ''): string {
 
 const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
-function randomHex(bytes: number): string {
-  const arr = new Uint8Array(bytes)
+function getRandomBytes(len: number): Uint8Array {
+  const arr = new Uint8Array(len)
   crypto.getRandomValues(arr)
-  return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('')
+  return arr
+}
+
+function randomHex(bytes: number): string {
+  return Array.from(getRandomBytes(bytes), (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 function randomBase62(length: number): string {
-  const arr = new Uint8Array(length)
-  crypto.getRandomValues(arr)
-  return Array.from(arr, (b) => BASE62_ALPHABET[b % 62]).join('')
+  return Array.from(getRandomBytes(length), (b) => BASE62_ALPHABET[b % 62]).join('')
 }
 
 /**
@@ -143,23 +146,6 @@ function deriveSessionId(seed: string): string {
   return `ses_${hex}${b62}`
 }
 
-function textOfContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    let out = ''
-    for (const part of content) {
-      const p = (part !== null && typeof part === 'object' && !Array.isArray(part)
-        ? part as Record<string, unknown> : null)
-      if (p) {
-        if (typeof p.text === 'string') out += p.text
-        else if (typeof p.content === 'string') out += p.content
-      }
-    }
-    return out
-  }
-  return ''
-}
-
 /**
  * 提取首条 user 文本: 兼容 chat 形态(messages[])与 Responses 形态(input[])。
  */
@@ -169,10 +155,8 @@ function firstUserText(parsed: Record<string, unknown> | null): string {
     const list = parsed[key]
     if (!Array.isArray(list)) continue
     for (const item of list) {
-      const rec = (item !== null && typeof item === 'object' && !Array.isArray(item)
-        ? item as Record<string, unknown> : null)
-      if (rec && rec.role === 'user') {
-        const text = textOfContent(rec.content)
+      if (item && typeof item === 'object' && (item as Record<string, unknown>).role === 'user') {
+        const text = contentText((item as Record<string, unknown>).content)
         if (text) return text
       }
     }
