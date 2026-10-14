@@ -35,6 +35,19 @@ describe('admin: checkSafeUpstreamUrl (SSRF防护)', () => {
     expect(checkSafeUpstreamUrl('https://metadata.google.internal')).toBe('不允许访问内网主机')
   })
 
+  // 回归：同名 index 曾把 fe/fc/fd 开头的合法域名误判为内网 IPv6 而拒绝
+  it('fe/fc/fd 开头的合法域名不会被误判为 IPv6', () => {
+    expect(checkSafeUpstreamUrl('https://fe.example.com/v1')).toBeNull()
+    expect(checkSafeUpstreamUrl('https://fc-api.example.com')).toBeNull()
+    expect(checkSafeUpstreamUrl('https://fdc.example.com')).toBeNull()
+  })
+
+  it('拒绝其它内网/保留 IPv6 段 (site-local / 6to4 / NAT64)', () => {
+    expect(checkSafeUpstreamUrl('https://[fec0::1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[2002::1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[64:ff9b::1]')).toBe('不允许访问私有/回环/链路本地地址')
+  })
+
   it('彻底防御 IPv6-mapped IPv4 变体 (hex 格式及点分十进制)', () => {
     // WHATWG URL 规范化会将 [::ffff:127.0.0.1] 转为 [::ffff:7f00:1]
     expect(checkSafeUpstreamUrl('https://[::ffff:127.0.0.1]')).toBe('不允许访问私有/回环/链路本地地址')

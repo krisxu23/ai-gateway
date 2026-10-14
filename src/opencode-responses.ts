@@ -297,6 +297,10 @@ export function createResponsesToChatStream(
   // 是否已下发过正文增量: 流在 response.completed 之前断开时据此区分
   // "回答被截断"(length) 与 "上游就发了个空回复"(stop)
   let sawText = false
+  // 是否收到过"工具调用参数已收完"的信号(output_item.done /
+  // function_call_arguments.done)：流式下 arguments 是边收边发的，没有这个
+  // 信号就无从判断已下发的参数是否完整
+  let toolFinalized = false
 
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
     const type = typeof ev.type === 'string' ? ev.type : ''
@@ -356,19 +360,29 @@ export function createResponsesToChatStream(
         }
         break
       }
+      case 'response.output_item.done':
+      case 'response.function_call_arguments.done': {
+        // 上游用哪个事件表示"参数收完"并不统一，两种都认；只有已下发给客户端的
+        // 工具调用才算（桩被吞掉了，与我们无关）
+        const item = asRecord(ev.item)
+        const itemID = typeof ev.item_id === 'string' ? ev.item_id : typeof item?.id === 'string' ? item.id : ''
+        if (toolIdx[itemID] !== undefined) toolFinalized = true
+        break
+      }
       case 'response.completed':
       case 'response.incomplete': {
-        // 与非流式路径(responsesToChatBody)对齐: 本轮发过 function_call 时以
-        // tool_calls 结束, 客户端才能识别为"需要执行工具"; 但桩全被吞光时仍为
-        // stop。nextIdx 只计真实下发的工具调用(桩不递增), 与被吞数量无关。
-        const hasToolCalls = nextIdx > 0
-        // 已下发工具调用时优先 tool_calls（与非流式路径一致）：agent 客户端只在
-        // finish_reason=tool_calls 时执行工具，报 length 会让调用被丢弃
-        const finish = hasToolCalls
-          ? 'tool_calls'
-          : type === 'response.incomplete' ? 'length' : 'stop'
         const resp = asRecord(ev.response)
         const usage = asRecord(resp?.usage)
+        // finish_reason 与非流式路径(responsesToChatBody)对齐，但流式下工具的
+        // arguments 是边收边发的：只有拿到"参数收完"的信号才算完整调用，否则报
+        // length —— 否则客户端会拿半截 JSON 去执行工具（非流式的 output item
+        // 天然完整，所以那里 tool_calls 优先）。nextIdx 只计真实下发的工具调用
+        // (桩不递增)，与被吞数量无关。
+        const incomplete = type === 'response.incomplete'
+        const hitLimit = incomplete && asRecord(resp?.incomplete_details)?.reason === 'max_output_tokens'
+        const finish = nextIdx > 0
+          ? (incomplete && !toolFinalized ? 'length' : 'tool_calls')
+          : incomplete && (sawText || hitLimit) ? 'length' : 'stop'
         const usageOut = usage
           ? {
               prompt_tokens: usage.input_tokens ?? 0,
@@ -436,9 +450,12 @@ export function createResponsesToChatStream(
       if (!finished) {
         // 上游在 response.completed 之前断开: 补一个带 finish_reason 的收尾块,
         // 让客户端能区分"回答被截断"与"模型正常结束"(否则截断会被当成干净停止)。
-        // 已下发工具调用时报 tool_calls(与非流式路径一致, agent 客户端才会执行);
-        // 什么都没发过时报 stop(上游只是空回复, 不是截断)。
-        const finish = nextIdx > 0 ? 'tool_calls' : sawText ? 'length' : 'stop'
+        // 只有拿到"参数收完"信号时才报 tool_calls —— 客户端在这种 finish_reason
+        // 下会直接执行工具, 半截 arguments 会被当成合法参数; 什么都没发过时报
+        // stop(上游只是空回复, 不是截断)。
+        const finish = nextIdx > 0
+          ? (toolFinalized ? 'tool_calls' : 'length')
+          : sawText ? 'length' : 'stop'
         controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, finish)))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       }

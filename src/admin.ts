@@ -46,6 +46,9 @@ function isPrivateIPv4(host: string): boolean {
 
 function isPrivateIPv6(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, '').toLowerCase()
+  // 域名不含 ':'（WHATWG URL 对 IPv6 字面量才会给出带冒号的 hostname），
+  // 先排除域名再按前缀匹配，否则 fe/fc/fd 开头的合法域名（fe.example.com）会被误判
+  if (!h.includes(':')) return false
   if (h === '::1' || h === '::' || h === '0:0:0:0:0:0:0:1' || h === '0:0:0:0:0:0:0:0') return true
   // fe00::/8: 含 link-local fe80::/10 与 site-local fec0::/10；全局单播在 2000::/3，
   // 不在 fe00::/8 内，所以按首字节整段拦截
@@ -172,7 +175,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: 'id、name、baseUrl 为必填项' }, 400)
   }
 
-  if (!/^[A-Za-z0-9._-]+$/.test(body.id)) {
+  if (typeof body.id !== 'string' || !/^[A-Za-z0-9._-]+$/.test(body.id)) {
     return c.json<ApiResponse>({ success: false, message: '提供商 id 只能包含字母、数字、点、下划线和连字符' }, 400)
   }
 

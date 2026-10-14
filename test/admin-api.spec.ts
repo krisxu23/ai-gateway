@@ -70,6 +70,24 @@ describe('storage 字段形状归一化', () => {
     expect(providers[1].models).toEqual([{ id: 'm1', enabled: true }])
     expect(providers[1].apiKeys).toEqual([{ key: 'sk', enabled: true }])
   })
+
+  // KV 里残留的字符串 "false" 是 truthy，曾让“已停用”的 Key/提供商继续生效
+  it('enabled 只认真布尔，字符串 "false" 一律视为停用', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const env = makeEnv()
+    await env.KV.put('proxy:keys', JSON.stringify([{ id: 'k9', key: 'sk_cf_off', name: 'k9', enabled: 'false' }]))
+    await env.KV.put('providers', JSON.stringify([
+      { id: 'p9', name: 'P9', baseUrl: 42, enabled: 'false', models: [{ id: 'm9', enabled: 'false' }], apiKeys: [{ key: 'sk', enabled: 'false' }] },
+    ]))
+
+    expect(await storage.validateProxyKey(env, 'sk_cf_off')).toBe(false)
+    const providers = await storage.getProviders(env)
+    expect(providers[0].enabled).toBe(false)
+    expect(providers[0].baseUrl).toBe('') // 非字符串兜底成空串，转发侧据此返回可读错误
+    expect(providers[0].models[0].enabled).toBe(false)
+    expect(providers[0].apiKeys[0].enabled).toBe(false)
+  })
 })
 
 describe('管理台登录限流', () => {
@@ -297,6 +315,31 @@ describe('转发请求体校验', () => {
 
   it('model 非字符串时返回 400', async () => {
     expect((await post(makeEnv(), JSON.stringify({ model: 123 }))).status).toBe(400)
+  })
+})
+
+describe('上游地址缺失时的转发错误', () => {
+  // baseUrl 被人工改成非字符串时，过去会在 URL 拼接处抛异常变成裸 500。
+  // 本用例需要 storage 与 proxy 从同一次 resetModules() 后的模块图取，否则
+  // proxy 仍持有旧 storage 实例（其 isolate 缓存是模块级状态）。
+  it('KV 中 baseUrl 非字符串时返回 502 可读错误，而不是 500', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const { handleProxy: proxyHandler } = await import('../src/proxy')
+    const env = makeEnv()
+    await env.KV.put('providers', JSON.stringify([
+      { id: 'pb', name: 'PB', baseUrl: 42, enabled: true, models: [{ id: 'mb', enabled: true }], apiKeys: [{ key: 'sk', enabled: true }] },
+    ]))
+    await storage.addProxyKey(env, proxyKey('bk', 'sk_cf_badurl'))
+
+    const app = new Hono<{ Bindings: Env }>()
+    app.post('/v1/chat/completions', proxyHandler)
+    const res = await app.request('/v1/chat/completions', jsonInit({
+      model: 'pb/mb',
+      messages: [{ role: 'user', content: 'hi' }],
+    }), env)
+    expect(res.status).toBe(502)
+    expect(await res.text()).toContain('baseUrl')
   })
 })
 

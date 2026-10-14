@@ -44,18 +44,25 @@ const isObj = (item: unknown): item is Record<string, unknown> =>
  * /v1/models 与转发全部 500（管理员无法通过界面自救）。因此在读取出口统一
  * 归一化：丢弃非对象条目，把被依赖的字段补成正确类型。
  */
+/** enabled 必须是真布尔：KV 里残留的 "false"/0/[] 都是 truthy，会让已停用的项继续生效 */
+const withBoolEnabled = (item: Record<string, unknown>): Record<string, unknown> =>
+  ({ ...item, enabled: item.enabled === true })
+
 function sanitizeList(key: string, raw: unknown[]): unknown[] {
   const items = raw.filter(isObj)
   if (key === KV_KEYS.PROVIDERS) {
     return items.map((p) => ({
       ...p,
+      id: String(p.id ?? ''),
       name: String(p.name ?? ''),
-      models: Array.isArray(p.models) ? p.models.filter(isObj) : [],
-      apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj) : [],
+      baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
+      enabled: p.enabled === true,
+      models: Array.isArray(p.models) ? p.models.filter(isObj).map(withBoolEnabled) : [],
+      apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj).map(withBoolEnabled) : [],
     }))
   }
   if (key === KV_KEYS.PROXY_KEYS) {
-    return items.map((k) => ({ ...k, key: String(k.key ?? ''), name: String(k.name ?? '') }))
+    return items.map((k) => withBoolEnabled({ ...k, key: String(k.key ?? ''), name: String(k.name ?? '') }))
   }
   return items
 }

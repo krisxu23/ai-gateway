@@ -239,15 +239,30 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"finish_reason":"tool_calls"')
   })
 
-  // 回归：incomplete 曾无条件记为 length，已发出的 tool_calls 被说成截断
-  it('已发出工具调用后 response.incomplete 记为 tool_calls 而非 length', async () => {
+  // 回归：incomplete 曾无条件记为 length，已收完参数的工具调用被说成截断。
+  // “参数收完”的信号 = output_item.done（上游也可能用 function_call_arguments.done）
+  it('已发出工具调用且参数收完时 response.incomplete 记为 tool_calls', async () => {
     const upstream = sseChunks([
       'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
       'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
       'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
     ])
     const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
     expect(out).toContain('"finish_reason":"tool_calls"')
+    expect(out).not.toContain('"finish_reason":"length"')
+  })
+
+  // 没收到“参数收完”信号时参数可能被截断：报 length 让客户端丢弃，而不是执行半截 JSON
+  it('参数未收完就 incomplete 时记为 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"cmd\\":\\"l"}\n\n',
+      'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"length"')
+    expect(out).not.toContain('"finish_reason":"tool_calls"')
   })
 
   // 回归：未知 item_id 的参数增量曾回退到 index 0，污染第一个工具调用的参数
@@ -362,15 +377,28 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"content":"compact"')
   })
 
-  // 回归：收尾兜底曾硬编码 length，把已下发的工具调用说成“截断”，agent 客户端会丢弃调用
-  it('已发出工具调用后上游断开: 收尾块记为 tool_calls', async () => {
+  // 回归：收尾兜底曾硬编码 length，把已下发的工具调用说成“截断”，agent 客户端会丢弃调用。
+  // 参数收完（function_call_arguments.done）后上游才断：调用是完整的，报 tool_calls
+  it('参数收完后上游断开: 收尾块记为 tool_calls', async () => {
     const upstream = sseChunks([
       'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
       'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1"}\n\n',
     ])
     const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
     expect(out).toContain('"finish_reason":"tool_calls"')
     expect(out).not.toContain('"finish_reason":"length"')
+  })
+
+  // 参数没给完（没收到 done）就断开：可能是半截 JSON，报 length 让客户端丢弃
+  it('参数没收完上游就断开: 收尾块记为 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"cmd\\":\\"l"}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"length"')
+    expect(out).not.toContain('"finish_reason":"tool_calls"')
   })
 
   // 回归：什么都没下发时上游就断开（空回复）不是截断

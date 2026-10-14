@@ -369,3 +369,41 @@ responsesToChatBody(body as unknown as Parameters<...>[0], 'muse', true)
 | `npm run bundle` | `worker.js` 159485 B，与 `src/` 一致 |
 
 本轮新增回归用例 10 条：收尾块 `finish_reason` 判定 2 条（已下发工具调用 → `tool_calls`、空流 → `stop`）、KV 字段形状归一化 1 条、`enabled` 布尔校验 4 条（Key 传 `"false"`、提供商传 `0`、新建传 `"false"`、合法 `false` 正常停用）、非法 `apiType` 1 条、数字模型 ID 1 条、responses 通道 + 非流式客户端的桩吞噬 1 条（覆盖 R4-A-11 的回归）。
+
+## 十四、第五轮修复记录（差异复核发现的 5 项 + 测试基建）
+
+第四轮提交 `8aa38fd` 后，又派出一路 reviewer **只复核本轮 diff**（`git diff 067a70c 8aa38fd -- src/ test/`），目标是找「修复本身引入的回归」。结论为「无高危，但 5 处清洗不完整/误伤」，其中 2 处正好削弱了本轮修复的目标。逐条处置：
+
+### 14.1 已修复
+
+| 编号 | 问题 | 位置 | 处置 |
+| --- | --- | --- | --- |
+| R5-1【中】 | `sanitizeList` 归一了 `name`/`models`/`apiKeys`，却**没有**归一化 `enabled`：KV 里残留的字符串 `"false"` 是 truthy，被停用的转发 Key / 提供商 / 模型会继续生效（与 R4-B-M2 同一类漏洞，只是从「写入侧」漏到了「读取侧」） | `src/storage.ts` | 新增 `withBoolEnabled()`：providers（含 `models`/`apiKeys` 子项）与 proxy keys 的 `enabled` 一律 `=== true`；顺带把 `id`/`name` 归一为字符串、`baseUrl` 非字符串兜成 `''` |
+| R5-2【中】 | `handleCreateProvider` 的 `id` 只做正则校验（`RegExp.test(123)` 会把数字转成字符串通过），`{id:123}` 落库后 `p.id === id` 永不匹配 | `src/admin.ts` | 改为 `typeof body.id !== 'string' \|\| !/^[A-Za-z0-9._-]+$/.test(body.id)` → 400 |
+| R5-3【中】 | 非字符串 `baseUrl` 兜成 `''` 之后，转发侧 `new URL('')` 会抛异常 → 裸 500（R5-1 的兜底把旧崩溃点从「类型错」挪到了「空串」） | `src/proxy.ts` `handleProxy` | `enabled` 检查之后新增空 `baseUrl` 守卫 → 502 `provider_misconfigured`（可读的上游错误） |
+| R5-4【中】 | `isPrivateIPv6` 用 `startsWith('fe'/'fc'/'fd')` 做前缀匹配，会**误伤** `fe.example.com`、`fc-api.example.com` 这类合法域名（R4-B-L4 的补丁引入了新误报） | `src/admin.ts` `isPrivateIPv6` | 函数开头加 `if (!h.includes(':')) return false`：域名不含冒号，只对 IPv6 字面量做前缀判定 |
+| R5-5【中】 | 流式 `finish_reason` 把「已下发工具调用」直接当 `tool_calls`，但流式下 `arguments` 是边收边发的 —— 被 `max_output_tokens` 截断时会报 `tool_calls`，agent 客户端拿**半截 JSON** 去执行工具 | `src/opencode-responses.ts` | 新增 `toolFinalized` 标志，由 `response.output_item.done` / `response.function_call_arguments.done` 置位；终态事件与收尾兜底都改为「**只有拿到参数收完信号**才报 `tool_calls`，否则 `length`」（`response.completed` 视为正常结束，仍报 `tool_calls`） |
+
+### 14.2 复核后有意保留（附理由）
+
+| 问题 | 保留理由 |
+| --- | --- |
+| 登录 Cookie 改 `SameSite=Strict` 后，从站外链接直接进入管理台会不带 cookie（需先访问一次站点） | 安全收益大于便利损失；`Lax` 下的登出 CSRF 是真实可利用的 |
+| 模型列表仍只接受字符串形式（对象形式会被 `findInvalidModelId` 判非法） | 保持既有管理 API 形状，避免为一处便利改动 6 处调用点 |
+| 5xx 时也继续轮换下一个 Key | 免费通道/多 Key 抖动场景下的可用性收益大于重复请求成本；失败 Key 已由健康降权隔离 |
+| 桩吞噬流解析失败的非 `data:` / 半截 JSON 行直接丢弃（不再原样透传） | 透传半截 JSON 只会让下游解析报错，丢弃更干净（与 responses 路径一致） |
+
+### 14.3 测试基建修复
+
+| 编号 | 问题 | 处置 |
+| --- | --- | --- |
+| R5-6 | 新写的 4 个用例调用 `app.request(path, init)` 时**漏传第三个参数 `env`**，`c.env` 为 `undefined` → 全部 500，但错误被断言「502 而不是 500」掩盖成一条失败 | 按本文件既有约定补 `, env`（Hono 的 `request(input, init, Env, executionCtx)`） |
+
+## 十五、第五轮验证记录（修复后）
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run check` | `tsc --noEmit` 零错误（`src/` + `test/`）+ 4 文件 / **83 用例**全过 |
+| `npm run bundle` | `worker.js` 159928 B（`esbuild --bundle --format=esm --minify --charset=utf8`） |
+
+本轮新增/改造回归用例 6 条：`enabled` 读取侧归一化 1 条、`baseUrl` 非字符串 → 502 1 条、`fe/fc/fd` 合法域名不误拦 1 条、IPv6 保留段（`fec0::` / `2002::` / `64:ff9b::`） 1 条、`output_item.done` → `tool_calls` 1 条、无 done 信号 → `length` 2 条（终态事件与收尾兜底各一）。

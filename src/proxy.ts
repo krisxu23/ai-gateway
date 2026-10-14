@@ -273,6 +273,14 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }, 403)
     }
 
+    // baseUrl 可能被人工改成非字符串（读取侧已兜成空串），空值没法拼上游地址，
+    // 提前给一个可读的上游错误，而不是让 URL 拼接抛异常变成裸 500
+    if (!provider.baseUrl) {
+      return c.json({
+        error: { message: `提供商 "${provider.name}" 未配置有效的 baseUrl`, type: 'provider_misconfigured' },
+      }, 502)
+    }
+
     const modelConfig = provider.models.find((m) => m.id === modelId)
     if (!modelConfig) {
       return c.json({
