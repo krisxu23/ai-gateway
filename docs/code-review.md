@@ -827,3 +827,17 @@ R11-C 已核实不成立：空 token 双保险（`auth.ts` 的 `(.+)` + `storage
 | `/v1/models` 去掉空 `baseUrl` 过滤 | 「不列出 baseUrl 为空的提供商」 | 失败 | 通过 |
 
 （探针脚本用 `sed` 就地变异 + `git checkout --` 还原，未留下工作区改动。）
+
+### 三十一、第十一轮补充自审（主 agent）
+
+在三路 reviewer 之外，本轮另做了以下自查与加固：
+
+| 项 | 内容 | 证据 |
+|----|------|------|
+| 转发保真 | anthropic 提供的 `/v1/messages`：子路径保留、`x-api-key` + `anthropic-version`、不带 `Authorization` | test/routes.spec.ts「转发：协议与路径保真」 |
+| 路径拼接 | `baseUrl` 带尾随斜杠（含 `//`）不会拼出 `//chat/completions` | 同上 |
+| 页面 id 唯一性 | 首页 / 登录页 / 管理台三张页面渲染结果内 `id` 无重复（`getElementById` 唯一性不变式） | test/routes.spec.ts「渲染页面 id 不重复」 |
+| 凭据不外泄 | 转发请求头全部由 `buildAuthHeaders` / `createRequestHeaders` 重建，**从不透传客户端请求头** → 客户端的网关 Key（`sk_cf_*`）不会随请求发到上游；opencode 通道同理 | src/proxy.ts:420、src/opencode.ts:754 |
+| 重复字面量 | src/opencode-responses.ts 内 `FREE_LANE_NAMES = ['bash','read']` 与同文件 `STUB_TOOL_NAMES` 重复，已删除改用后者 | 提交 1226a2b |
+
+**opencode 伪装未被改动**：本轮所有改动均不涉及 `createRequestHeaders`、`generateOpenCodeId`、`applyFreeLaneGate`、`resolveSessionId`、镜像顺序等伪装相关逻辑；伪装部分仅被动验证（存活 `x-opencode-*` 头 + 官方 UA `opencode/1.18.31` + 6 字节倒序时间戳 ID）。
