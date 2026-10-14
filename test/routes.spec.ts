@@ -810,3 +810,49 @@ describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数�
     expect(body.data.baseUrl).toBe('https://up.example.com/v1')
   })
 })
+
+describe('转发：协议与路径保真（anthropic / 子路径 / 尾随斜杠）', () => {
+  it('anthropic 提供商的 /v1/messages：子路径保留，用 x-api-key 且不带 Authorization', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ apiType: 'anthropic', apiKeys: [{ key: 'only-anthropic', enabled: true }] })])
+
+    let seenUrl = ''
+    let seenHeaders: Record<string, string> = {}
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+      seenUrl = String(url)
+      seenHeaders = (init.headers ?? {}) as Record<string, string>
+      return new Response('{"id":"msg_1","type":"message"}', {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    const res = await makeApp().request('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${VALID_KEY}` },
+      body: JSON.stringify({ model: 'p1/m1', messages: [{ role: 'user', content: 'hi' }], max_tokens: 32 }),
+    }, env)
+
+    expect(res.status).toBe(200)
+    expect(seenUrl).toBe('https://up.example.com/v1/messages')
+    expect(seenHeaders['x-api-key']).toBe('only-anthropic')
+    expect(seenHeaders['anthropic-version']).toBe('2023-06-01')
+    expect(seenHeaders['Authorization']).toBeUndefined()
+  })
+
+  it('baseUrl 带尾随斜杠时不会拼出 //chat/completions', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ baseUrl: 'https://up.example.com/v1//' })])
+
+    let seenUrl = ''
+    vi.stubGlobal('fetch', async (url: string) => {
+      seenUrl = String(url)
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(200)
+    expect(seenUrl).toBe('https://up.example.com/v1/chat/completions')
+  })
+})
