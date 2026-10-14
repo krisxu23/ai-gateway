@@ -31,6 +31,10 @@ jobs:
       - name: Typecheck & tests
         run: npm run check
 
+      # 单文件产物 worker.js 是提交进仓库的部署物：必须与 src/ 同步
+      - name: Verify worker.js is in sync with src/
+        run: npm run bundle && git diff --exit-code -- worker.js
+
       - name: Generate wrangler.toml with admin credentials
         env:
           ADMIN_USERNAME_VAR: ${{ vars.ADMIN_USERNAME }}

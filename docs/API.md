@@ -10,7 +10,7 @@ https://你的域名
 
 ### 管理后台认证 (Session Cookie)
 
-登录成功后通过 `Set-Cookie` 写入 `session_id`（HttpOnly、Secure、SameSite=Lax，有效期 7 天）。后续所有 `/admin/*` 请求需携带该 Cookie。
+登录成功后通过 `Set-Cookie` 写入 `session_id`（HttpOnly、Secure、SameSite=Strict，有效期 7 天）。后续所有 `/admin/*` 请求需携带该 Cookie。
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
@@ -20,7 +20,7 @@ https://你的域名
 
 #### POST /admin/login
 
-提交 JSON 进行登录校验（用户名明文比对，密码 SHA-256 哈希比对）。
+提交 JSON 进行登录校验（用户名与密码均先 SHA-256、再做常量时间比较；同一来源连续失败 5 次后锁定 15 分钟）。
 
 **请求体**:
 ```json
@@ -154,14 +154,14 @@ Authorization: Bearer sk_cf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
    - 读取该提供商下每个 Key 的历史健康状态（基于 KV 持久化）
    - **健康 Key**（无失败记录）：Fisher-Yates 洗牌后优先使用
    - **不健康 Key**（有失败记录，< 5 次）：追加到队列末尾
-   - **降权 Key**（连续失败 >= 5 次）：进入冷却排除，**1 小时后自动恢复试用**
+   - **降权 Key**（连续失败 >= 5 次）：进入冷却排除，**5 分钟后自动恢复试用**
    - **试用 Key**（冷却到期）：追加到不健康 Key 之后，限试一次
    - 仅有 1 个 Key 时跳过所有健康检查
 5. 按排序后的顺序依次尝试；遇 `401/403/5xx` 或网络错误时标记该 Key 失败（`failures++`、`demotedAt` 刷新）并切换下一个，成功时重置该 Key 的健康状态；遇 `429` 时不记录失败，切换下一个key
 
 **Key 健康状态**存储在 KV 中（`key:health:{providerId}`），每次请求后更新，仅保留有失败记录的 Key。
 
-> Anthropic 协议的提供商请求会使用 `x-api-key` + `anthropic-version: 2023-06-01` 头；OpenAI 协议使用 `Authorization: Bearer <key>` 头。请求超时为 60 秒。
+> Anthropic 协议的提供商请求会使用 `x-api-key` + `anthropic-version: 2023-06-01` 头；OpenAI 协议使用 `Authorization: Bearer <key>` 头。响应头超时为 30 秒（只约束“等响应头”，流式正文不受限）。
 
 #### OpenCode 专用故障转移
 
@@ -355,7 +355,7 @@ Session 过期返回 `401`：
 
 #### POST /admin/api/providers/:id/test-model
 
-测试指定提供商下某个模型的连接是否可用。发送最小请求（`max_tokens: 1`，超时 15 秒）。
+测试指定提供商下某个模型的连接是否可用。发送最小请求（`max_tokens: 64`，超时 15 秒）。
 
 **请求体**:
 ```json

@@ -48,6 +48,29 @@ describe('admin: checkSafeUpstreamUrl (SSRF防护)', () => {
     expect(checkSafeUpstreamUrl('https://[64:ff9b::1]')).toBe('不允许访问私有/回环/链路本地地址')
   })
 
+  it('拒绝私有 IPv6 各前缀与内嵌凭据形式', () => {
+    expect(checkSafeUpstreamUrl('https://[fe80::1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[fec0::1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[2002::1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[64:ff9b::7f00:1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[fd00::1]:8443/v1')).toBe('不允许访问私有/回环/链路本地地址')
+    // 带内嵌凭据不影响 hostname 判定
+    expect(checkSafeUpstreamUrl('https://user:pass@127.0.0.1/v1')).toBe('不允许访问私有/回环/链路本地地址')
+    // WHATWG URL 会把 127.1 / 2130706433 规范化为 127.0.0.1
+    expect(checkSafeUpstreamUrl('https://127.1/v1')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://2130706433/v1')).toBe('不允许访问私有/回环/链路本地地址')
+    // 大小写与结尾根点
+    expect(checkSafeUpstreamUrl('https://LOCALHOST./v1')).toBe('不允许访问内网主机')
+    expect(checkSafeUpstreamUrl('https://metadata.')).toBe('不允许访问内网主机')
+  })
+
+  it('fe/fc/fd 开头的合法域名不误拦（域名不含冒号）', () => {
+    expect(checkSafeUpstreamUrl('https://fe.example.com/v1')).toBeNull()
+    expect(checkSafeUpstreamUrl('https://fc-api.example.com')).toBeNull()
+    expect(checkSafeUpstreamUrl('https://fdic.gov')).toBeNull()
+    expect(checkSafeUpstreamUrl('https://api.deepseek.com/v1')).toBeNull()
+  })
+
   it('彻底防御 IPv6-mapped IPv4 变体 (hex 格式及点分十进制)', () => {
     // WHATWG URL 规范化会将 [::ffff:127.0.0.1] 转为 [::ffff:7f00:1]
     expect(checkSafeUpstreamUrl('https://[::ffff:127.0.0.1]')).toBe('不允许访问私有/回环/链路本地地址')

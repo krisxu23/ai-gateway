@@ -31,6 +31,11 @@ function healthCacheGet(key: string): HealthMap | undefined {
   return entry.value
 }
 
+/** 仅供测试：清空 isolate 健康状态内存缓存（模块级状态，用例之间必须能互相隔离） */
+export function clearHealthCache(): void {
+  healthMemCache.clear()
+}
+
 function healthCacheSet(key: string, value: HealthMap): void {
   healthMemCache.set(key, { value, expiresAt: Date.now() + HEALTH_CACHE_TTL_MS })
 }

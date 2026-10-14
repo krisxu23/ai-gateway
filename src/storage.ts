@@ -108,6 +108,11 @@ function safeEntryId(raw: unknown, label: string): string | null {
   return id
 }
 
+/** 仅供测试：清空 isolate 内存缓存（模块级状态，用例之间必须能互相隔离） */
+export function clearListCache(): void {
+  memCache.clear()
+}
+
 /** 通用缓存列表读取：优先内存，未命中再读 KV */
 async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
   const cached = cacheGet<T[]>(key)

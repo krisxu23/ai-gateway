@@ -1,4 +1,4 @@
-// 针对 src/opencode-responses.ts 纯函数的单元测试（在 Workers 池中运行）。
+// 针对 src/opencode-responses.ts 纯函数的单元测试（跑在 Node 环境，不启 workerd）。
 import { describe, it, expect } from 'vitest'
 import {
   chatBodyToResponsesBody,
@@ -19,13 +19,16 @@ function sseChunks(lines: string[]): ReadableStream<Uint8Array> {
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
   const reader = stream.getReader()
+  // 必须保留跨 chunk 的半个多字节字符：decode 不带 { stream: true } 时
+  // 中文等字符被切在块边界上会被替成 U+FFFD，断言会假失败
+  const decoder = new TextDecoder()
   let out = ''
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
-    out += new TextDecoder().decode(value)
+    out += decoder.decode(value, { stream: true })
   }
-  return out
+  return out + decoder.decode()
 }
 
 describe('zenModelNeedsResponses', () => {

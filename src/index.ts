@@ -25,7 +25,7 @@ const app = new Hono<{ Bindings: Env }>()
 
 // ===== 全局中间件 =====
 // 只给 /v1/* 开 CORS：管理台接口不需要跨域，收敛通配头减少暴露面
-// （admin Cookie 已是 httpOnly + SameSite=Lax，此处为纵深防御）。
+// （admin Cookie 已是 httpOnly + SameSite=Strict，此处为纵深防御）。
 app.use('/v1/*', cors())
 
 // 管理台/首页补基础安全响应头：内联脚本较多，CSP 需先做 nonce 化改造，暂不启用；

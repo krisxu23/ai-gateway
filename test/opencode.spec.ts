@@ -163,9 +163,10 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       random: () => 0,
       fetcher: fetcher as typeof fetch,
     })
-    // 502 是“传输失败”的兜底状态码：这里必须保留上游的真实状态码
-    expect([429, 503]).toContain(res.status)
-    expect(await res.text()).toContain('down')
+    // 官方线路先失败、镜像随后失败：回放的是最后一次（镜像）的失败响应，
+    // 状态码与正文都必须原样保留（不能落到 502 丢真）
+    expect(res.status).toBe(429)
+    expect(await res.text()).toContain('mirror down')
   })
 
   it('失败响应体过大时只回简短说明，不整包读进内存', async () => {

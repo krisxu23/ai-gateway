@@ -1,22 +1,27 @@
 // 管理台 API 的端到端行为测试（真 Hono 路由 + 内存 KV 桩）。
 // 覆盖：登录限流、转发 Key 过期时间、模型 ID 校验、列表并发写、吊销与脏数据容错。
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
 import { handleLogin } from '../src/auth'
 import { handleCreateProvider, handleCreateProxyKey, handleTestKeyNew, handleTestModelNew, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
-import { addProxyKey, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
+import { addProxyKey, clearListCache, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
 import { modelRowHTML, renderAdminPage, renderHomePage } from '../src/pages'
+import { KV_KEYS } from '../src/config'
 import type { Env, ProxyKey } from '../src/types'
 
-function makeEnv(): Env {
+interface TestEnv extends Env {
+  store: Map<string, string>
+}
+
+function makeEnv(): TestEnv {
   const store = new Map<string, string>()
   const KV = {
     get: async (key: string) => store.get(key) ?? null,
     put: async (key: string, value: string) => { store.set(key, value) },
     delete: async (key: string) => { store.delete(key) },
   }
-  return { KV, ADMIN_USERNAME: 'admin', ADMIN_PASSWORD: 'pw' } as unknown as Env
+  return { KV, ADMIN_USERNAME: 'admin', ADMIN_PASSWORD: 'pw', store } as unknown as TestEnv
 }
 
 function jsonInit(payload: unknown, headers: Record<string, string> = {}): RequestInit {
@@ -31,8 +36,12 @@ function proxyKey(id: string, key: string): ProxyKey {
   return { id, key, name: id, enabled: true, createdAt: new Date().toISOString() }
 }
 
-// 注意：storage 的 isolate 内存缓存是模块级状态，脏数据用例必须放在本文件最前，
-// 否则前面用例已经把列表读进缓存，就不会走到 JSON 解析分支。
+// storage 的内存缓存是模块级状态（键不含 env），所以每个用例前必须清一次，
+// 否则断言会在“不执行被测路径”的情况下通过（读到上游用例留下的缓存）。
+beforeEach(() => {
+  clearListCache()
+})
+
 describe('storage 脏数据容错', () => {
   it('KV 里是非 JSON / 非数组内容时按空列表处理，不抛错', async () => {
     const env = makeEnv()
@@ -248,6 +257,9 @@ describe('转发 Key 列表写入', () => {
       addProxyKey(env, proxyKey('c3', 'sk_cf_c3')),
     ])
     expect((await getProxyKeys(env)).length).toBe(before + 3)
+    // 同时断言真的落到 KV：只看内存缓存的话，序列化写队列失效也能绕过
+    const persisted = JSON.parse(env.store.get(KV_KEYS.PROXY_KEYS) ?? '[]') as unknown[]
+    expect(persisted.length).toBe(before + 3)
   })
 
   it('吊销后同一 isolate 内立即失效', async () => {

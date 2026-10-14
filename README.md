@@ -24,8 +24,8 @@
 
 | 层 | 做法 |
 |---|---|
-| 请求头 | `User-Agent: opencode/1.19.0`（裸 UA，版本须 ≥ 1.18.0 否则 426）；`x-opencode-client` / `x-opencode-session` / `x-opencode-request` / `x-opencode-project`；`x-session-affinity` / `X-Session-Id`；`Authorization: Bearer public` |
-| Session | `ses_` + 12 位小写 hex + 14 位 base62（官方格式）；同一会话确定性派生——优先复用客户端透传的会话头，否则按首条 user 消息哈希；request ID 用 `msg_` + 32 位 hex，每请求随机 |
+| 请求头 | `User-Agent: opencode/1.18.31`（裸 UA，版本须 ≥ 1.18.0 否则 426；以 `src/opencode.ts` 的 `OPENCODE_VERSION` 为准）；`x-opencode-client` / `x-opencode-session` / `x-opencode-request` / `x-opencode-project`；`x-session-affinity` / `X-Session-Id`；`Authorization: Bearer public` |
+| Session | `ses_` + 12 位小写 hex（时间戳）+ 14 位 base62（官方标识符格式）；优先复用客户端透传的会话头，否则按首条 user 消息在 isolate 内缓存一个会话 ID（内存 30 分钟，**跨 isolate 不保证一致**）；request ID 用 `msg_` + 12 位 hex + 14 位 base62 |
 | Body 门禁 | 强制上游 `stream:true`；缺 `bash`/`read` 时注入桩 function tools（chat 路径在客户端无 tools 时补 `tool_choice:"none"`；responses 路径只认 `"auto"`，统一归一） |
 | 非流式兼容 | 客户端 `stream:false` 时，网关把上游 SSE 拼回单个 `chat.completion` JSON |
 | Responses 家族 | `muse-*-free` 在上游只提供 Responses 接口（走 chat 会 500），网关自动改写为 `/responses` 请求并双向翻译；`max_tokens` 自动补足上游下限 16；`reasoning_effort` 默认 `low`（可用 `reasoning_effort` 覆盖 minimal/low/medium/high/xhigh） |
@@ -97,8 +97,8 @@ npm run bundle
 1. Fork 或推送代码到你的 GitHub 仓库
 
 2. 在 GitHub 仓库 Settings → **Secrets and variables** → **Actions** 中配置：
-   - **Secrets**：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑）
-   - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个；默认已包含上述三个公共镜像）
+   - **Secrets**（必填）：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑）、`CF_ACCOUNT_ID`（Cloudflare 账户 ID）、`ADMIN_PASSWORD`（后台登录密码）
+   - **Variables**（可选）：`ADMIN_USERNAME`（缺省 `admin`）、`OPENCODE_MIRRORS_URL`（追加额外镜像地址，每行一个；默认已包含上述三个公共镜像）
 
 3. 在 GitHub 仓库 Actions 页面手动触发 **Deploy to Cloudflare Workers** 工作流
 
@@ -133,10 +133,13 @@ ai-gateway/
 │   └── shared.js.ts        # 共享 JS 工具函数
 ├── docs/
 │   ├── API.md              # 完整接口文档与调用示例
-│   └── opencode-cdn.md     # 自建 OpenCode CDN 镜像教程
+│   ├── opencode-cdn.md     # 自建 OpenCode CDN 镜像教程
+│   └── code-review.md      # 历次代码审查与修复记录
 ├── test/                   # 自动化测试用例（Vitest，跑在 Node 环境，不启 workerd）
+├── .github/workflows/       # CI：类型检查 + 单测 + 产物同步校验 + 部署
 ├── worker.js               # 单文件生产级部署产物，由 `npm run bundle` 生成（勿手改）
 ├── wrangler.toml           # Cloudflare Workers 配置
+├── vitest.config.ts
 ├── package.json
 └── tsconfig.json
 ```

@@ -498,3 +498,54 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
   - 「失败响应体过大时只回简短说明，不整包读进内存」—— 500 + 300KB 体，断言回包含「过大」且长度 < 1000。
 - **`src/opencode.ts` 桩吞噬流的 `pendingCalls` 可能在流结束时不落地**：name 始终未到的调用被永久缓存，客户端只会看到 `finish_reason=tool_calls` 却没有任何调用。现于 `flush` 中把残留缓存原样补发（合成一个 `delta.tool_calls` 事件）。同时补两条用例覆盖「name 晚到」的两种走向：客户端工具名晚到 → 缓冲后透传改名（不丢调用）；桩工具参数先到 → 整段吞掉且不残留 `tool_calls` 结束原因。
 
+
+## 二十、第八轮修复记录（R8-A：测试代码 + 工程配置 + 文档一致性）
+
+> 本轮起改用两路独立审查：**R8-A** 只审测试/构建配置/文档（此前唯一从未被独立审查过的部分），**R8-B** 做全源码对抗性通读。以下是 R8-A 的处理结果（R8-B 见 20.3）。
+
+### 20.1 已修复（16 项）
+
+| 编号 | 问题 | 位置 | 修法 |
+| --- | --- | --- | --- |
+| H1 | README 把 `ADMIN_PASSWORD` 列为 Variables，而 workflow 读 `secrets.ADMIN_PASSWORD` 且缺失即 `exit 1`，照做必失败 | README.md:100-101 vs .github/workflows/deploy.yml:39-42 | README 改为 Secrets（必填）= `CF_API_TOKEN`/`CF_ACCOUNT_ID`/`ADMIN_PASSWORD`，Variables（可选）= `ADMIN_USERNAME`/`OPENCODE_MIRRORS_URL` |
+| H2 | 网关核心转发逻辑（Key 轮询、健康降权、熔断）零用例 | src/proxy.ts:222-498 | 新增 test/routes.spec.ts：多 Key 401 轮换、失败 Key 降序、429 不计健康失败、Key 耗尽错误码、提供商/模型禁用、baseUrl 缺失 502 |
+| H3 | `admin-api.spec.ts` 的模块级缓存让多处断言可在“不执行被测路径”时通过 | test/admin-api.spec.ts | src/storage.ts 导出 `clearListCache()`、src/proxy.ts 导出 `clearHealthCache()`（仅供测试，注释标明），`beforeEach` 清理；并发写用例补 KV 落盘断言 |
+| M1 | API.md 会话 Cookie 属性写 SameSite=Lax | docs/API.md:13 | 改为 SameSite=Strict |
+| M2 | API.md 说“用户名明文比对” | docs/API.md:23 | 改为用户名与密码均先 SHA-256 再常量时间比较，并补登录限流（5 次 / 15 分钟） |
+| M3 | API.md 降权冷却写“1 小时” | docs/API.md:157 | 改为 5 分钟（KEY_HEALTH_COOLDOWN_MS） |
+| M4 | API.md 转发超时写“60 秒” | docs/API.md:164 | 改为“响应头超时 30 秒，只约束等响应头，流式正文不受限” |
+| M5 | README 的 OpenCode UA 写 `opencode/1.19.0` | README.md 请求头表 | 改为 `opencode/1.18.31`（以 `src/opencode.ts` 的 `OPENCODE_VERSION` 为准） |
+| M6 | README 说 request id 每请求随机、会话按首条 user 消息哈希 | README.md Session 行 | 改为 `msg_` + 12 位 hex（时间戳）+ 14 位 base62；会话优先复用客户端透传头，否则 isolate 内按首条 user 文本缓存 30 分钟（跨 isolate 不保证一致） |
+| M7 | `.gitignore` 忽略整个 `docs/`，新增文档会被静默漏提交 | .gitignore | 移除 `docs/`，文档正常入库 |
+| M8 | 鉴权链整段无测试 | test/routes.spec.ts | 转发鉴权 401 矩阵（缺失/空/错误/大小写）、管理台接口 401 与页面 302、有效会话放行、失效会话清 Cookie、登出删会话 |
+| M9 | 一批管理 API handler 零覆盖 | test/routes.spec.ts | `handleStatus` 计数、转发 Key 列表掩码不泄露、删除提供商 404/200 |
+| M10 | `seedInitialData` 无测试 | test/routes.spec.ts | 空 KV 初始化、重复执行幂等、已有提供商时不建测试 Key、迁移标记存在时不再补写 |
+| M11 | `test/opencode-responses.spec.ts` 测试基建：`readAll` 逐块 `decode` 未带 `{stream:true}`（多字节字符被切在块边界会变 U+FFFD）；文件头写“在 Workers 池中运行” | test/opencode-responses.spec.ts:1,20-29 | 改用共享 decoder + `{stream:true}`（末尾 flush）；注释改为“跑在 Node 环境，不启 workerd” |
+| M12 | `test/opencode.spec.ts:142-168` 用例名与实现相反、断言过弱（`[429,503]`、正文只断言 `'down'`） | test/opencode.spec.ts:142-168 | 断言改为 `429` + 正文含 `mirror down`（回放最后一次失败响应） |
+| M13 | CI 不校验 `worker.js` 与 `src/` 同步 | .github/workflows/deploy.yml | 在 `npm run check` 后新增 `npm run bundle && git diff --exit-code -- worker.js` |
+| L1 | API.md 测试模型请求写 `max_tokens: 1` | docs/API.md:358 | 改为 64 |
+| L2 | SSRF 校验的两条新分支未独立覆盖 | test/admin-ssrf.spec.ts | 补 `[fe80::1]`/`[fec0::1]`/`[2002::1]`/`[64:ff9b::...]`/`[fd00::1]` 拦截、内嵌凭据、`127.1`、`2130706433`、`LOCALHOST.`、`metadata.`；`fe/fc/fd` 开头合法域名不误拦 |
+| L3 | README 项目结构与实际目录不一致 | README.md 结构段 | 补 `docs/code-review.md`、`.github/workflows/`、`vitest.config.ts` |
+| L4 | `.gitignore` 遗漏常见产物 | .gitignore | 补 `coverage/`、`*.log`、`.env` |
+| L5 | `vitest.config.ts` 未声明 `test.include` | vitest.config.ts | 补 `test: { include: ['test/**/*.spec.ts'] }` |
+
+### 20.2 复核后有意保留
+
+| 项 | 理由 |
+| --- | --- |
+| 管理台深度渲染只断言 200 与内联脚本语法 | 转义逻辑已有 `modelRowHTML` 专项用例与逐点人工核实；为可维护性不再堆等价断言 |
+| `testModelConnection` / `fetchOpenCodeModels` / `testOpenCodeModel` 不测 | 依赖真实网络与上游账号，属“已知不测” |
+| 健康状态写入的并发丢计数、登录限流住 isolate 内存、转 Key `===` 比较、无 CSP | 均为前几轮已判定并写入代码 `shortcut:` 注释的既定取舍 |
+
+### 20.3 R8-B（全源码对抗性通读）
+
+- 状态：本轮提交时 R8-B 仍在运行；其发现与处置将在下一节（或本节追加）记录。
+
+## 二十一、第八轮验证记录（R8-B 结果并入前）
+
+| 项 | 结果 |
+| --- | --- |
+| `npm run check` | tsc 零错误（src + test）+ 5 个测试文件 / **127 用例全过** |
+| `npm run bundle` | worker.js 165919 B；与提交版逐字节相同（新增的两个“仅供测试”导出被 tree-shaking 掉，index.ts 的注释改动被 minify 剥离） |
+| 新增用例 | test/routes.spec.ts 21 条（转发链路 6 + 鉴权链 4 + 管理接口 3 + app 装配 4 + 初始化种子 4） |
+| 已知覆盖盲区（有意） | `src/pages.ts` 深度渲染分支、`src/opencode.ts` 镜像失败循环/保活体积上限的直接用例、`testModelConnection`（网络） |
