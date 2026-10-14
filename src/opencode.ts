@@ -134,6 +134,9 @@ export function generateOpenCodeId(prefix: 'ses' | 'msg', timestamp = Date.now()
 /**
  * 会话缓存 (内存 Map): 同一对话有效窗口内复用同一个合法时间戳派生的 ses_ ID,
  * 既保证上游时间戳风控校验通过, 又保持对话上下文一致性与上游 Prompt 缓存命中。
+ * shortcut: 缓存键只用「首条 user 文本」派生，不同客户端/不同转发 Key 的首条消息
+ * 相同时会共用同一个 ses_（共享上游会话亲和与 Prompt 缓存）。按客户端隔离需要把
+ * 转发 Key 或 IP 混入 seed，那会改变伪装出的会话形态，故按硬性约束保持现状。
  */
 const sessionCache = new Map<string, { id: string; expiresAt: number }>()
 

@@ -224,6 +224,9 @@ export function updateProxyKey(env: Env, id: string, updates: Partial<ProxyKey>)
 }
 
 export async function validateProxyKey(env: Env, key: string): Promise<boolean> {
+  // 空 token 不算 Key：KV 里若存在被清洗成 `key: ''` 的脏条目（或历史遗留），
+  // 空的 `Authorization: Bearer ` 会与它“相等”而放行
+  if (!key) return false
   const keys = await getProxyKeys(env)
   const now = Date.now()
   return keys.some((k) => k.key === key && k.enabled && (!k.expiresAt || now < new Date(k.expiresAt).getTime()))

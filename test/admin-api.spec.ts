@@ -3,7 +3,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { Hono } from 'hono'
 import { handleLogin } from '../src/auth'
-import { handleCreateProvider, handleCreateProxyKey, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
+import { handleCreateProvider, handleCreateProxyKey, handleTestKeyNew, handleTestModelNew, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
 import { addProxyKey, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
 import { modelRowHTML } from '../src/pages'
@@ -87,6 +87,16 @@ describe('storage 字段形状归一化', () => {
     expect(providers[0].baseUrl).toBe('') // 非字符串兜底成空串，转发侧据此返回可读错误
     expect(providers[0].models[0].enabled).toBe(false)
     expect(providers[0].apiKeys[0].enabled).toBe(false)
+  })
+
+  // 空 token 不应与“被清洗成 `key: ''` 的脏条目”相等而放行（空的 Bearer 头）
+  it('空 token 不会被 key 为空的脏条目放行', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const env = makeEnv()
+    await env.KV.put('proxy:keys', JSON.stringify([{ id: 'k0', name: 'k0', enabled: true }]))
+    expect(await storage.validateProxyKey(env, '')).toBe(false)
+    expect(await storage.validateProxyKey(env, 'sk_cf_anything')).toBe(false)
   })
 })
 
@@ -340,6 +350,37 @@ describe('上游地址缺失时的转发错误', () => {
     }), env)
     expect(res.status).toBe(502)
     expect(await res.text()).toContain('baseUrl')
+  })
+})
+
+// 回归：字面量 null（或数字/字符串）请求体过去会在解构或字段访问时抛 TypeError → 500
+describe('管理接口的非对象请求体', () => {
+  const nullInit: RequestInit = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: 'null' }
+
+  it('null 体统一按空对象处理，返回 400 / 404 而不是 500', async () => {
+    const env = makeEnv()
+    const app = new Hono<{ Bindings: Env }>()
+    app.post('/admin/api/providers', handleCreateProvider)
+    app.put('/admin/api/providers/:id', handleUpdateProvider)
+    app.post('/admin/api/proxy-keys', handleCreateProxyKey)
+    app.patch('/admin/api/proxy-keys/:id', handleUpdateProxyKey)
+    app.post('/admin/api/test-key', handleTestKeyNew)
+    app.post('/admin/api/test-model', handleTestModelNew)
+
+    // 创建类：缺必填项 → 400
+    for (const path of ['/admin/api/providers', '/admin/api/test-key', '/admin/api/test-model']) {
+      const res = await app.request(path, nullInit, env)
+      expect(res.status, path).toBe(400)
+    }
+    // 创建转发 Key 无必填项：空对象也能建（默认名 + 永不过期）
+    const created = await app.request('/admin/api/proxy-keys', nullInit, env)
+    expect(created.status).toBe(201)
+    expect(JSON.stringify(await created.json())).toContain('sk_cf_')
+    // 更新类：空对象 → 无字段可更新 → 目标不存在 → 404
+    for (const path of ['/admin/api/providers/p1', '/admin/api/proxy-keys/k1']) {
+      const res = await app.request(path, nullInit, env)
+      expect(res.status, path).toBe(404)
+    }
   })
 })
 

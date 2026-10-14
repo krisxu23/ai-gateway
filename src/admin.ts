@@ -126,6 +126,17 @@ export function findInvalidModelId(items: unknown): string | null {
   return null
 }
 
+/**
+ * 解析 JSON 请求体。字面量 null / 数字 / 字符串等非对象体过去会在解构或字段访问时
+ * 抛 TypeError → 500（管理台接口统一应给 400），这里统一归一成空对象交给各 handler
+ * 的必填项校验；非法 JSON 仍按原来的 SyntaxError → 400 处理。
+ */
+async function readJsonBody<T extends object>(c: Context<{ Bindings: Env }>): Promise<T> {
+  const raw: unknown = await c.req.json()
+  // 各 handler 都会校验自己的必填项，所以这里只保证"拿到的是个对象"
+  return (raw !== null && typeof raw === 'object' ? raw : {}) as T
+}
+
 const invalidModelMessage = (id: string) =>
   `模型 ID "${id.slice(0, 64)}" 含非法字符，仅允许字母、数字与 . _ : / -`
 
@@ -165,7 +176,7 @@ export async function handleGetProviders(c: Context<{ Bindings: Env }>) {
 }
 
 export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
-  const body = await c.req.json<CreateProviderRequest>()
+  const body = await readJsonBody<CreateProviderRequest>(c)
   // opencode 未传地址时自动填充
   if (body.id === 'opencode' && !body.baseUrl) {
     body.baseUrl = OPENCODE_DEFAULT_URL
@@ -224,7 +235,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
 export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<UpdateProviderRequest>()
+  const body = await readJsonBody<UpdateProviderRequest>(c)
 
   const updates: Partial<Provider> = {}
   if (body.name !== undefined) updates.name = body.name
@@ -280,7 +291,7 @@ export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
 export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const { modelId } = await c.req.json<TestModelRequest>()
+  const { modelId } = await readJsonBody<TestModelRequest>(c)
   if (!modelId) return c.json<ApiResponse>({ success: false, message: 'modelId 为必填项' }, 400)
 
   const provider = await getProvider(c.env, id)
@@ -319,12 +330,12 @@ function buildAuthHeaders(apiKey: string, apiType?: string): Record<string, stri
 }
 
 export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
-  const { url, apiKey, apiType, providerId } = await c.req.json<{
+  const { url, apiKey, apiType, providerId } = await readJsonBody<{
     url: string
     apiKey: string
     apiType?: string
     providerId?: string
-  }>()
+  }>(c)
   if (!url || (!apiKey && !(providerId && isOpenCodeProvider(providerId)))) {
     return c.json<ApiResponse>({ success: false, message: 'url 和 apiKey 为必填项' }, 400)
   }
@@ -378,13 +389,13 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
 }
 
 export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
-  const { url, apiKey, apiType, model, providerId } = await c.req.json<{
+  const { url, apiKey, apiType, model, providerId } = await readJsonBody<{
     url: string
     apiKey: string
     apiType?: string
     model: string
     providerId?: string
-  }>()
+  }>(c)
   if (!url || !model || (!apiKey && !isOpenCodeProvider(providerId || ''))) {
     return c.json<ApiResponse>({ success: false, message: 'url、apiKey、model 为必填项' }, 400)
   }
@@ -438,7 +449,7 @@ export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
 }
 
 export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
-  const body = await c.req.json<CreateProxyKeyRequest>()
+  const body = await readJsonBody<CreateProxyKeyRequest>(c)
   const id = crypto.randomUUID()
   const randomPart = crypto.randomUUID().replace(/-/g, '')
   const key = `${PROXY_KEY_PREFIX}${randomPart}`
@@ -478,7 +489,7 @@ export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
 export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
-  const body = await c.req.json<{ enabled?: boolean }>()
+  const body = await readJsonBody<{ enabled?: boolean }>(c)
   const updates: Partial<import('./types').ProxyKey> = {}
   if (body.enabled !== undefined) {
     // 字符串 "false" 是 truthy: 静默落库会让"吊销"看起来成功但 Key 仍可用
