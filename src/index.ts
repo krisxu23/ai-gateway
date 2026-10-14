@@ -37,6 +37,8 @@ const securityHeaders = async (c: Context<{ Bindings: Env }>, next: () => Promis
 }
 app.use('/admin/*', securityHeaders)
 app.use('/', securityHeaders)
+// 转发响应也补 nosniff（JSON/SSE 本不会被嗅探成脚本，属便宜的纵深防御）
+app.use('/v1/*', securityHeaders)
 // 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
 // tail 日志足够排查问题。
 

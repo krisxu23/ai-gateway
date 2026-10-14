@@ -452,7 +452,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           continue
         }
 
-        // 其他错误（400/404 等）直接返回
+        // 其他错误（400/404 等）直接返回；上一个 Key 的失败响应体同样要取消，
+        // 否则其 body 悬挂到请求结束
+        await dropLastError()
         const { raw, json } = await readErrorBody(response)
         return c.json(
           json ?? { error: { message: raw.substring(0, 500) } },
@@ -488,11 +490,16 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // 所有 key 均失败
     if (lastError) {
+      // 429 是上游限流，不代表 Key 失效：用独立 type/文案，否则调用方会按
+      // key_exhausted 去换 Key（实际只需稍后重试）
+      const rateLimited = lastError.status === 429
       const { raw } = await readErrorBody(lastError)
       return c.json({
         error: {
-          message: `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
-          type: 'key_exhausted',
+          message: rateLimited
+            ? '所有 API Key 都被上游限流（HTTP 429），请稍后重试'
+            : `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
+          type: rateLimited ? 'rate_limited' : 'key_exhausted',
           detail: (raw || '所有 API Key 均失败').substring(0, 500),
         },
       }, clampErrorStatus(lastError.status) as Parameters<typeof c.json>[1])

@@ -51,6 +51,13 @@ const withBoolEnabled = (item: Record<string, unknown>): Record<string, unknown>
   ({ ...item, enabled: item.enabled === true })
 
 /**
+ * 字符串条目（旧 schema / 人工误写）按写路径 normalizeArray 的规则还原成对象，
+ * 读路径不宜静默丢弃：丢弃会在下一次整表写回时把数据永久删掉。
+ */
+const toStringEntries = (items: unknown[], field: string): Record<string, unknown>[] =>
+  items.map((item) => (typeof item === 'string' ? { [field]: item, enabled: true } : item)).filter(isObj)
+
+/**
  * id 会被拼进管理台内联 JS 的字符串字面量（onclick="tog('${p.id}')"），那里 HTML
  * 转义挡不住引号闭合；写路径有同样的白名单，读路径再兜一道，KV 里的人工脏数据 /
  * 旧版本残留就不会变成存储型 XSS。
@@ -70,8 +77,8 @@ function sanitizeList(key: string, raw: unknown[]): unknown[] {
         name: String(p.name ?? ''),
         baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
         enabled: p.enabled === true,
-        models: Array.isArray(p.models) ? p.models.filter(isObj).map(withBoolEnabled) : [],
-        apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj).map(withBoolEnabled) : [],
+        models: Array.isArray(p.models) ? toStringEntries(p.models, 'id').map(withBoolEnabled) : [],
+        apiKeys: Array.isArray(p.apiKeys) ? toStringEntries(p.apiKeys, 'key').map(withBoolEnabled) : [],
       })
     }
     return out
@@ -137,7 +144,9 @@ async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
 /** 通用缓存列表写入：先写 KV 成功后再更新内存缓存，防止脏数据污染 */
 async function setCachedList<T>(env: Env, key: string, list: T[]): Promise<void> {
   await env.KV.put(key, JSON.stringify(list))
-  cacheSet(key, list, CACHE_TTL_BY_KEY[key])
+  // 内存缓存必须与读 KV 的出口一致：写路径的入参没过 sanitizeList，若原样缓存
+  // （E.g. enabled:"false"），60s 内该 Key 仍被当作启用、停用模型仍出现在 /v1/models。
+  cacheSet(key, sanitizeList(key, list) as T[], CACHE_TTL_BY_KEY[key])
 }
 
 // 同 isolate 内的写队列：把「读全表 → 改 → 写回」串行化，避免两个并发管理操作
@@ -168,10 +177,13 @@ export async function setProviders(env: Env, providers: Provider[]): Promise<voi
   await setCachedList(env, KV_KEYS.PROVIDERS, providers)
 }
 
-export function addProvider(env: Env, provider: Provider): Promise<void> {
+/** 返回 false 表示 id 已存在（去重必须在串行队列内做，队列外的 some() 挡不住并发同 id 创建） */
+export function addProvider(env: Env, provider: Provider): Promise<boolean> {
   return serialized(KV_KEYS.PROVIDERS, async () => {
     const providers = await getProviders(env)
+    if (providers.some((p) => p.id === provider.id)) return false
     await setProviders(env, [...providers, provider])
+    return true
   })
 }
 

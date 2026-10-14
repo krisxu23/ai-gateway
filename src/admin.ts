@@ -121,6 +121,19 @@ function normalizeArray<T>(
     .filter((item): item is T => typeof item === 'object' && item !== null)
 }
 
+/**
+ * 对象条目里若带了 enabled，必须是布尔：字符串 "false" 是 truthy，落库后会表现为
+ * "停用失败"（与顶层 enabled 的校验保持一致）。
+ */
+function findInvalidEnabled(items: unknown): boolean {
+  if (!Array.isArray(items)) return false
+  return items.some(
+    (item) =>
+      typeof item === 'object' && item !== null &&
+      'enabled' in item && typeof (item as { enabled?: unknown }).enabled !== 'boolean'
+  )
+}
+
 // 模型 ID 会渲染进管理台 HTML 属性，且可来自上游 /models 接口，属于不可信输入：
 // 只放行安全字符集，从源头堵死注入（渲染侧的 data-mid 传递是第二道防线）
 const MODEL_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/
@@ -207,11 +220,6 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
   }
 
-  const providers = await getProviders(c.env)
-  if (providers.some((p) => p.id === body.id)) {
-    return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
-  }
-
   const badModel = findInvalidModelId(body.models)
   if (badModel !== null) {
     return c.json<ApiResponse>({ success: false, message: invalidModelMessage(badModel) }, 400)
@@ -223,6 +231,9 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   }
   if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
     return c.json<ApiResponse>({ success: false, message: 'enabled 必须是布尔值' }, 400)
+  }
+  if (findInvalidEnabled(body.apiKeys) || findInvalidEnabled(body.models)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys/models 条目里的 enabled 必须是布尔值' }, 400)
   }
 
   const now = new Date().toISOString()
@@ -240,7 +251,10 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     updatedAt: now,
   }
 
-  await addProvider(c.env, provider)
+  // 去重由 storage 在串行队列内完成：队列外的 some() 挡不住并发同 id 创建
+  if (!(await addProvider(c.env, provider))) {
+    return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
+  }
   return c.json<ApiResponse<Provider>>({ success: true, data: provider }, 201)
 }
 
@@ -253,6 +267,10 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   if (body.name !== undefined) {
     if (typeof body.name !== 'string') {
       return c.json<ApiResponse>({ success: false, message: 'name 必须是字符串' }, 400)
+    }
+    // 与创建路径一致：空串会让列表行标题变空白
+    if (!body.name) {
+      return c.json<ApiResponse>({ success: false, message: 'name 不能为空' }, 400)
     }
     updates.name = body.name
   }
@@ -278,6 +296,9 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
       return c.json<ApiResponse>({ success: false, message: 'enabled 必须为布尔值' }, 400)
     }
     updates.enabled = body.enabled
+  }
+  if (findInvalidEnabled(body.apiKeys) || findInvalidEnabled(body.models)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys/models 条目里的 enabled 必须是布尔值' }, 400)
   }
   if (body.models !== undefined) {
     const badModel = findInvalidModelId(body.models)

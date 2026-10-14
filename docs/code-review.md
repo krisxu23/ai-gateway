@@ -613,3 +613,59 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 | 冷启动播种后 `GET /v1/models`（带播种出的测试 Key） | 200，返回 4 个 opencode 免费模型（id 带 `opencode/` 前缀） |
 
 结论：`npm run check` = tsc 零错误 + 139 用例全过。
+
+## 二十五、第九轮修复记录（两路独立审查：翻译状态机 + 全量对抗性通读）
+
+两路只读 reviewer：`del_mv7jlld8_kk4m`（src/opencode.ts + src/opencode-responses.ts 状态机）与
+`del_mv7jlld9_4mwa`（test/ 全部 spec + 其余 src）。两份报告共 21 项，其中 12 项已修、2 项有意保留、7 项复核后不成立。
+
+### 25.1 已修（R9-A：responses→chat 翻译状态机）
+
+| 编号 | 问题 | 修复 |
+| --- | --- | --- |
+| R9A-H1 | `collapseChatSseToJson` 对 `tool_call.index` 无上界：上游给 `index: 999999` 会生成百万级稀疏数组 → 内存/序列化放大（DoS） | 加 `MAX_TOOL_INDEX = 128`，越界索引按“溢出槽位”合并（不再按 index 分配） |
+| R9A-M1 | `output_item.done` 缺 `arguments` 时用 `'{}'` 覆盖已累计参数 → 客户端拼出非法 JSON 且被标记为“已收完” | 无 `arguments` 时沿用已累计值；只有 `isCompleteJson` 才 `finalizedIds.add` |
+| R9A-M2 | `allToolsFinalized()` 未校验 JSON 完整性（参数被截断也报 `tool_calls`） | `finalizedIds.has(id) \|\| isCompleteJson(toolArgs[id])` |
+| R9A-M3 | 工具调用先到、`output_item.added` 始终不来时调用彻底丢失 | 新增 `synthesizeCall()`：按 added 形状补发 name 并建索引，收尾前从 `pendingDone` 合成 |
+| R9A-L1 | `done` 先到、`added` 后到：`pendingDone` 只存参数，name 丢失 | `pendingDone` 改存 `{name, args}`；补发时走 `diffArgs` 差量 |
+| R9A-L2 | `done` 已收完后同名 `delta` 仍会追加 → 合法 JSON 被拼坏 | delta 分支加 `if (finalizedIds.has(itemID)) break` |
+| R9A-L3 | `finish_reason` 只用 `nextIdx`/`sawText` 推断，`stop` 与截断无法区分 | 收尾改看 `toolFinalized`（`allToolsFinalized()`）与 `hitLimit` |
+
+### 25.2 已修（R9-B：全量对抗性通读）
+
+| 编号 | 问题 | 修复 |
+| --- | --- | --- |
+| R9B-H1 | 写路径 `setCachedList` 不走 `sanitizeList`：`enabled:"false"` 被原样缓存 60s，期间停用的 Key 仍被转发、停用模型仍出现在 `/v1/models` | `setCachedList` 缓存前统一过 `sanitizeList` |
+| R9B-H1b | `normalizeArray` 不校验对象条目内的 `enabled` 类型 | 新增 `findInvalidEnabled()`，create/update 命中即 400（与顶层一致） |
+| R9B-H2 | 提供商重名检查在串行队列外 → 并发同 id 创建落两条，后一条无法寻址（`findIndex` 永远命中第一条） | 去重移入 `serialized` 内的 `addProvider`（返回 `boolean`），据此回 409 |
+| R9B-M3 | 全部 Key 被 429 时仍报 `key_exhausted`「已用完」→ 调用方误判为 Key 失效 | 单列 `type: 'rate_limited'` 与文案「被上游限流，请稍后重试」 |
+| R9B-L1 | 「其他错误（400/404）」分支漏了 `dropLastError()` → 上一个失败 Key 的 body 悬挂 | 补 `await dropLastError()` |
+| R9B-L2 | `loginFailures` 只清过期项：攻击压满 1000 个活跃来源时一条都删不掉，Map 无界增长 | 仍超限时按插入序淘汰最早条目 |
+| R9B-L3 | 转发 Key 掩码 API 4 星、页面 5 星 | 统一 4 星（`SHARED_JS` 是字符串，前后端无法共用同一函数，故对齐字面量而非抽函数） |
+| R9B-L4 | 更新路径允许把 `name` 改成空串（创建路径禁止） | `!body.name` → 400「name 不能为空」 |
+| R9B-L5 | 读路径 `sanitizeList` 丢弃字符串形式的 `models`/`apiKeys`，下一次写回把丢失持久化 | 新增 `toStringEntries()`，按写路径 `normalizeArray` 的规则还原 |
+| R9B-L6 | `/v1/*` 响应缺 `X-Content-Type-Options: nosniff` | `app.use('/v1/*', securityHeaders)` |
+| R9B-L7 | 登录限流表是模块级状态，测试间无重置出口（靠硬编码不同 IP 才不串扰） | 导出 `clearLoginFailures()`（仅供测试）并在 `beforeEach` 调用 |
+
+### 25.3 有意保留
+
+| 编号 | 问题 | 保留理由 |
+| --- | --- | --- |
+| R9A-L4 | 上游无终结符直接断开时，纯文本流也报 `finish_reason: 'length'` | 没有终结符就应视为“未正常完成”，报 `length` 比报 `stop` 更诚实；加超时表会引入新的状态与竞态 |
+| R9B-L8 | `/v1/*` 的 subPath 取自 pathname（可转发到上游同主机任意路径） | 见 22.2 R8B-11：主机与 Key 都是管理员配置的；`..` 逃逸在 WHATWG 规范化阶段即被消解 |
+
+### 25.4 复核后不成立（已排除）
+
+`onError` 丢 CORS 头（实测仍带 `ACAO: *`）、`renderHomePage` 反射 `Host`（三处插值都过 `escapePageHtml`，无 XSS）、`safeEntryId` 读路径归一化可注入（写入侧白名单 + `modelRowHTML` 的 `data-mid` 三层覆盖）、`admin-ssrf.spec.ts` 用例重叠（冗余非错误）、`app.store` 内存桩串扰、`test/proxy-connect.spec.ts` 断言质量、`test/admin-api.spec.ts` 的 `new Function` 只验语法（已声明为有意保留的盲区）。
+
+## 二十六、第九轮验证记录
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run check` | tsc 零错误（src + test）+ 6 文件 **144 用例全过** |
+| `npm run bundle` | worker.js 重建（164.0kb），与 src 同步 |
+| 回归验证 | 临时 stash 掉本轮 src 改动后重跑 test/routes.spec.ts：**6 条用例失败**，说明新增断言确实覆盖被测路径（不是恒真断言） |
+
+**本轮新增用例（5 条 + 3 处强化）**：嵌套 `enabled` 非布尔 → 400；写路径缓存过 `sanitizeList`（脏数据不会在 60s 内“复活”）；并发同 id 创建 → 一个 201 一个 409 且只落一条；`name` 空串 → 400；`/v1/*` 带 `nosniff`；强化：429 全部失败 → `type: rate_limited` 且健康表整体为空（原 `?? 0` 写法在 `writeHealth` 失效时也成立）、过期会话用 KV 里 `expiresAt` 已过去的记录覆盖（断言 `Max-Age=0` 且会话被删除）。
+
+**未覆盖（已知盲区，同第八轮）**：`testModelConnection` / `testOpenCodeModel` / `fetchOpenCodeModels`（需真实网络）、页面像素级断言、`createKeepAliveStream` 保活细节、`storeFailure` 体积上限回放、`loginFailures` 的 1000 条上限淘汰（需 1001 个真实源 IP，且有 400ms 失败延时，不适合单测）。

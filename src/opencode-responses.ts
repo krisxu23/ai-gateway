@@ -68,7 +68,9 @@ export function normalizeReasoningEffort(value: unknown): string {
 // 小写的 bash/read 发给上游, 返回值里的 back 记录 上游名→客户端原名 映射, 供下游
 // 把模型调用改回原名透传。客户端没有该工具时才注入桩(在 opencode.ts 的 gate 里做)。
 export function mapFreeLaneClientTools(chat: Rec): Record<string, string> {
-  const back: Record<string, string> = {}
+  // 无原型对象: 上游可能报 __proto__/constructor 这类名字, 在 {} 上查
+  // back[name] 会命中 Object.prototype, 被误判成“客户端改过名”而损坏输出
+  const back: Record<string, string> = Object.create(null)
   if (!Array.isArray(chat.tools)) return back
   const FREE_LANE_NAMES = ['bash', 'read']
   const tools = chat.tools as unknown[]
@@ -305,7 +307,7 @@ export function createResponsesToChatStream(
   // 不代表另一个也收完了。
   const toolArgs: Record<string, string> = Object.create(null)
   // done 早于 added 的乱序到达(镜像重排): 先缓存参数, 等 added 建好索引再补发
-  const pendingDone: Record<string, string> = Object.create(null)
+  const pendingDone: Record<string, { name: string; args: string }> = Object.create(null)
   const finalizedIds = new Set<string>()
   const isCompleteJson = (raw: string | undefined): boolean => {
     if (!raw) return false
@@ -345,6 +347,33 @@ export function createResponsesToChatStream(
         ? injectedStubs.has(lower) || injectedStubs.has(name)
         : swallowStubs)
     return { name, isStub }
+  }
+
+  // 用终态信息合成完整调用(上游没发 output_item.added, 或 added 始终没到):
+  // 先按 added 的形状下发 name 并建索引, 再补参数差量。返回索引, 桩返回 null。
+  const synthesizeCall = (
+    controller: TransformStreamDefaultController<Uint8Array>,
+    itemID: string,
+    rawName: unknown,
+    rawArgs: unknown,
+    callId: string
+  ): number | null => {
+    const { name, isStub } = resolveToolName(typeof rawName === 'string' ? rawName : '')
+    if (isStub) return null
+    let idx = toolIdx[itemID] as number | undefined
+    if (idx === undefined) {
+      idx = nextIdx++
+      toolIdx[itemID] = idx
+      controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
+        tool_calls: [{ index: idx, id: callId, type: 'function', function: { name, arguments: '' } }],
+      })))
+    }
+    const args = finalArgs(typeof rawArgs === 'string' ? rawArgs : '')
+    const suffix = diffArgs(itemID, args)
+    toolArgs[itemID] = args
+    if (isCompleteJson(args)) finalizedIds.add(itemID)
+    if (suffix) emitArgs(controller, idx, suffix)
+    return idx
   }
 
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
@@ -393,9 +422,11 @@ export function createResponsesToChatStream(
           const pending = pendingDone[itemID]
           if (pending !== undefined) {
             delete pendingDone[itemID]
-            toolArgs[itemID] = pending
-            finalizedIds.add(itemID)
-            emitArgs(controller, idx, pending)
+            const args = finalArgs(pending.args)
+            const suffix = diffArgs(itemID, args)
+            toolArgs[itemID] = args
+            if (isCompleteJson(args)) finalizedIds.add(itemID)
+            if (suffix) emitArgs(controller, idx, suffix)
           }
         }
         break
@@ -403,6 +434,8 @@ export function createResponsesToChatStream(
       case 'response.function_call_arguments.delta': {
         const itemID = typeof ev.item_id === 'string' ? ev.item_id : ''
         if (swallowedIds.has(itemID)) break
+        // done 已收完: 之后的同名 delta 属乱序/重复, 再拼会把合法 JSON 拼坏
+        if (finalizedIds.has(itemID)) break
         // 没见过 output_item.added 的 item_id 不能默认落到 index 0：参数会拼到
         // 错误的工具调用上（宁可丢弃也不静默串味）
         const idx = toolIdx[itemID] as number | undefined
@@ -439,18 +472,23 @@ export function createResponsesToChatStream(
         const rawArgs = typeof ev.arguments === 'string'
           ? ev.arguments
           : typeof item?.arguments === 'string' ? item.arguments : ''
+        const rawName = typeof item?.name === 'string' ? item.name : ''
         const idx = itemID ? (toolIdx[itemID] as number | undefined) : undefined
         if (idx === undefined) {
-          // added 还没到: 先缓存, 等 added 建好索引再补发, 否则参数永久丢失
-          if (itemID && rawArgs) pendingDone[itemID] = finalArgs(rawArgs)
+          // added 还没到: 先缓存名字与参数, 等 added 建好索引再补发(或在收尾时
+          // 合成), 否则这个工具调用会永久丢失
+          if (itemID && (rawArgs || rawName)) pendingDone[itemID] = { name: rawName, args: rawArgs }
           break
         }
-        // 只有“已下发给客户端的工具调用”才算数(桩被吞掉了, 与我们无关)
-        const args = finalArgs(rawArgs)
+        // 只有“已下发给客户端的工具调用”才算数(桩被吞掉了, 与我们无关)。
+        // 没有 arguments 的 done 不能当作“空参数={}”: 那会把已累计的参数覆盖成
+        // `{"a":` + `{}` 这种非法 JSON, 还会让 allToolsFinalized 误判为收完。
+        const args = rawArgs ? finalArgs(rawArgs) : (toolArgs[itemID] || '{}')
         const suffix = diffArgs(itemID, args)
         toolArgs[itemID] = args
         if (suffix) emitArgs(controller, idx, suffix)
-        finalizedIds.add(itemID)
+        // 只有确实拿到完整 JSON 才算“参数收完”, 否则留给终态报 length
+        if (isCompleteJson(args)) finalizedIds.add(itemID)
         break
       }
       case 'response.completed':
@@ -471,28 +509,12 @@ export function createResponsesToChatStream(
                 ? item.id
                 : typeof item.call_id === 'string' ? item.call_id : ''
               if (!itemID) continue
-              const { name, isStub } = resolveToolName(typeof item.name === 'string' ? item.name : '')
-              if (isStub) continue
-              let idx = toolIdx[itemID] as number | undefined
-              if (idx === undefined) {
-                // 上游没发 output_item.added: 直接从终态合成完整调用, 否则客户端
-                // 会收到 name 有值但 arguments 为空的 tool_call
-                idx = nextIdx++
-                toolIdx[itemID] = idx
-                controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
-                  tool_calls: [{
-                    index: idx,
-                    id: item.call_id ?? itemID,
-                    type: 'function',
-                    function: { name, arguments: '' },
-                  }],
-                })))
-              }
-              const args = finalArgs(typeof item.arguments === 'string' ? item.arguments : '')
-              const suffix = diffArgs(itemID, args)
-              toolArgs[itemID] = args
-              finalizedIds.add(itemID)
-              if (suffix) emitArgs(controller, idx, suffix)
+              // 上游没发 output_item.added: 直接从终态合成完整调用, 否则客户端
+              // 会收到 name 有值但 arguments 为空的 tool_call
+              synthesizeCall(
+                controller, itemID, item.name, item.arguments,
+                typeof item.call_id === 'string' && item.call_id ? item.call_id : itemID
+              )
             } else if (item.type === 'message' && !sawText && Array.isArray(item.content)) {
               for (const part of item.content) {
                 const p = asRecord(part)
@@ -503,6 +525,12 @@ export function createResponsesToChatStream(
               }
             }
           }
+        }
+        // done 先到、added 始终没来、终态 output 也没有该项: 名字与参数只剩在
+        // pendingDone 里, 收尾前合成完整调用, 否则这个工具调用会彻底消失。
+        for (const [pendingID, pending] of Object.entries(pendingDone)) {
+          if (pendingID in toolIdx) continue
+          synthesizeCall(controller, pendingID, pending.name, pending.args, pendingID)
         }
         // finish_reason 与非流式路径(responsesToChatBody)对齐,但流式下工具的
         // arguments 是边收边发的: 只有拿到"参数收完"的信号才算完整调用, 否则报

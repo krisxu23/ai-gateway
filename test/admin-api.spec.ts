@@ -2,7 +2,7 @@
 // 覆盖：登录限流、转发 Key 过期时间、模型 ID 校验、列表并发写、吊销与脏数据容错。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
-import { handleLogin } from '../src/auth'
+import { clearLoginFailures, handleLogin } from '../src/auth'
 import { handleCreateProvider, handleCreateProxyKey, handleTestKeyNew, handleTestModelNew, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
 import { addProxyKey, clearListCache, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
@@ -38,8 +38,10 @@ function proxyKey(id: string, key: string): ProxyKey {
 
 // storage 的内存缓存是模块级状态（键不含 env），所以每个用例前必须清一次，
 // 否则断言会在“不执行被测路径”的情况下通过（读到上游用例留下的缓存）。
+// 登录限流表同样是模块级状态，不重置会让后续用例污染成 429。
 beforeEach(() => {
   clearListCache()
+  clearLoginFailures()
 })
 
 describe('storage 脏数据容错', () => {

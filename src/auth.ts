@@ -42,13 +42,23 @@ function recordLoginFailure(ip: string, now: number): void {
   const state = loginFailures.get(ip)
   const count = state && state.until > now ? state.count + 1 : 1
   loginFailures.set(ip, { count, until: now + LOGIN_WINDOW_MS })
-  // 顺带清理过期条目，避免 Map 无界增长
+  // 有界：先清过期项；仍超限时按插入序淘汰最早的 —— 只扫过期项在攻击压满 1000 个
+  // 活跃来源时一条都删不掉，Map 会持续增长
   if (loginFailures.size > 1000) {
     for (const [key, value] of loginFailures) if (value.until <= now) loginFailures.delete(key)
+    for (const key of loginFailures.keys()) {
+      if (loginFailures.size <= 1000) break
+      loginFailures.delete(key)
+    }
   }
 }
 // shortcut: 计数住在 isolate 内存里，攻击者分散到多个 POP 能绕过；
 // 需要全局强限流时改用 Durable Object 或 Cloudflare Rate Limiting。
+
+/** 仅供测试：清空登录失败计数（模块级状态） */
+export function clearLoginFailures(): void {
+  loginFailures.clear()
+}
 
 /** 管理后台 Session 验证中间件 */
 export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {

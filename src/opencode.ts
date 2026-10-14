@@ -247,7 +247,9 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
     const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
     return typeof fn?.name === 'string' ? fn.name : undefined
   }))
-  const back: Record<string, string> = {}
+  // 上游工具名 → 客户端原名。用无原型对象: 上游可能报 __proto__/constructor
+  // 这类名字, 在 {} 上查 back[name] 会命中 Object.prototype 而被误判成“改过名”。
+  const back: Record<string, string> = Object.create(null)
   // injectedStubs: 我们注入的桩名(仅当客户端没有同名/变体工具时才注入)。
   // 吞噬按名判定: 无论客户端是否带了自己的工具，只要这个 bash/read 是我们注入
   // 的桩，模型对它的调用都必须被吞，混合场景下才不会把残缺调用泄给客户端。
@@ -377,7 +379,12 @@ export async function collapseChatSseToJson(
           const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
           if (Array.isArray(tc)) {
             for (const call of tc) {
-              const idx = typeof call.index === 'number' ? call.index : toolCalls.length
+              const rawIdx = call.index
+              // index 只用于定位: 非整数/负数/越界一律当作新的一条，否则
+              // index=1e6 的输入会被序列化成上百万个 null（响应放大）
+              const idx = Number.isInteger(rawIdx) && (rawIdx as number) >= 0 && (rawIdx as number) < MAX_TOOL_INDEX
+                ? (rawIdx as number)
+                : toolCalls.length
               if (!toolCalls[idx]) {
                 toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
                 argBufs[idx] = ''
@@ -420,17 +427,28 @@ export async function collapseChatSseToJson(
       : swallowStubs
   }
   const shouldFilter = swallowStubs || injectedStubs.size > 0
+  // 上游跳过 index 时数组会留空洞: 先压紧, 否则 JSON.stringify 会写出 null,
+  // 而空洞还会被误算成“吞掉了桩”(swallowedAny)
+  const denseCalls = toolCalls.filter((tc): tc is Record<string, unknown> => Boolean(tc))
   const finalToolCalls = shouldFilter
-    ? toolCalls.filter((tc) => {
-        if (!tc) return false
+    ? denseCalls.filter((tc) => {
         const fn = (tc.function ?? {}) as Record<string, unknown>
         const name = typeof fn.name === 'string' ? fn.name : ''
         return !isStub(name)
       })
-    : toolCalls
+    : denseCalls
+  // 参数被截断却报 tool_calls 会让客户端直接执行半截 JSON: 非空且解析不开时
+  // 降级为 length(与流式路径的 allToolsFinalized 守卫对齐)
+  if (finishReason === 'tool_calls' || finishReason === 'stop') {
+    const truncated = finalToolCalls.some((tc) => {
+      const args = (tc.function as Record<string, unknown>).arguments
+      return typeof args === 'string' && args !== '' && !isCompleteJsonArgs(args)
+    })
+    if (truncated) finishReason = 'length'
+  }
   // 只有真实观察到桩调用并被过滤掉时, 才算"模型调了桩": 空正文也可能是
   // 推理吃光 token 预算(finish_reason length) 等原因, 此时不能误报提示句。
-  const swallowedAny = shouldFilter && toolCalls.length > finalToolCalls.length
+  const swallowedAny = shouldFilter && denseCalls.length > finalToolCalls.length
   if (swallowedAny && finalToolCalls.length === 0 && finishReason === 'tool_calls') {
     finishReason = 'stop'
   }
@@ -480,6 +498,9 @@ function createStubSwallowingChatStream(
   const normalIndexes = new Set<number>()
 
   /** 处理单个 SSE data 载荷: 返回重序列化后的 data, 或 null 表示丢弃整事件。 */
+  // 无 index 的真实调用(被保留)会让"seenIndexes 全是桩"的判定失真, 单独记一笔
+  let keptUnindexed = false
+
   const handleData = (data: string, controller: TransformStreamDefaultController<Uint8Array>): string | null => {
     let evt: Record<string, unknown>
     try {
@@ -537,13 +558,14 @@ function createStubSwallowingChatStream(
                 continue
               }
             }
+            if (idx < 0) keptUnindexed = true
             kept.push(call)
           }
           if (kept.length > 0) delta.tool_calls = kept
           else delete delta.tool_calls
         }
       }
-      if (choice.finish_reason === 'tool_calls' && seenIndexes.size > 0
+      if (choice.finish_reason === 'tool_calls' && !keptUnindexed && seenIndexes.size > 0
         && [...seenIndexes].every((i) => stubIndexes.has(i))) {
         choice.finish_reason = 'stop'
       }
@@ -592,6 +614,12 @@ function createStubSwallowingChatStream(
   // finish_reason=tool_calls 却看不到任何调用
   const flushPendingCalls = (controller: TransformStreamDefaultController<Uint8Array>) => {
     if (pendingCalls.size === 0) return
+    // 客户端本来就没带 tools: 这一轮不存在任何可执行的调用, 名字始终未到的缓存
+    // 一律丢弃——否则桩参数(如 rm -rf)会经这条路径泄给客户端。
+    if (!hadClientTools) {
+      pendingCalls.clear()
+      return
+    }
     const calls: Array<Record<string, unknown>> = []
     for (const queue of pendingCalls.values()) calls.push(...queue)
     pendingCalls.clear()
@@ -625,6 +653,18 @@ function createStubSwallowingChatStream(
 }
 
 const MAX_STORED_FAILURE_BYTES = 256 * 1024
+/** 上游 tool_call.index 的合理上界: 越界一律当作新的一条(防稀疏数组响应放大) */
+const MAX_TOOL_INDEX = 256
+
+/** arguments 是否为完整 JSON(空串视为“无参数”, 由客户端按 {} 处理) */
+function isCompleteJsonArgs(raw: string): boolean {
+  try {
+    JSON.parse(raw)
+    return true
+  } catch {
+    return false
+  }
+}
 
 async function storeFailure(response: Response): Promise<StoredFailure> {
   const headers = new Headers(response.headers)

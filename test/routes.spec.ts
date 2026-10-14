@@ -204,11 +204,13 @@ describe('转发：多 Key 轮换与健康状态', () => {
     for (let i = 0; i < 3; i++) {
       const res = await app.request('/v1/chat/completions', chatInit(), env)
       expect(res.status).toBe(429)
+      // 全部 Key 都被限流 ≠ Key 失效：用独立 type，否则调用方会误判成 key_exhausted
+      const body = (await res.json()) as { error: { type: string } }
+      expect(body.error.type).toBe('rate_limited')
     }
-    // 两个 key 都被 429 过，但健康数据里不应出现失败计数（否则会被错误降权）
-    const health = healthOf(env, 'p1')
-    expect(health['key-1']?.failures ?? 0).toBe(0)
-    expect(health['key-2']?.failures ?? 0).toBe(0)
+    // 健康表必须整体为空：`?? 0` 的写法在 writeHealth 完全失效时也成立，等于没测
+    expect(healthOf(env, 'p1')).toEqual({})
+    expect(env.store.has(KV_KEYS.KEY_HEALTH_PREFIX + 'p1')).toBe(false)
   })
 
   it('所有 Key 都失败时返回上游状态码与可读错误', async () => {
@@ -292,6 +294,15 @@ describe('鉴权链', () => {
     const bad = await app.request('/admin/api/status', { headers: { Cookie: 'session_id=not-exist' } }, env)
     expect(bad.status).toBe(401)
     expect(bad.headers.get('Set-Cookie')).toContain('session_id=')
+
+    // 真正“过期”（不是“不存在”）：KV 里写一条 expiresAt 已过去的会话，
+    // 覆盖 getSession 的过期分支与 deleteSession
+    const expiredId = 'expired-session'
+    env.store.set(KV_KEYS.SESSION_PREFIX + expiredId, JSON.stringify({ username: 'admin', expiresAt: Date.now() - 1000 }))
+    const expired = await app.request('/admin/api/status', { headers: { Cookie: `session_id=${expiredId}` } }, env)
+    expect(expired.status).toBe(401)
+    expect(expired.headers.get('Set-Cookie')).toContain('Max-Age=0')
+    expect(env.store.has(KV_KEYS.SESSION_PREFIX + expiredId)).toBe(false)
   })
 
   it('退出登录会删除会话并让 Cookie 失效', async () => {
@@ -348,6 +359,56 @@ describe('管理接口', () => {
     await expect(getProviders(env)).resolves.toEqual([])
     expect((await app.request('/admin/api/providers/p1', { method: 'DELETE', headers }, env)).status).toBe(404)
   })
+
+  it('嵌套 enabled 非布尔时返回 400（字符串 "false" 是 truthy，落库会静默失效）', async () => {
+    const env = makeEnv()
+    const headers = { 'Content-Type': 'application/json', ...(await adminHeaders(env)) }
+    const res = await makeApp().request('/admin/api/providers', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        id: 'p9', name: 'P9', baseUrl: 'https://up.example.com/v1',
+        apiKeys: [{ key: 'sk-x', enabled: 'false' }],
+      }),
+    }, env)
+    expect(res.status).toBe(400)
+  })
+
+  it('写路径的内存缓存同样过 sanitizeList：脏数据不会在 60s 内“复活”', async () => {
+    const env = makeEnv()
+    // 绕过 API 校验直接写（模拟 KV 里已有的脏数据 / 历史版本）
+    await setProviders(env, [
+      makeProvider({ apiKeys: [{ key: 'k', enabled: 'false' } as unknown as { key: string; enabled: boolean }] }),
+    ])
+    // 缓存命中路径（未过期）必须与读 KV 的出口一致：否则 60s 内停用的 Key 仍会被拿去转发
+    const providers = await getProviders(env)
+    expect(providers[0].apiKeys[0].enabled).toBe(false)
+  })
+
+  it('并发创建同 id 提供商：只有一个成功，不会落两条同 id 记录', async () => {
+    const env = makeEnv()
+    const app = makeApp()
+    const headers = { 'Content-Type': 'application/json', ...(await adminHeaders(env)) }
+    const post = (baseUrl: string) => app.request('/admin/api/providers', {
+      method: 'POST', headers, body: JSON.stringify({ id: 'dup', name: 'Dup', baseUrl }),
+    }, env)
+
+    const [a, b] = await Promise.all([post('https://a.example.com/v1'), post('https://b.example.com/v1')])
+    expect([a.status, b.status].sort()).toEqual([201, 409])
+    clearListCache()
+    expect((await getProviders(env)).filter((p) => p.id === 'dup')).toHaveLength(1)
+  })
+
+  it('更新提供商不允许把 name 改成空串（与创建路径一致）', async () => {
+    const env = makeEnv()
+    await setProviders(env, [makeProvider()])
+    const res = await makeApp().request('/admin/api/providers/p1', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...(await adminHeaders(env)) },
+      body: JSON.stringify({ name: '' }),
+    }, env)
+    expect(res.status).toBe(400)
+  })
 })
 
 describe('app 装配（src/index.ts）', () => {
@@ -372,6 +433,19 @@ describe('app 装配（src/index.ts）', () => {
       expect(res.headers.get('X-Frame-Options'), path).toBe('DENY')
       expect(res.headers.get('X-Content-Type-Options'), path).toBe('nosniff')
     }
+  })
+
+  it('/v1/* 转发响应也带 nosniff', async () => {
+    const env = makeEnv()
+    await setProviders(env, [makeProvider()])
+    await seedValidKey(env)
+    vi.stubGlobal('fetch', async () => new Response('{}', {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    const app = (await import('../src/index')).default
+    const res = await app.request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
   })
 
   it('未知路径返回 404 JSON；非法 JSON 请求体经 onError 返回 400', async () => {
