@@ -468,13 +468,34 @@ function pM(msg, def) {
     document.getElementById('pMo').addEventListener('click', function() { closeM(); r(inp.value.trim()) })
   })
 }
+let toastTimer = 0
 function toast(msg, t) {
   const el = document.getElementById('toast')
   const i = t === 'success' ? 'fa-check-circle' : 'fa-times-circle'
   const cls = t === 'success' ? 'al-s' : 'al-e'
   el.innerHTML = '<div class="al ' + cls + '"><i class="fas ' + i + '"></i> ' + escapeHtml(msg) + '</div>'
   el.classList.remove('hd')
-  setTimeout(() => el.classList.add('hd'), 3000)
+  // 上一条的定时器不清理，会把新提示提前关掉
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => el.classList.add('hd'), 3000)
+}
+
+// 统一的 JSON 请求：网络异常/非 JSON 响应不再变成未捕获的 rejection（点按钮毫无反应、
+// 按钮也不恢复），并把 onError/notFound 的 {error:{message}} 形状归一成 d.message
+async function apiJson(url, opts) {
+  let r
+  try { r = await fetch(url, opts) }
+  catch (e) { return { success: false, message: '网络错误：' + ((e && e.message) || '请求失败') } }
+  let d = null
+  try { d = await r.json() } catch (e) {}
+  if (!d || typeof d !== 'object') return { success: false, message: 'HTTP ' + r.status + '：响应不是有效的 JSON' }
+  if (d.message === undefined && d.error && d.error.message) d.message = d.error.message
+  return d
+}
+
+// 连通性测试失败时的文案：status 为 0 表示请求根本没发出去，显示 “HTTP 0” 没有意义
+function httpMsg(result) {
+  return result.status ? 'HTTP ' + result.status : (result.message || '请求失败')
 }
 
 // providers
@@ -547,7 +568,8 @@ async function addAllUpstream(panelId) {
   getMdl(id).forEach(m => { existing[m.id] = true })
   let added = 0
   ids.forEach(mid => {
-    if (!existing[mid]) { addMdlToEdit(id, mid); added++ }
+    // 循环内同步标记：上游列表自身重复的 id 会被加两次
+    if (!existing[mid]) { existing[mid] = true; addMdlToEdit(id, mid); added++ }
   })
   if (!added) { toast('列表内模型均已存在，无需入库', 'error'); return }
   toast('已加入 ' + added + ' 个模型，正在保存…')
@@ -575,7 +597,7 @@ function testNewAKey(btn) {
     } else {
       document.getElementById('amc').classList.add('hd')
     }
-    showResult(tr, result.success, result.success ? '' : 'HTTP ' + result.status)
+    showResult(tr, result.success, result.success ? '' : httpMsg(result))
   })
 }
 
@@ -609,7 +631,7 @@ function testNewMdl(btn) {
   const apiKey = configuredKey
   showSpinner(tr)
   testModelConnection(url, apiType, apiKey, mid, providerId).then(function(result) {
-    showResult(tr, result.success, result.success ? '' : 'HTTP ' + result.status)
+    showResult(tr, result.success, result.success ? '' : httpMsg(result))
   })
 }
 
@@ -630,12 +652,11 @@ async function createProv() {
   }).filter(Boolean)
   const enabled = document.getElementById('aen').checked
   if (!nm || !id || !url) { toast('请填写名称、ID 和 API 地址', 'error'); return }
-  const r = await fetch('/admin/api/providers', {
+  const d = await apiJson('/admin/api/providers', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled })
   })
-  const d = await r.json()
   if (d.success) { toast('已创建', 'success'); location.reload() }
   else toast(d.message || '创建失败', 'error')
 }
@@ -688,7 +709,7 @@ async function testKeyRow(id, idx) {
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, k, id)
-  showResult(tr, result.success, result.success ? '' : 'HTTP ' + result.status)
+  showResult(tr, result.success, result.success ? '' : httpMsg(result))
   if (result.success && result.data) {
     showEditModelsList(id, result.data.data || [])
   }
@@ -703,7 +724,7 @@ async function fetchEditModels(id) {
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
   const result = await testKeyConnection(url, apiType, apiKey, id)
-  showResult(tr, result.success, result.success ? '' : escapeHtml(result.message || '获取模型失败'))
+  showResult(tr, result.success, result.success ? '' : (result.message || '获取模型失败'))
   if (result.success && result.data) {
     showEditModelsList(id, result.data.data || [])
   }
@@ -741,23 +762,23 @@ function getMdl(id) {
 
 async function save(id) {
   const nm = document.getElementById('nm-' + id).value.trim(), url = document.getElementById('url-' + id).value.trim()
+  // 与服务端字段校验对齐：名称/地址清空后保存会让列表页标题变空
+  if (!nm || !url) { toast('请填写名称和 API 地址', 'error'); return }
   const apiType = document.getElementById('at-' + id).value
   const keys = getKeys(id)
   const models = getMdl(id), enabled = document.getElementById('en-' + id).checked
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
+  const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled })
   })
-  const d = await r.json()
   if (d.success) { toast('已保存', 'success'); location.reload() }
   else toast(d.message || '保存失败', 'error')
 }
 
 async function del(id) {
   if (!(await cM('确定要删除此提供商？'))) return
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), { method: 'DELETE' })
-  const d = await r.json()
+  const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id), { method: 'DELETE' })
   if (d.success) { toast('已删除', 'success'); location.reload() }
   else toast(d.message || '删除失败', 'error')
 }
@@ -844,12 +865,11 @@ async function genKey() {
 async function doGenKey(exp, name) {
   closeM()
   const nm = name || ''
-  const r = await fetch('/admin/api/proxy-keys', {
+  const d = await apiJson('/admin/api/proxy-keys', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: nm, expiresIn: exp })
   })
-  const d = await r.json()
   if (d.success && d.data) {
     showM('<h3><i class="fas fa-check-circle c-s"></i> 生成成功</h3><p>请妥善保存，切勿泄露：</p><div class="mk">' + escapeHtml(d.data.key) + '</div><div class="fa"><button class="btn btn-p" onclick="closeM();location.reload()">关闭</button></div>')
   } else toast(d.message || '生成失败', 'error')
@@ -857,25 +877,32 @@ async function doGenKey(exp, name) {
 
 async function rmKey(id) {
   if (!(await cM('确定要删除此 Key？'))) return
-  const r = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(id), { method: 'DELETE' })
-  const d = await r.json()
+  const d = await apiJson('/admin/api/proxy-keys/' + encodeURIComponent(id), { method: 'DELETE' })
   if (d.success) { toast('已删除', 'success'); location.reload() }
   else toast(d.message || '删除失败', 'error')
 }
 
 // proxy key list interactions
-async function togglePb(id, checked) {
+// 先乐观改 UI，失败则回滚：吊销开关停在错误状态会让管理员以为 Key 已失效
+function setPbState(id, on) {
   const pi = document.querySelector('.pi[data-id="' + id + '"]')
   if (!pi) return
   const b = pi.querySelector('.ps .bd')
-  if (b) { b.textContent = checked ? '已启用' : '未启用'; b.className = 'bd ' + (checked ? 'bd-on' : 'bd-off') }
-  const r = await fetch('/admin/api/providers/' + encodeURIComponent(id), {
+  if (b) { b.textContent = on ? '已启用' : '未启用'; b.className = 'bd ' + (on ? 'bd-on' : 'bd-off') }
+  const cb = document.getElementById('en-' + id)
+  if (cb) cb.checked = on
+}
+
+async function togglePb(id, checked) {
+  setPbState(id, checked)
+  const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: checked })
   })
-  const d = await r.json()
-  if (!d.success) toast(d.message || '操作失败', 'error')
+  if (d.success) return
+  setPbState(id, !checked)
+  toast(d.message || '操作失败', 'error')
 }
 
 function toggleKeyVis(id) {
@@ -893,24 +920,27 @@ function toggleKeyVis(id) {
   }
 }
 
+function setPkState(id, on) {
+  const ki = document.querySelector('.ki[data-id="' + id + '"]')
+  if (!ki) return
+  const b = ki.querySelector('span.bd')
+  if (b) { b.textContent = on ? '已启用' : '已禁用'; b.className = 'bd ' + (on ? 'bd-on' : 'bd-off') }
+  const cb = ki.querySelector('.tg input[type=checkbox]')
+  if (cb) cb.checked = on
+}
+
 async function toggleProxyKey(id, checked) {
-  const r = await fetch('/admin/api/proxy-keys/' + encodeURIComponent(id), {
+  const d = await apiJson('/admin/api/proxy-keys/' + encodeURIComponent(id), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: checked })
   })
-  const d = await r.json()
-  if (d.success) {
-    const ki = document.querySelector('.ki[data-id="' + id + '"]')
-    if (ki) {
-      const b = ki.querySelector('span.bd')
-      if (b) { b.textContent = checked ? '已启用' : '已禁用'; b.className = 'bd ' + (checked ? 'bd-on' : 'bd-off') }
-    }
-  } else toast(d.message || '操作失败', 'error')
+  setPkState(id, d.success ? checked : !checked)
+  if (!d.success) toast(d.message || '操作失败', 'error')
 }
 
 // 中文说明：根据点击和 URL 锚点同步侧栏选中态，避免导航始终停留在“概览”。
-const adminNavLinks = Array.from(document.querySelectorAll('.admin-nav a[href^="#"]'))
+const adminNavLinks = Array.from(document.querySelectorAll('a[href^="#"]'))
 function setActiveAdminNav(hash) {
   const targetHash = adminNavLinks.some(function (link) { return link.getAttribute('href') === hash }) ? hash : '#overview'
   adminNavLinks.forEach(function (link) {

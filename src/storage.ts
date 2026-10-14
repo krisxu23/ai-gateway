@@ -48,21 +48,35 @@ const isObj = (item: unknown): item is Record<string, unknown> =>
 const withBoolEnabled = (item: Record<string, unknown>): Record<string, unknown> =>
   ({ ...item, enabled: item.enabled === true })
 
+/**
+ * id 会被拼进管理台内联 JS 的字符串字面量（onclick="tog('${p.id}')"），那里 HTML
+ * 转义挡不住引号闭合；写路径有同样的白名单，读路径再兜一道，KV 里的人工脏数据 /
+ * 旧版本残留就不会变成存储型 XSS。
+ */
+const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/
+
 function sanitizeList(key: string, raw: unknown[]): unknown[] {
   const items = raw.filter(isObj)
   if (key === KV_KEYS.PROVIDERS) {
-    return items.map((p) => ({
-      ...p,
-      id: String(p.id ?? ''),
-      name: String(p.name ?? ''),
-      baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
-      enabled: p.enabled === true,
-      models: Array.isArray(p.models) ? p.models.filter(isObj).map(withBoolEnabled) : [],
-      apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj).map(withBoolEnabled) : [],
-    }))
+    // 无有效 id 的条目直接丢弃：补成 id:'' 会造出一个不可寻址、彼此不可区分的
+    // 幽灵提供商（getProvider/删除都碰不到它）
+    return items
+      .filter((p) => typeof p.id === 'string' && SAFE_ID_RE.test(p.id))
+      .map((p) => ({
+        ...p,
+        id: p.id as string,
+        name: String(p.name ?? ''),
+        baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
+        enabled: p.enabled === true,
+        models: Array.isArray(p.models) ? p.models.filter(isObj).map(withBoolEnabled) : [],
+        apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj).map(withBoolEnabled) : [],
+      }))
   }
   if (key === KV_KEYS.PROXY_KEYS) {
-    return items.map((k) => withBoolEnabled({ ...k, key: String(k.key ?? ''), name: String(k.name ?? '') }))
+    // 转发 Key 的 id 同样会进内联 JS；缺失/非法 id 的条目无法寻址，直接丢弃
+    return items
+      .filter((k) => typeof k.id === 'string' && SAFE_ID_RE.test(k.id))
+      .map((k) => withBoolEnabled({ ...k, id: k.id as string, key: String(k.key ?? ''), name: String(k.name ?? '') }))
   }
   return items
 }

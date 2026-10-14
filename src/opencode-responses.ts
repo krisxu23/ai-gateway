@@ -297,10 +297,24 @@ export function createResponsesToChatStream(
   // 是否已下发过正文增量: 流在 response.completed 之前断开时据此区分
   // "回答被截断"(length) 与 "上游就发了个空回复"(stop)
   let sawText = false
-  // 是否收到过"工具调用参数已收完"的信号(output_item.done /
-  // function_call_arguments.done)：流式下 arguments 是边收边发的，没有这个
-  // 信号就无从判断已下发的参数是否完整
-  let toolFinalized = false
+  // 已下发工具调用的“参数完整性”：流式下 arguments 是边收边发的，只有拿到
+  // “参数收完”的信号(output_item.done / function_call_arguments.done)或参数本身
+  // 已是完整 JSON，才能报告 tool_calls —— 客户端在 tool_calls 下会直接执行参数，
+  // 半截 JSON 会被当成合法参数。按 item 记录：并行工具调用很常见，一个工具收完
+  // 不代表另一个也收完了。
+  const toolArgs: Record<string, string> = {}
+  const finalizedIds = new Set<string>()
+  const isCompleteJson = (raw: string | undefined): boolean => {
+    if (!raw) return false
+    try {
+      JSON.parse(raw)
+      return true
+    } catch {
+      return false
+    }
+  }
+  const allToolsFinalized = (): boolean =>
+    nextIdx > 0 && Object.keys(toolIdx).every((id) => finalizedIds.has(id) || isCompleteJson(toolArgs[id]))
 
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
     const type = typeof ev.type === 'string' ? ev.type : ''
@@ -354,6 +368,7 @@ export function createResponsesToChatStream(
         const idx = toolIdx[itemID] as number | undefined
         if (idx === undefined) break
         if (typeof ev.delta === 'string' && ev.delta) {
+          toolArgs[itemID] = (toolArgs[itemID] ?? '') + ev.delta
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
             tool_calls: [{ index: idx, function: { arguments: ev.delta } }],
           })))
@@ -362,11 +377,25 @@ export function createResponsesToChatStream(
       }
       case 'response.output_item.done':
       case 'response.function_call_arguments.done': {
-        // 上游用哪个事件表示"参数收完"并不统一，两种都认；只有已下发给客户端的
-        // 工具调用才算（桩被吞掉了，与我们无关）
+        // 上游用哪个事件表示“参数收完”并不统一，两种都认；只有已下发给客户端的
+        // 工具调用才算（桩被吞掉了，与我们无关）。有些上游把完整参数只放在 done
+        // 事件里而不发 delta，这里补发差量，否则会给出“tool_calls + 空 arguments”
+        // 这种自相矛盾的结果。
         const item = asRecord(ev.item)
         const itemID = typeof ev.item_id === 'string' ? ev.item_id : typeof item?.id === 'string' ? item.id : ''
-        if (toolIdx[itemID] !== undefined) toolFinalized = true
+        const idx = toolIdx[itemID]
+        if (idx !== undefined) {
+          const args = typeof ev.arguments === 'string'
+            ? ev.arguments
+            : typeof item?.arguments === 'string' ? item.arguments : ''
+          if (args && !toolArgs[itemID]) {
+            toolArgs[itemID] = args
+            controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
+              tool_calls: [{ index: idx, function: { arguments: args } }],
+            })))
+          }
+          finalizedIds.add(itemID)
+        }
         break
       }
       case 'response.completed':
@@ -379,10 +408,11 @@ export function createResponsesToChatStream(
         // 天然完整，所以那里 tool_calls 优先）。nextIdx 只计真实下发的工具调用
         // (桩不递增)，与被吞数量无关。
         const incomplete = type === 'response.incomplete'
-        const hitLimit = incomplete && asRecord(resp?.incomplete_details)?.reason === 'max_output_tokens'
+        // incomplete 一律算截断（上游没给 reason / 用了别家写法时同样如此），
+        // 不能因为认不出 reason 就把截断伪装成干净结束
         const finish = nextIdx > 0
-          ? (incomplete && !toolFinalized ? 'length' : 'tool_calls')
-          : incomplete && (sawText || hitLimit) ? 'length' : 'stop'
+          ? (incomplete && !allToolsFinalized() ? 'length' : 'tool_calls')
+          : incomplete ? 'length' : 'stop'
         const usageOut = usage
           ? {
               prompt_tokens: usage.input_tokens ?? 0,
@@ -454,7 +484,7 @@ export function createResponsesToChatStream(
         // 下会直接执行工具, 半截 arguments 会被当成合法参数; 什么都没发过时报
         // stop(上游只是空回复, 不是截断)。
         const finish = nextIdx > 0
-          ? (toolFinalized ? 'tool_calls' : 'length')
+          ? (allToolsFinalized() ? 'tool_calls' : 'length')
           : sawText ? 'length' : 'stop'
         controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, finish)))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))

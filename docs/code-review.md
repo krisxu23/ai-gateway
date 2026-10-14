@@ -407,3 +407,41 @@ responsesToChatBody(body as unknown as Parameters<...>[0], 'muse', true)
 | `npm run bundle` | `worker.js` 159928 B（`esbuild --bundle --format=esm --minify --charset=utf8`） |
 
 本轮新增/改造回归用例 6 条：`enabled` 读取侧归一化 1 条、`baseUrl` 非字符串 → 502 1 条、`fe/fc/fd` 合法域名不误拦 1 条、IPv6 保留段（`fec0::` / `2002::` / `64:ff9b::`） 1 条、`output_item.done` → `tool_calls` 1 条、无 done 信号 → `length` 2 条（终态事件与收尾兜底各一）。
+
+## 十六、第六轮修复记录（差异复核 + 前端审查 + 自查）
+
+本轮投入：两路独立 reviewer（`git diff 8aa38fd..2d6ab69` 差异复核、前端与前后端契约审查）+ 主 agent 对 admin/storage 的自查。
+
+### 16.1 已修复
+
+| # | 位置 | 问题 | 修法 |
+| --- | --- | --- | --- |
+| R6-1 | `src/storage.ts` `validateProxyKey` | 空 token 可被 `key: ''` 的脏条目放行（`Authorization: Bearer ` 直接通过鉴权） | 开头 `if (!key) return false` + 回归用例 |
+| R6-2 | `src/admin.ts` | 7 处 `c.req.json()`：字面量 `null` 体在解构/字段访问时 TypeError → 500 | 新增 `readJsonBody<T>()`，非对象体归一成 `{}`，交由各 handler 的必填项校验给 400 |
+| R6-3 | `src/opencode-responses.ts` | 工具完成判定是**响应级布尔**：并行工具调用时一个收完就掩盖另一个被截断（当着 `tool_calls` 下发半截 JSON）；`output_item.done` 只置位不转发 `arguments`；认不出 `incomplete_details.reason` 时把截断报成 `stop` | 改成按 item 记录 `finalizedIds` + `toolArgs`（done 事件或**参数本身是完整 JSON** 二者之一即算完整）；done 事件里补发差量 arguments；`incomplete` 一律 `length`（认不出 reason 也算截断）；flush 用同一判定 |
+| R6-4 | `src/storage.ts` 读路径 | provider/proxy-key 的 `id` 未做字符集校验，而它会被拼进内联 JS 字符串（`onclick="tog('${p.id}')"`），KV 脏数据可造存储型 XSS | 新增 `SAFE_ID_RE`，读路径丢弃 id 非法/缺失的条目（写路径白名单之外的最后一道防线） |
+| R6-5 | `src/storage.ts` `PROXY_KEYS` | 转发 Key 的 `id` 完全没归一（缺失时 `data-id="undefined"`） | 一并 `id: String(...)` 并纳入白名单过滤 |
+| R6-6 | `src/proxy.ts` | 纯空白 `baseUrl` 能绕过空值守卫 | `if (!provider.baseUrl.trim())` |
+| R6-7 | `src/pages.ts` 内联 JS | 7 个写接口函数无 `try/catch`（网络异常 = 未处理 rejection，点了没反应、按钮不恢复），且只读 `d.message` → `onError` 的 `{error:{message}}` 文案被吞 | 新增 `apiJson(url, opts)`：统一 try/catch + 非 JSON 兜底 + 把 `error.message` 归一到 `d.message`；7 处调用点改用 |
+| R6-8 | `src/pages.ts` 内联 JS | `togglePb`/`toggleProxyKey` 乐观改 UI 后失败**不回滚**（吊销开关停在“已启用/已禁用”的错误状态） | `setPbState`/`setPkState` 统一改 UI（含展开面板复选框），失败时反向回滚 + toast |
+| R6-9 | `src/pages.ts` 内联 JS | `toast` 定时器叠加（新提示被旧定时器提前关掉）；`addAllUpstream` 不更新去重表（上游重复 id 会加两次）；`save` 缺名称/地址校验；测试失败显示 “HTTP 0”；双重 `escapeHtml`；移动端导航选择器漏 `.admin-nav` | 分别清理定时器、循环内同步 `existing[mid]=true`、补 `!nm \|\| !url` 校验、新增 `httpMsg()`、去掉多余转义、选择器放宽为 `a[href^="#"]` |
+
+### 16.2 复核后有意保留（附理由）
+
+- **前端 15 处 `onclick="fn('${id}')"` 仍把 id 拼进 JS 字符串**：写路径（`handleCreateProvider` 的 `^[A-Za-z0-9._-]+$`）与读路径（R6-4）双层白名单已让非法字符无法进入，且 `k.id` 恒为 `crypto.randomUUID()`；结构性改写（`data-*` + `addEventListener`）会大面积改动无类型检查的内联脚本，收益不抵回归风险。已新增「页面内联脚本语法」用例兜住手改语法错误。
+- `hideAdd` 不重置添加表单、`doGenKey` 弹窗关闭后 Key 需从列表页查看：均为既有交互设计，非缺陷（列表页展示完整 Key 是有意行为，页面已 `Cache-Control: no-store`）。
+- `buildAuthHeaders` 在 `admin.ts` / `proxy.ts` 各一份：合并会使 admin 依赖 proxy 的分层倒置，4 行代码收益不抵成本。
+- `memCache` 键不含 env（用例侧靠 `vi.resetModules()` 隔离）：生产单 env，为测试加 env 维度属过度设计。
+
+### 16.3 审查方已排除的误报（本轮新增）
+
+Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 行索引、`ki span.bd` 选择器、`closeModal` 的 Promise 落地、`modelRowHTML` 的 `data-mid` 取值、`getMdl/getKeys` 两侧 id 一致、`renderModelGrid` 输出、登录表单全部错误路径均为 JSON —— 复核后确认无问题。
+
+## 十七、第六轮验证记录（修复后）
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run check` | `tsc --noEmit` 零错误（`src/` + `test/`）+ 4 文件 / **92 用例**全过 |
+| `npm run bundle` | `worker.js` 与 `src/` 同源重建（提交前执行） |
+
+本轮新增回归用例 9 条：空 token 不被放行、7 个管理端点收到 `null` 体返 400/404、非法 id 条目被读路径丢弃、多工具仅部分收完 → `length`、多工具全部收完 → `tool_calls`、参数只出现在 `output_item.done` 时补发、`incomplete` 缺 `reason` → `length`、无 done 但参数完整 → `tool_calls`、页面内联 `<script>` 语法可解析。

@@ -6,7 +6,7 @@ import { handleLogin } from '../src/auth'
 import { handleCreateProvider, handleCreateProxyKey, handleTestKeyNew, handleTestModelNew, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
 import { addProxyKey, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
-import { modelRowHTML } from '../src/pages'
+import { modelRowHTML, renderAdminPage, renderHomePage } from '../src/pages'
 import type { Env, ProxyKey } from '../src/types'
 
 function makeEnv(): Env {
@@ -97,6 +97,29 @@ describe('storage 字段形状归一化', () => {
     await env.KV.put('proxy:keys', JSON.stringify([{ id: 'k0', name: 'k0', enabled: true }]))
     expect(await storage.validateProxyKey(env, '')).toBe(false)
     expect(await storage.validateProxyKey(env, 'sk_cf_anything')).toBe(false)
+  })
+
+  // 读路径的 id 白名单：id 会被拼进管理台内联 JS 的字符串字面量，
+  // 那里 HTML 转义挡不住引号闭合（写路径有白名单，读路径是最后一道防线）
+  it('含非法字符或缺失的 id 条目被丢弃', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const env = makeEnv()
+    await env.KV.put('providers', JSON.stringify([
+      { id: "p');alert(1);//", name: 'evil', baseUrl: 'https://a.example.com' },
+      { id: 'p-ok', name: 'ok', baseUrl: 'https://a.example.com' },
+    ]))
+    await env.KV.put('proxy:keys', JSON.stringify([
+      { id: '<img>', key: 'sk_cf_x', name: 'evil', enabled: true },
+      { id: 'k-ok', key: 'sk_cf_ok', name: 'ok', enabled: true },
+      { key: 'sk_cf_noid', name: 'noid', enabled: true },
+    ]))
+
+    expect((await storage.getProviders(env)).map((p) => p.id)).toEqual(['p-ok'])
+    expect((await storage.getProxyKeys(env)).map((k) => k.id)).toEqual(['k-ok'])
+    expect(await storage.validateProxyKey(env, 'sk_cf_x')).toBe(false)
+    expect(await storage.validateProxyKey(env, 'sk_cf_noid')).toBe(false)
+    expect(await storage.validateProxyKey(env, 'sk_cf_ok')).toBe(true)
   })
 })
 
@@ -392,5 +415,24 @@ describe('管理台模型行渲染', () => {
     expect(html).not.toContain(evil)
     expect(html.match(/data-mid="([^"]*)"/)?.[1]).toBe('a&quot; onmouseover=&quot;alert(1)')
     expect(html).toContain(`onclick="testMdl('p1',this.dataset.mid)"`)
+  })
+})
+
+// 内联 JS 是模板字符串，tsc 不检查它；这里只用 new Function 做语法解析（不执行），
+// 拦住“手改前端脚本留下语法错误”这类静默事故。
+describe('页面内联脚本语法', () => {
+  it('管理台与首页的 <script> 都能被解析', async () => {
+    const env = makeEnv()
+    const app = new Hono<{ Bindings: Env }>()
+    app.get('/', (c) => renderHomePage(c, false))
+    app.get('/admin', renderAdminPage)
+
+    for (const path of ['/', '/admin']) {
+      const res = await app.request(path, undefined, env)
+      expect(res.status, path).toBe(200)
+      const scripts = [...(await res.text()).matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])
+      expect(scripts.length, path).toBeGreaterThan(0)
+      for (const code of scripts) expect(() => new Function(code), path).not.toThrow()
+    }
   })
 })

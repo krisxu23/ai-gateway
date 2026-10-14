@@ -401,6 +401,67 @@ describe('createResponsesToChatStream', () => {
     expect(out).not.toContain('"finish_reason":"tool_calls"')
   })
 
+  // 回归：finalized 曾是响应级布尔，并行工具调用时一个收完就掩盖另个被截断
+  it('多工具并行：仅部分收完就 incomplete 时记为 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i2","call_id":"c2","name":"read"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"i1"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i2","delta":"{\\"path\\":\\"/e"}\n\n',
+      'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"name":"read"')
+    expect(out).toContain('"finish_reason":"length"')
+  })
+
+  it('多工具并行：全部收完时 incomplete 仍记为 tool_calls', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i2","call_id":"c2","name":"read"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i2","delta":"{}"}\n\n',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"i1"}}\n\n',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"i2"}}\n\n',
+      'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"tool_calls"')
+    expect(out).not.toContain('"finish_reason":"length"')
+  })
+
+  // 回归：上游把完整参数只放在 done 事件里（不发 delta）时，必须补发差量，
+  // 否则会给出“tool_calls + 空 arguments”这种自相矛盾的结果
+  it('参数只出现在 output_item.done 里时补发 arguments', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash","arguments":"{\\"cmd\\":\\"ls\\"}"}}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('\\"cmd\\":\\"ls\\"')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归：认不出 incomplete_details.reason 时曾把截断报成 stop
+  it('incomplete 缺 reason 且无正文时仍记为 length', async () => {
+    const upstream = sseChunks(['data: {"type":"response.incomplete","response":{}}\n\n'])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"length"')
+    expect(out).not.toContain('"finish_reason":"stop"')
+  })
+
+  // 回归：上游不下发 done 事件时，靠“参数本身已是完整 JSON”判定调用完整
+  it('无 done 事件但参数已是完整 JSON 时，断开收尾记为 tool_calls', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"cmd\\":\\"ls\\"}"}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
   // 回归：什么都没下发时上游就断开（空回复）不是截断
   it('上游空流断开: 收尾块记为 stop', async () => {
     const upstream = sseChunks(['data: {"type":"response.created","response":{}}\n\n'])
