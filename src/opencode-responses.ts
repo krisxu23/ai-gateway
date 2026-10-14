@@ -289,8 +289,9 @@ export function createResponsesToChatStream(
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
-  const chunkId = `chatcmpl-${Date.now().toString(16)}`
-  const toolIdx: Record<string, number> = {}
+  const chunkId = `chatcmpl-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`
+  // item_id 直接来自上游: 用无原型对象承载, 避免 __proto__ 之类的键与原型链撞车
+  const toolIdx: Record<string, number> = Object.create(null)
   const swallowedIds = new Set<string>()
   let nextIdx = 0
   let finished = false
@@ -302,7 +303,9 @@ export function createResponsesToChatStream(
   // 已是完整 JSON，才能报告 tool_calls —— 客户端在 tool_calls 下会直接执行参数，
   // 半截 JSON 会被当成合法参数。按 item 记录：并行工具调用很常见，一个工具收完
   // 不代表另一个也收完了。
-  const toolArgs: Record<string, string> = {}
+  const toolArgs: Record<string, string> = Object.create(null)
+  // done 早于 added 的乱序到达(镜像重排): 先缓存参数, 等 added 建好索引再补发
+  const pendingDone: Record<string, string> = Object.create(null)
   const finalizedIds = new Set<string>()
   const isCompleteJson = (raw: string | undefined): boolean => {
     if (!raw) return false
@@ -315,6 +318,34 @@ export function createResponsesToChatStream(
   }
   const allToolsFinalized = (): boolean =>
     nextIdx > 0 && Object.keys(toolIdx).every((id) => finalizedIds.has(id) || isCompleteJson(toolArgs[id]))
+  const emitArgs = (controller: TransformStreamDefaultController<Uint8Array>, idx: number, text: string) => {
+    controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
+      tool_calls: [{ index: idx, function: { arguments: text } }],
+    })))
+  }
+  // done / response.output 里的参数是终态: 空参数等价于 {}（部分严格客户端要求合法 JSON）
+  const finalArgs = (raw: string): string => raw || '{}'
+  // 差量补发: 上游先发部分 delta 再用 done 给全量时, 只补没发过的那段
+  const diffArgs = (itemID: string, args: string): string => {
+    const acc = toolArgs[itemID] ?? ''
+    if (args === acc) return ''
+    return args.startsWith(acc) ? args.slice(acc.length) : args
+  }
+  // 工具名归一: 客户端改名的 bash/read(back 有映射)改回原名透传; 我们注入的桩
+  // (back 无映射且名在 injectedStubs 里)要吞掉, 不下发给客户端。
+  // 大小写归一: back 键为小写, 上游可能输出大写 Bash/Read。
+  const resolveToolName = (raw: string): { name: string; isStub: boolean } => {
+    const lower = raw.toLowerCase()
+    const isRenamed = !!(raw && (back[lower] || back[raw]))
+    const name = isRenamed ? (back[lower] || back[raw]) : raw
+    const isStub =
+      isStubToolName(name) &&
+      !isRenamed &&
+      (injectedStubs.size > 0
+        ? injectedStubs.has(lower) || injectedStubs.has(name)
+        : swallowStubs)
+    return { name, isStub }
+  }
 
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
     const type = typeof ev.type === 'string' ? ev.type : ''
@@ -325,25 +356,26 @@ export function createResponsesToChatStream(
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.delta })))
         }
         break
+      case 'response.output_text.done':
+        // 上游只在 done 里给全文(不发 delta)时不能丢正文
+        if (!sawText && typeof ev.text === 'string' && ev.text) {
+          sawText = true
+          controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.text })))
+        }
+        break
       case 'response.output_item.added': {
         const item = asRecord(ev.item)
         if (item && item.type === 'function_call') {
-          const itemID = typeof item.id === 'string' ? item.id : ''
-          let name = typeof item.name === 'string' ? item.name : ''
+          // 没有 id 就无法与后续 delta 对齐; 重复 added 会覆盖 toolIdx 而 nextIdx
+          // 已递增, 造成“某个索引永远拿不到参数”的空调用
+          const itemID = typeof item.id === 'string' && item.id
+            ? item.id
+            : typeof item.call_id === 'string' ? item.call_id : ''
+          if (!itemID || itemID in toolIdx) break
           // 客户端改名来的 bash/read(back 有映射)改回原名透传;
-          // 我们注入的桩(back 无映射且名在 injectedStubs 里)吞掉, 不下发给
-          // 客户端 —— 混合场景(客户端带自己的工具)下同样生效。
-          // 大小写归一: back 键为小写, 上游可能输出大写 Bash/Read。
-          const lower = name.toLowerCase()
-          const isRenamed = !!(name && (back[lower] || back[name]))
-          if (isRenamed) name = back[lower] || back[name]
-          const isInjectedStub =
-            isStubToolName(name) &&
-            !isRenamed &&
-            (injectedStubs.size > 0
-              ? injectedStubs.has(lower) || injectedStubs.has(name)
-              : swallowStubs)
-          if (isInjectedStub) {
+          // 注入的桩(back 无映射且名在 injectedStubs 里)吞掉, 不下发。
+          const { name, isStub } = resolveToolName(typeof item.name === 'string' ? item.name : '')
+          if (isStub) {
             swallowedIds.add(itemID)
             break
           }
@@ -357,6 +389,14 @@ export function createResponsesToChatStream(
               function: { name, arguments: '' },
             }],
           })))
+          // 乱序到达的 done 参数在此补发并直接标记为完整
+          const pending = pendingDone[itemID]
+          if (pending !== undefined) {
+            delete pendingDone[itemID]
+            toolArgs[itemID] = pending
+            finalizedIds.add(itemID)
+            emitArgs(controller, idx, pending)
+          }
         }
         break
       }
@@ -382,37 +422,95 @@ export function createResponsesToChatStream(
         // 事件里而不发 delta，这里补发差量，否则会给出“tool_calls + 空 arguments”
         // 这种自相矛盾的结果。
         const item = asRecord(ev.item)
-        const itemID = typeof ev.item_id === 'string' ? ev.item_id : typeof item?.id === 'string' ? item.id : ''
-        const idx = toolIdx[itemID]
-        if (idx !== undefined) {
-          const args = typeof ev.arguments === 'string'
-            ? ev.arguments
-            : typeof item?.arguments === 'string' ? item.arguments : ''
-          if (args && !toolArgs[itemID]) {
-            toolArgs[itemID] = args
-            controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
-              tool_calls: [{ index: idx, function: { arguments: args } }],
-            })))
+        // message item 的 done 里可能带正文(上游只发 done 不发 delta)
+        if (item?.type === 'message' && !sawText && Array.isArray(item.content)) {
+          for (const part of item.content) {
+            const p = asRecord(part)
+            if (p && p.type === 'output_text' && typeof p.text === 'string' && p.text) {
+              sawText = true
+              controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: p.text })))
+            }
           }
-          finalizedIds.add(itemID)
+          break
         }
+        const itemID = typeof ev.item_id === 'string' && ev.item_id
+          ? ev.item_id
+          : typeof item?.id === 'string' && item.id ? item.id : ''
+        const rawArgs = typeof ev.arguments === 'string'
+          ? ev.arguments
+          : typeof item?.arguments === 'string' ? item.arguments : ''
+        const idx = itemID ? (toolIdx[itemID] as number | undefined) : undefined
+        if (idx === undefined) {
+          // added 还没到: 先缓存, 等 added 建好索引再补发, 否则参数永久丢失
+          if (itemID && rawArgs) pendingDone[itemID] = finalArgs(rawArgs)
+          break
+        }
+        // 只有“已下发给客户端的工具调用”才算数(桩被吞掉了, 与我们无关)
+        const args = finalArgs(rawArgs)
+        const suffix = diffArgs(itemID, args)
+        toolArgs[itemID] = args
+        if (suffix) emitArgs(controller, idx, suffix)
+        finalizedIds.add(itemID)
         break
       }
       case 'response.completed':
       case 'response.incomplete': {
         const resp = asRecord(ev.response)
         const usage = asRecord(resp?.usage)
-        // finish_reason 与非流式路径(responsesToChatBody)对齐，但流式下工具的
-        // arguments 是边收边发的：只有拿到"参数收完"的信号才算完整调用，否则报
-        // length —— 否则客户端会拿半截 JSON 去执行工具（非流式的 output item
-        // 天然完整，所以那里 tool_calls 优先）。nextIdx 只计真实下发的工具调用
-        // (桩不递增)，与被吞数量无关。
         const incomplete = type === 'response.incomplete'
-        // incomplete 一律算截断（上游没给 reason / 用了别家写法时同样如此），
-        // 不能因为认不出 reason 就把截断伪装成干净结束
+        // 上游也可能用 completed + incomplete_details.reason 表达截断(与非流式路径一致)
+        const hitLimit = asRecord(resp?.incomplete_details)?.reason === 'max_output_tokens'
+        // 有些上游把正文/参数只放在终态的 response.output 里(不发 delta/done):
+        // 这里兜底补发, 否则客户端会拿到空回答或空参数的 tool_call
+        if (Array.isArray(resp?.output)) {
+          for (const rawItem of resp.output) {
+            const item = asRecord(rawItem)
+            if (!item) continue
+            if (item.type === 'function_call') {
+              const itemID = typeof item.id === 'string' && item.id
+                ? item.id
+                : typeof item.call_id === 'string' ? item.call_id : ''
+              if (!itemID) continue
+              const { name, isStub } = resolveToolName(typeof item.name === 'string' ? item.name : '')
+              if (isStub) continue
+              let idx = toolIdx[itemID] as number | undefined
+              if (idx === undefined) {
+                // 上游没发 output_item.added: 直接从终态合成完整调用, 否则客户端
+                // 会收到 name 有值但 arguments 为空的 tool_call
+                idx = nextIdx++
+                toolIdx[itemID] = idx
+                controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
+                  tool_calls: [{
+                    index: idx,
+                    id: item.call_id ?? itemID,
+                    type: 'function',
+                    function: { name, arguments: '' },
+                  }],
+                })))
+              }
+              const args = finalArgs(typeof item.arguments === 'string' ? item.arguments : '')
+              const suffix = diffArgs(itemID, args)
+              toolArgs[itemID] = args
+              finalizedIds.add(itemID)
+              if (suffix) emitArgs(controller, idx, suffix)
+            } else if (item.type === 'message' && !sawText && Array.isArray(item.content)) {
+              for (const part of item.content) {
+                const p = asRecord(part)
+                if (p && p.type === 'output_text' && typeof p.text === 'string' && p.text) {
+                  sawText = true
+                  controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: p.text })))
+                }
+              }
+            }
+          }
+        }
+        // finish_reason 与非流式路径(responsesToChatBody)对齐,但流式下工具的
+        // arguments 是边收边发的: 只有拿到"参数收完"的信号才算完整调用, 否则报
+        // length —— 客户端在 tool_calls 下会直接执行参数, 半截 JSON 会被当合法参数。
+        // nextIdx 只计真实下发的工具调用(桩不递增), 与被吞数量无关。
         const finish = nextIdx > 0
-          ? (incomplete && !allToolsFinalized() ? 'length' : 'tool_calls')
-          : incomplete ? 'length' : 'stop'
+          ? (allToolsFinalized() ? 'tool_calls' : 'length')
+          : incomplete || hitLimit ? 'length' : 'stop'
         const usageOut = usage
           ? {
               prompt_tokens: usage.input_tokens ?? 0,

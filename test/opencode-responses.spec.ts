@@ -469,4 +469,93 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"finish_reason":"stop"')
     expect(out).not.toContain('"finish_reason":"length"')
   })
+
+  // 回归（第七轮 H1）：response.completed 曾无条件报 tool_calls，把半截参数当完整调用
+  it('completed 终态但参数没收完时报 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"cmd\\":\\"l"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"length"')
+    expect(out).not.toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归（H1-2）：正文与参数只出现在终态 response.output 里（不发 delta/done）
+  it('completed 的 response.output 里的正文与参数被补发', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]},{"type":"function_call","id":"i1","call_id":"c1","name":"bash","arguments":"{\\"cmd\\":\\"ls\\"}"}]}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('hello')
+    expect(out).toContain('\\"cmd\\":\\"ls\\"')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归（M4）：上游只在 response.output_text.done 里给全文
+  it('output_text.done 里的正文在没收到 delta 时补发', async () => {
+    const upstream = sseChunks(['data: {"type":"response.output_text.done","text":"all at once"}\n\n'])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('all at once')
+  })
+
+  // 回归（M5）：上游用 completed + incomplete_details.reason 表达截断
+  it('completed 带 max_output_tokens 时报 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.completed","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"length"')
+  })
+
+  // 回归（H2）：先收到部分增量、done 再带全量参数时必须按差量补发
+  it('done 带全量参数时补发差量', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{\\"cmd\\":"}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1","arguments":"{\\"cmd\\":\\"ls -la\\"}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('\\"ls -la\\"')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归（M1）：done 早于 added（镜像重排）时参数不能丢
+  it('done 早于 added 时参数不丢', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1","arguments":"{\\"cmd\\":\\"ls\\"}"}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('\\"cmd\\":\\"ls\\"')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归（M3）：重复 added 曾让 nextIdx 与 toolIdx 失配，产生空参数调用
+  it('同一 item_id 重复 added 只产生一个工具调用', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1","arguments":"{\\"cmd\\":\\"ls\\"}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out.match(/"tool_calls":\[\{"index":/g)?.length).toBe(2)
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归（L1）：item_id 直接来自上游，不能污染原型链
+  it('item_id 为 __proto__ 时不影响判定', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"__proto__","call_id":"c9","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"__proto__","arguments":"{\\"cmd\\":\\"ls\\"}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('\\"cmd\\":\\"ls\\"')
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
 })

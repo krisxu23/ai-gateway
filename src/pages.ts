@@ -422,6 +422,11 @@ ${H('管理')}
 // copy
 function copyText(t, el) {
   const i = el.tagName === 'I' ? el : (el.querySelector('i') || el.parentElement?.querySelector('i'))
+  if (!navigator.clipboard || !navigator.clipboard.writeText) {
+    // 非安全上下文（http:// 或某些内嵌 WebView）没有 clipboard API，直接调用会抛
+    toast('当前环境不支持自动复制，请手动选择文本', 'error')
+    return
+  }
   if (!i) { navigator.clipboard.writeText(t).catch(() => {}); return }
   const oc = i.className
   navigator.clipboard.writeText(t).then(() => {
@@ -546,7 +551,7 @@ function renderModelGrid(models, editId, providerId) {
   return '<div class="grid-2-gap6">' + h + '</div>'
 }
 
-// 可用模型面板 heading（添加态静态 HTML 与编辑态动态生成共用同一结构）
+// 可用模型面板 heading（编辑态动态生成；添加态的静态 #amc 没有“全部入库”按钮）
 function modelPanelHeading(panelId) {
   return '<div class="panel-heading"><div>' +
     '<span class="panel-heading__mark"><i class="fas fa-cube" aria-hidden="true"></i></span>' +
@@ -572,8 +577,8 @@ async function addAllUpstream(panelId) {
     if (!existing[mid]) { existing[mid] = true; addMdlToEdit(id, mid); added++ }
   })
   if (!added) { toast('列表内模型均已存在，无需入库', 'error'); return }
-  toast('已加入 ' + added + ' 个模型，正在保存…')
-  await save(id)
+  // 先保存再报成功：save 校验失败时会自己 toast，先报“已加入”会误导
+  if (await save(id)) toast('已加入 ' + added + ' 个模型并保存成功')
 }
 
 // 关闭可用模型面板（仅隐藏，不清空已获取的模型数据）
@@ -808,19 +813,16 @@ async function testMdlDirect(id, mid) {
   const apiType = document.getElementById('at-' + id).value
   const keys = getKeys(id)
   const apiKey = keys.length > 0 ? keys[0].key : ''
-  try {
-    const r = await fetch('/admin/api/test-model', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url, apiKey: apiKey, apiType: apiType, model: mid, providerId: id })
-    })
-    const d = await r.json()
-    if (d.success && d.data) {
-      showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || ('HTTP ' + d.data.statusCode)))
-    } else {
-      showResult(tr, false, d.message || '测试失败')
-    }
-  } catch (e) { showResult(tr, false, '请求失败') }
+  const d = await apiJson('/admin/api/test-model', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url, apiKey: apiKey, apiType: apiType, model: mid, providerId: id })
+  })
+  if (d.success && d.data) {
+    showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || ('HTTP ' + d.data.statusCode)))
+  } else {
+    showResult(tr, false, d.message || '测试失败')
+  }
 }
 
 function rmMdl(id, idx) {
@@ -833,24 +835,21 @@ function rmMdl(id, idx) {
 async function testMdl(id, mid) {
   const tr = document.getElementById('tr-' + id)
   showSpinner(tr)
-  try {
-    const r = await fetch('/admin/api/providers/' + encodeURIComponent(id) + '/test-model', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ modelId: mid })
-    })
-    const d = await r.json()
-    if (d.success && d.data) {
-      if (d.data.success && d.data.message) {
-        // 后端降级直测时会附带“尚未保存”提醒，成功态也要展示出来。
-        tr.innerHTML = '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功 <span class="mu">' + escapeHtml(d.data.message) + '</span></div>'
-      } else {
-        showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'))
-      }
+  const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id) + '/test-model', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ modelId: mid })
+  })
+  if (d.success && d.data) {
+    if (d.data.success && d.data.message) {
+      // 后端降级直测时会附带“尚未保存”提醒，成功态也要展示出来。
+      tr.innerHTML = '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功 <span class="mu">' + escapeHtml(d.data.message) + '</span></div>'
     } else {
-      showResult(tr, false, d.message || '测试失败')
+      showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'))
     }
-  } catch (e) { showResult(tr, false, '请求失败') }
+  } else {
+    showResult(tr, false, d.message || '测试失败')
+  }
 }
 
 // proxy keys
@@ -894,12 +893,17 @@ function setPbState(id, on) {
 }
 
 async function togglePb(id, checked) {
+  const cb = document.getElementById('en-' + id)
+  // 连点保护：请求在途时忽略后续点击，否则两个响应各自“回滚”到相反状态
+  if (cb && cb.dataset.busy) { cb.checked = !checked; return }
+  if (cb) cb.dataset.busy = '1'
   setPbState(id, checked)
   const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: checked })
   })
+  if (cb) delete cb.dataset.busy
   if (d.success) return
   setPbState(id, !checked)
   toast(d.message || '操作失败', 'error')
@@ -930,11 +934,17 @@ function setPkState(id, on) {
 }
 
 async function toggleProxyKey(id, checked) {
+  const ki = document.querySelector('.ki[data-id="' + id + '"]')
+  const cb = ki ? ki.querySelector('.tg input[type=checkbox]') : null
+  // 与 togglePb 同样的连点保护
+  if (cb && cb.dataset.busy) { cb.checked = !checked; return }
+  if (cb) cb.dataset.busy = '1'
   const d = await apiJson('/admin/api/proxy-keys/' + encodeURIComponent(id), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: checked })
   })
+  if (cb) delete cb.dataset.busy
   setPkState(id, d.success ? checked : !checked)
   if (!d.success) toast(d.message || '操作失败', 'error')
 }

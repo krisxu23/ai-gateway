@@ -12,6 +12,8 @@ interface CacheEntry<T> {
 }
 
 // 模块级单例：跨请求共享同一 isolate 内的缓存。
+// shortcut: 键不含 env —— 一个 isolate 只服务一个 Worker 环境（生产单 env；测试用
+// vi.resetModules() 隔离模块状态）。若将来同一 isolate 承载多环境，需把 env 并入键。
 const memCache = new Map<string, CacheEntry<unknown>>()
 
 function cacheGet<T>(key: string): T | undefined {
@@ -58,27 +60,52 @@ const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/
 function sanitizeList(key: string, raw: unknown[]): unknown[] {
   const items = raw.filter(isObj)
   if (key === KV_KEYS.PROVIDERS) {
-    // 无有效 id 的条目直接丢弃：补成 id:'' 会造出一个不可寻址、彼此不可区分的
-    // 幽灵提供商（getProvider/删除都碰不到它）
-    return items
-      .filter((p) => typeof p.id === 'string' && SAFE_ID_RE.test(p.id))
-      .map((p) => ({
+    const out: Record<string, unknown>[] = []
+    for (const p of items) {
+      const id = safeEntryId(p.id, 'providers')
+      if (!id) continue
+      out.push({
         ...p,
-        id: p.id as string,
+        id,
         name: String(p.name ?? ''),
         baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
         enabled: p.enabled === true,
         models: Array.isArray(p.models) ? p.models.filter(isObj).map(withBoolEnabled) : [],
         apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj).map(withBoolEnabled) : [],
-      }))
+      })
+    }
+    return out
   }
   if (key === KV_KEYS.PROXY_KEYS) {
-    // 转发 Key 的 id 同样会进内联 JS；缺失/非法 id 的条目无法寻址，直接丢弃
-    return items
-      .filter((k) => typeof k.id === 'string' && SAFE_ID_RE.test(k.id))
-      .map((k) => withBoolEnabled({ ...k, id: k.id as string, key: String(k.key ?? ''), name: String(k.name ?? '') }))
+    const out: Record<string, unknown>[] = []
+    for (const k of items) {
+      const id = safeEntryId(k.id, '转发 Key')
+      if (!id) continue
+      out.push(withBoolEnabled({ ...k, id, key: String(k.key ?? ''), name: String(k.name ?? '') }))
+    }
+    return out
   }
   return items
+}
+
+/**
+ * 归一化条目 id：非法字符归一到 '-'，而不是丢整条 —— 整表写回 KV 时丢弃等于把
+ * 管理员的配置或 Key 永久删掉。缺失/空 id 无法寻址，只能丢弃。
+ */
+function safeEntryId(raw: unknown, label: string): string | null {
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    console.warn(`[storage] ${label} 条目缺少可用 id，已丢弃（无法寻址）`)
+    return null
+  }
+  const text = String(raw).trim()
+  if (!text) {
+    console.warn(`[storage] ${label} 条目 id 为空，已丢弃（无法寻址）`)
+    return null
+  }
+  if (SAFE_ID_RE.test(text)) return text
+  const id = text.replace(/[^A-Za-z0-9._-]/g, '-')
+  console.warn(`[storage] ${label} 条目 id "${text}" 含非法字符，已归一为 "${id}"`)
+  return id
 }
 
 /** 通用缓存列表读取：优先内存，未命中再读 KV */

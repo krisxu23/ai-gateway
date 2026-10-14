@@ -100,14 +100,17 @@ describe('storage 字段形状归一化', () => {
   })
 
   // 读路径的 id 白名单：id 会被拼进管理台内联 JS 的字符串字面量，
-  // 那里 HTML 转义挡不住引号闭合（写路径有白名单，读路径是最后一道防线）
-  it('含非法字符或缺失的 id 条目被丢弃', async () => {
+  // 那里 HTML 转义挡不住引号闭合（写路径有白名单，读路径是最后一道防线）。
+  // 非法 id 归一化而不是丢弃：整表写回 KV 时丢弃等于把配置/Key 永久删掉。
+  it('含非法字符的 id 被归一化，无法寻址（缺失/空）的条目才丢弃', async () => {
     vi.resetModules()
     const storage = await import('../src/storage')
     const env = makeEnv()
     await env.KV.put('providers', JSON.stringify([
       { id: "p');alert(1);//", name: 'evil', baseUrl: 'https://a.example.com' },
+      { id: 123, name: 'numeric', baseUrl: 'https://a.example.com' },
       { id: 'p-ok', name: 'ok', baseUrl: 'https://a.example.com' },
+      { id: '', name: 'empty', baseUrl: 'https://a.example.com' },
     ]))
     await env.KV.put('proxy:keys', JSON.stringify([
       { id: '<img>', key: 'sk_cf_x', name: 'evil', enabled: true },
@@ -115,9 +118,10 @@ describe('storage 字段形状归一化', () => {
       { key: 'sk_cf_noid', name: 'noid', enabled: true },
     ]))
 
-    expect((await storage.getProviders(env)).map((p) => p.id)).toEqual(['p-ok'])
-    expect((await storage.getProxyKeys(env)).map((k) => k.id)).toEqual(['k-ok'])
-    expect(await storage.validateProxyKey(env, 'sk_cf_x')).toBe(false)
+    expect((await storage.getProviders(env)).map((p) => p.id)).toEqual(['p---alert-1----', '123', 'p-ok'])
+    expect((await storage.getProxyKeys(env)).map((k) => k.id)).toEqual(['-img-', 'k-ok'])
+    // 归一化后条目仍可用，不会因为一次脏数据就把管理员的 Key 静默作废
+    expect(await storage.validateProxyKey(env, 'sk_cf_x')).toBe(true)
     expect(await storage.validateProxyKey(env, 'sk_cf_noid')).toBe(false)
     expect(await storage.validateProxyKey(env, 'sk_cf_ok')).toBe(true)
   })

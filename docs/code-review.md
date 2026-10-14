@@ -445,3 +445,48 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 | `npm run bundle` | `worker.js` 与 `src/` 同源重建（提交前执行） |
 
 本轮新增回归用例 9 条：空 token 不被放行、7 个管理端点收到 `null` 体返 400/404、非法 id 条目被读路径丢弃、多工具仅部分收完 → `length`、多工具全部收完 → `tool_calls`、参数只出现在 `output_item.done` 时补发、`incomplete` 缺 `reason` → `length`、无 done 但参数完整 → `tool_calls`、页面内联 `<script>` 语法可解析。
+
+## 十八、第七轮修复记录（两路独立审查：翻译状态机 + 前端/契约）
+
+第七轮采用两路并行独立审查：R7-A 只看 `src/opencode.ts` 与 `src/opencode-responses.ts`（流式翻译状态机），R7-B 看 `src/index.ts` / `src/proxy.ts` / `src/storage.ts` / `src/auth.ts` / `src/admin.ts` / `src/pages.ts` / `src/pages.css.ts` / `src/shared.js.ts` / `src/config.ts` / `src/types.ts`（前端内联 JS 与前后端契约）。两路均确认无高危；下列条目已全部修复。
+
+### 18.1 已修复（16 项）
+
+| # | 位置 | 问题 | 修法 |
+| --- | --- | --- | --- |
+| 1 | `src/opencode-responses.ts` flush | 收尾兜底硬编码 `finish_reason: 'length'`，与 completed 分支的判定不一致：已下发完工具调用时会被报成“截断”，agent 客户端因此丢弃调用 | flush 与终态统一为 `nextIdx > 0 ? (toolFinalized ? 'tool_calls' : 'length') : sawText ? 'length' : 'stop'` |
+| 2 | `src/opencode-responses.ts` `response.incomplete` | 只要 `incomplete` 就报 `length`，忽略 `incomplete_details.reason` | 仅 `reason === 'max_output_tokens'` 时算截断，否则按 `stop` |
+| 3 | `src/opencode-responses.ts` 工具完成度 | 用响应级布尔 `toolFinalized` 判断“参数收完”：并行多工具时一个收完就掩盖另一个被截断（会下发半截 JSON 让客户端执行） | 改为逐索引的 `finalizedIds`（每个索引收到自己的 `function_call_arguments.done` 才算完成）+ `allToolsFinalized()`；`output_item.done` 改为回填已收参数（原来直接忽略 done 里的 args，可能丢尾段） |
+| 4 | `src/opencode-responses.ts` flush 空流 | 上游 200 + `text/event-stream` 但一个事件都没发时也报 `length` | 用 `sawText` 区分“空回复（stop）”与“中途截断（length）” |
+| 5 | `src/opencode.ts` 桩吞噬流 | 同一索引的参数先于 `name` 到达时，桩的前缀增量会被透传给客户端（半截 `tool_call`） | 新增 `pendingCalls` 缓冲：name 未到的增量整包暂存，name 到达后再决定透传或整段吞噬 |
+| 6 | `src/opencode.ts` `sessionCache` | 过期条目只在超过 1000 条时被动清理，长期运行时占用只增不减 | `getOrCreateConversationSession` 命中过期条目立即 `delete` |
+| 7 | `src/opencode.ts` `storeFailure` | 把失败响应整包读进内存，镜像返回超大/恶意错误体会打满内存 | 新增 `MAX_STORED_FAILURE_BYTES = 256KB` 上限，超限时只回简短 JSON 说明 |
+| 8 | `src/storage.ts` `sanitizeList` | id 含非法字符的条目被整条丢弃 —— 而读改写的整表写回 KV 会让它被**永久删除**（管理员配置/Key 凭空消失） | 非法 id 归一化（`[^A-Za-z0-9._-]` → `-`）并 `console.warn`，只有缺失/空 id（无法寻址）才丢弃 |
+| 9 | `src/shared.js.ts` `testKeyConnection` / `testModelConnection` | 后端非 2xx（如 400）时返回 `status: 0` 且丢掉 message，前端只显示“连接失败” | 失败分支带上 `r.status` 与后端 `message` |
+| 10 | `src/pages.ts` `togglePb` / `toggleProxyKey` | 连点开关时两个请求各自回滚到相反状态，UI 与后端不一致（管理员以为 Key 已失效） | `dataset.busy` 连点保护：请求在途时忽略后续点击并复位复选框 |
+| 11 | `src/pages.ts` `copyText` | 非安全上下文（http://、内嵌 WebView）没有 `navigator.clipboard`，直接调用抛错 | 提前检测并提示“请手动选择文本” |
+| 12 | `src/pages.ts` `testMdl` / `testMdlDirect` | 裸 `fetch` + `r.json()`：非 2xx 时无提示、网络错误无 toast | 统一改用 `apiJson`（内部已处理非 2xx 与非 JSON） |
+| 13 | `src/pages.ts` `addAllUpstream` | 先 toast “已加入 N 个模型，正在保存…”再调用 `save()`，校验失败时提示与实际相反 | 按 `save()` 的返回值决定提示 |
+| 14 | `src/pages.ts` `modelPanelHeading` | 注释称添加态与编辑态共用同一结构，实际静态 `#amc` 没有「全部入库」按钮 | 修正注释 |
+| 15 | `src/storage.ts` `memCache` | 缓存键不含 env，多环境共用一个 isolate 时会串数据 | 加 `shortcut:` 注释说明前提（单 env；测试用 `vi.resetModules()` 隔离） |
+| 16 | `src/pages.css.ts` | `.al-s` 的 `margin-top: 20px` 同样作用于 toast 内的 `.al`，把提示推离视口边缘 | 新增 `.toast .al { margin-top: 0 }` |
+
+### 18.2 复核后有意保留（附理由）
+
+- **CSP**：管理台模板含大量内联脚本，加 CSP 需整体 nonce 化，收益不抵改动面；已有 `X-Frame-Options: DENY` + `X-Content-Type-Options: nosniff`。
+- **`SameSite=Strict` 的可用性代价**：从站外链接点进 `/admin` 会先看到登录页（cookie 不随跨站导航发送）。这是换取登出 CSRF 免疫的有意取舍；管理台用户通常直接访问。
+- **内联 `onclick` 仍携带 provider/Key id**：写入侧有 `^[A-Za-z0-9._-]+$` 白名单、读路径又有一道归一化，`k.id` 是 `crypto.randomUUID()`，均不可注入；不为不可利用的路径重构 15 处模板。
+- **`emitLine` 对非 `data:` 行的输出顺序**：仅影响客户端本就忽略的字段分组（`event:`/`id:`），不影响 `data:` 语义。
+- **健康状态与写队列的单 isolate 局限**：跨 isolate 精确一致需要 Durable Object，已在 `src/proxy.ts`、`src/storage.ts` 用 `shortcut:` 注释标明。
+- **`enabled` 严格布尔归一**：KV 里任何非 `true` 的一律视为停用（fail-closed）；写入侧已校验，读侧从严是最后一道防线。
+
+## 十九、第七轮验证记录（修复后）
+
+| 命令 | 结果 |
+| --- | --- |
+| `npx tsc --noEmit` | 零错误（src + test 全覆盖） |
+| `npm run check` | tsc 零错 + **4 文件 / 100 用例全过** |
+| `npm run bundle` | worker.js 重新生成，165776 B |
+| `findInvalidModelId` / `sanitizeList` 回归 | `test/admin-api.spec.ts`：id 归一化（`p');alert(1);//` → `p---alert-1----`、数字 id → `'123'`、`<img>` → `-img-`）+ 缺失 id 丢弃 + 归一后 Key 仍可用 |
+| 内联脚本语法守卫 | 首页与管理台的 `<script>` 均通过 `new Function` 解析（防手改前端脚本留下语法错误） |
+| `npm ls --depth=0` | 依赖树干净：hono 4.12.27 / esbuild 0.28.1 / vitest 2.1.9 / typescript 6.0.3 / wrangler 4.107.0 |

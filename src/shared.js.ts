@@ -43,9 +43,10 @@ async function testKeyConnection(url, apiType, key, providerId) {
     if (d.success && d.data) {
       return { success: d.data.success, status: d.data.statusCode, data: d.data.data, message: d.data.message }
     }
-    return { success: false, status: 0, data: null }
+    // 后端非 2xx（如 400）时也把状态码与消息带回去，否则调用方只会看到 status 0
+    return { success: false, status: r.status, data: null, message: d.message }
   } catch (e) {
-    return { success: false, status: 0, data: null }
+    return { success: false, status: 0, data: null, message: e && e.message ? e.message : '请求失败' }
   }
 }
 async function testModelConnection(url, apiType, key, modelId, providerId) {
@@ -57,11 +58,11 @@ async function testModelConnection(url, apiType, key, modelId, providerId) {
     })
     var d = await r.json()
     if (d.success && d.data) {
-      return { success: d.data.success, status: d.data.statusCode }
+      return { success: d.data.success, status: d.data.statusCode, message: d.data.message }
     }
-    return { success: false, status: 0 }
+    return { success: false, status: r.status, message: d.message }
   } catch (e) {
-    return { success: false, status: 0 }
+    return { success: false, status: 0, message: e && e.message ? e.message : '请求失败' }
   }
 }
 `

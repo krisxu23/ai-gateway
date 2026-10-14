@@ -343,6 +343,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 /* feedback, model list and modal */
 .al { min-height: var(--control-h); padding: var(--space-xs); display: flex; align-items: center; gap: var(--space-2xs); border: .0625rem solid transparent; border-radius: var(--radius-control); font-size: var(--text-xs); }
 .al-s { border-color: var(--color-success); background: var(--color-success-soft); color: var(--color-success-ink); margin-top: 20px; }
+/* toast 里的 .al 已定位在右上角，再叠 20px 上边距会把它推离视口边缘 */
+.toast .al { margin-top: 0; }
 .al-e { border-color: var(--color-danger); background: var(--color-danger-soft); color: var(--color-danger-ink); }
 .al-i { border-color: var(--color-accent); background: var(--color-accent-soft); color: var(--color-focus); }
 .toast { position: fixed; inset-block-start: var(--space-sm); inset-inline-end: var(--space-sm); z-index: 9998; width: min(calc(100% - calc(var(--space-sm) * 2)), 24rem); box-shadow: var(--shadow-float); }

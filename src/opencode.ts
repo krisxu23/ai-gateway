@@ -43,7 +43,7 @@ interface StoredFailure {
   status: number
   statusText: string
   headers: Headers
-  body: ArrayBuffer
+  body: ArrayBuffer | Uint8Array
 }
 
 export interface OpenCodeTestResult {
@@ -143,8 +143,10 @@ const sessionCache = new Map<string, { id: string; expiresAt: number }>()
 function getOrCreateConversationSession(seed: string): string {
   const now = Date.now()
   const cached = sessionCache.get(seed)
-  if (cached && cached.expiresAt > now) {
-    return cached.id
+  if (cached) {
+    if (cached.expiresAt > now) return cached.id
+    // 过期条目立即移除: 否则它们会一直占着内存(原来只在超 1000 条时清一条)
+    sessionCache.delete(seed)
   }
   const id = generateOpenCodeId('ses', now)
   sessionCache.set(seed, { id, expiresAt: now + 30 * 60 * 1000 })
@@ -472,6 +474,10 @@ function createStubSwallowingChatStream(
   let buf = ''
   const stubIndexes = new Set<number>()
   const seenIndexes = new Set<number>()
+  // 名字晚于首个增量到达的调用(index 已知但 name 为空): 先整包缓存, 等 name 到了
+  // 再决定透传还是整段吞噬 —— 否则客户端会先收到一个没有 name 的悬空 tool_call
+  const pendingCalls = new Map<number, Array<Record<string, unknown>>>()
+  const normalIndexes = new Set<number>()
 
   /** 处理单个 SSE data 载荷: 返回重序列化后的 data, 或 null 表示丢弃整事件。 */
   const handleData = (data: string): string | null => {
@@ -506,7 +512,23 @@ function createStubSwallowingChatStream(
                   stubIndexes.add(idx)
                 }
               }
-              if (stubIndexes.has(idx)) continue
+              if (stubIndexes.has(idx)) {
+                // 整段丢掉已缓存的增量, 不能让桩露一半出去
+                pendingCalls.delete(idx)
+                continue
+              }
+              if (!name && !normalIndexes.has(idx)) {
+                const queue = pendingCalls.get(idx)
+                if (queue) queue.push(call)
+                else pendingCalls.set(idx, [call])
+                continue
+              }
+              normalIndexes.add(idx)
+              const queued = pendingCalls.get(idx)
+              if (queued) {
+                pendingCalls.delete(idx)
+                kept.push(...queued)
+              }
             } else if (isStubCandidate) {
               // 无 index 的调用: 桩直接丢弃; 改名来的改回原名。
               if (back[lower] || back[name]) {
@@ -580,12 +602,31 @@ function createStubSwallowingChatStream(
   })
 }
 
+const MAX_STORED_FAILURE_BYTES = 256 * 1024
+
 async function storeFailure(response: Response): Promise<StoredFailure> {
   const headers = new Headers(response.headers)
   // body 已被 arrayBuffer() 解码，回放时不能再声称压缩与原长度，
   // 否则客户端会按 content-encoding 解压失败
   headers.delete('content-encoding')
   headers.delete('content-length')
+  // 失败体要整包读进内存再回放: 加个上限, 避免镜像返回超大/恶意错误体打满内存
+  const declared = Number(response.headers.get('content-length') ?? '')
+  let body: ArrayBuffer | Uint8Array
+  if (Number.isFinite(declared) && declared > MAX_STORED_FAILURE_BYTES) {
+    headers.set('content-type', 'application/json; charset=utf-8')
+    body = new TextEncoder().encode(
+      JSON.stringify({ error: { message: `上游错误响应体过大(${declared} 字节), 已省略` } })
+    )
+  } else {
+    body = await response.arrayBuffer()
+    if (body.byteLength > MAX_STORED_FAILURE_BYTES) {
+      headers.set('content-type', 'application/json; charset=utf-8')
+      body = new TextEncoder().encode(
+        JSON.stringify({ error: { message: `上游错误响应体过大(${body.byteLength} 字节), 已省略` } })
+      )
+    }
+  }
   return {
     status: response.status,
     statusText: response.statusText,
