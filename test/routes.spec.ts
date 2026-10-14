@@ -6,7 +6,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { clearHealthCache, handleModels, handleProxy } from '../src/proxy'
 import { adminAuthMiddleware, handleLogin, handleLogout, proxyKeyAuthMiddleware } from '../src/auth'
-import { handleCreateProvider, handleDeleteProvider, handleGetProxyKeys, handleStatus, handleUpdateProvider } from '../src/admin'
+import { handleCreateProvider, handleDeleteProvider, handleGetProxyKeys, handleStatus, handleTestKeyNew, handleUpdateProvider } from '../src/admin'
 import {
   addProxyKey,
   clearListCache,
@@ -17,6 +17,7 @@ import {
   setProviders,
 } from '../src/storage'
 import { KV_KEYS } from '../src/config'
+import { renderHomePage, renderLoginPage } from '../src/pages'
 import type { Env, Provider } from '../src/types'
 
 interface TestEnv extends Env {
@@ -69,8 +70,16 @@ function makeApp() {
   app.get('/admin/api/status', handleStatus)
   app.post('/admin/api/providers', handleCreateProvider)
   app.put('/admin/api/providers/:id', handleUpdateProvider)
+  app.post('/admin/api/test-key', handleTestKeyNew)
   app.get('/admin/api/proxy-keys', handleGetProxyKeys)
   app.delete('/admin/api/providers/:id', handleDeleteProvider)
+  return app
+}
+
+function makePageApp() {
+  const app = new Hono<{ Bindings: Env }>()
+  app.get('/', (c) => renderHomePage(c, false))
+  app.get('/admin/login', renderLoginPage)
   return app
 }
 
@@ -426,6 +435,74 @@ describe('app 装配（src/index.ts）', () => {
       headers: jsonHeaders,
       body: JSON.stringify({ name: [1] }),
     }, env)).status).toBe(400)
+  })
+})
+
+describe('管理台连通性测试接口（fetch 桩）', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('test-key：拼 /models、带上认证头，并透传上游结果', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    const seen: Array<{ url: string; auth: string | null }> = []
+    vi.stubGlobal('fetch', async (url: string | URL, init?: RequestInit) => {
+      seen.push({ url: String(url), auth: new Headers(init?.headers).get('Authorization') })
+      return new Response(JSON.stringify({ data: [{ id: 'm1' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    const res = await makeApp().request('/admin/api/test-key', {
+      method: 'POST',
+      headers: { ...(await adminHeaders(env)), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'https://up.example.com/v1/', apiKey: 'sk-x', apiType: 'openai' }),
+    }, env)
+
+    expect(res.status).toBe(200)
+    // 末尾斜杠被去掉再拼 /models
+    expect(seen).toEqual([{ url: 'https://up.example.com/v1/models', auth: 'Bearer sk-x' }])
+    const body = (await res.json()) as { data: { success: boolean; statusCode: number } }
+    expect(body.data.success).toBe(true)
+    expect(body.data.statusCode).toBe(200)
+  })
+
+  it('test-key：内网 / 非 https 地址在发请求前就被拒（SSRF）', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    let called = 0
+    vi.stubGlobal('fetch', async () => { called++; return new Response('{}') })
+    const headers = { ...(await adminHeaders(env)), 'Content-Type': 'application/json' }
+
+    for (const url of ['http://up.example.com/v1', 'https://127.0.0.1/v1', 'https://[::ffff:169.254.169.254]/latest/meta-data']) {
+      const res = await makeApp().request('/admin/api/test-key', {
+        method: 'POST', headers, body: JSON.stringify({ url, apiKey: 'sk-x' }),
+      }, env)
+      expect(res.status, url).toBe(400)
+    }
+    expect(called).toBe(0)
+  })
+})
+
+describe('页面渲染', () => {
+  it('首页与登录页正常渲染，且不回显任何提供商 Key / 管理员密码', async () => {
+    const env = makeEnv({ ADMIN_PASSWORD: 's3cret-do-not-echo' })
+    await setProviders(env, [
+      makeProvider({ apiKeys: [{ key: 'sk-secret-should-not-leak', enabled: true }] }),
+    ])
+    const app = makePageApp()
+
+    const home = await app.request('/', {}, env)
+    expect(home.status).toBe(200)
+    const homeHtml = await home.text()
+    expect(homeHtml).toContain('/v1')
+    expect(homeHtml).not.toContain('sk-secret-should-not-leak')
+
+    const login = await app.request('/admin/login', {}, env)
+    expect(login.status).toBe(200)
+    const loginHtml = await login.text()
+    expect(loginHtml).toContain('type="password"')
+    expect(loginHtml).not.toContain('s3cret-do-not-echo')
   })
 })
 
