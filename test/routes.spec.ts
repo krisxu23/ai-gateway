@@ -448,6 +448,20 @@ describe('app 装配（src/index.ts）', () => {
     expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
   })
 
+  it('/v1/* 的流式（SSE）响应同样带安全头', async () => {
+    const env = makeEnv()
+    await setProviders(env, [makeProvider()])
+    await seedValidKey(env)
+    vi.stubGlobal('fetch', async () => new Response('data: {"choices":[]}\n\n', {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    }))
+    const app = (await import('../src/index')).default
+    const res = await app.request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('Content-Type')).toContain('text/event-stream')
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+  })
+
   it('未知路径返回 404 JSON；非法 JSON 请求体经 onError 返回 400', async () => {
     const env = makeEnv()
     const app = (await import('../src/index')).default

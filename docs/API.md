@@ -558,12 +558,23 @@ Session 过期返回 `401`：
 }
 ```
 
-部分错误（如所有 Key 耗尽）会附带 `detail` 字段：
+部分错误（如所有 Key 耗尽 / 全部被限流）会附带 `detail` 字段：
 ```json
 {
   "error": {
-    "message": "所有 API Key 已用完，最后一次错误: HTTP 429",
+    "message": "所有 API Key 已用完，最后一次错误: HTTP 503",
     "type": "key_exhausted",
+    "detail": "..."
+  }
+}
+```
+
+全部 Key 都只是被上游限流（HTTP 429，Key 本身未失效）时用独立类型，便于调用方选择「稍后重试」而不是换 Key：
+```json
+{
+  "error": {
+    "message": "所有 API Key 都被上游限流（HTTP 429），请稍后重试",
+    "type": "rate_limited",
     "detail": "..."
   }
 }
@@ -578,7 +589,8 @@ Session 过期返回 `401`：
 | `provider_disabled` | 提供商已禁用 |
 | `model_disabled` | 模型已禁用 |
 | `configuration_error` | 配置错误（如提供商未配置可用 API Key） |
-| `key_exhausted` | 所有 API Key 均失败 |
+| `key_exhausted` | 所有 API Key 均失败（失效 / 被拒 / 上游 5xx） |
+| `rate_limited` | 所有 API Key 都被上游限流（HTTP 429），Key 本身未失效 |
 | `proxy_error` | 转发过程出错（如网络异常） |
 | `server_error` | 服务器内部错误 |
 | `not_found` | 接口不存在（404） |
