@@ -72,7 +72,6 @@ export function mapFreeLaneClientTools(chat: Rec): Record<string, string> {
   // back[name] 会命中 Object.prototype, 被误判成“客户端改过名”而损坏输出
   const back: Record<string, string> = Object.create(null)
   if (!Array.isArray(chat.tools)) return back
-  const FREE_LANE_NAMES = ['bash', 'read']
   const tools = chat.tools as unknown[]
   const names = new Set(
     tools.map((t) => {
@@ -80,7 +79,7 @@ export function mapFreeLaneClientTools(chat: Rec): Record<string, string> {
       return typeof fn?.name === 'string' ? fn.name : undefined
     }).filter((n): n is string => typeof n === 'string')
   )
-  for (const gateName of FREE_LANE_NAMES) {
+  for (const gateName of STUB_TOOL_NAMES) {
     if (names.has(gateName)) continue
     const variant = tools.find((t) => {
       const fn = asRecord(t)?.function as Rec | undefined
