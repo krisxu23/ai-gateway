@@ -598,6 +598,16 @@ function createStubSwallowingChatStream(
       const tail = buf
       buf = ''
       emitBlock(controller, tail)
+      // name 始终没到的调用: 流结束了不会再来 name, 把缓存原样补发, 免得客户端
+      // 只收到一条 finish_reason=tool_calls 却看不到任何调用
+      if (pendingCalls.size > 0) {
+        const calls: Array<Record<string, unknown>> = []
+        for (const queue of pendingCalls.values()) calls.push(...queue)
+        pendingCalls.clear()
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`)
+        )
+      }
     },
   })
 }
@@ -631,7 +641,7 @@ async function storeFailure(response: Response): Promise<StoredFailure> {
     status: response.status,
     statusText: response.statusText,
     headers,
-    body: await response.arrayBuffer(),
+    body,
   }
 }
 

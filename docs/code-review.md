@@ -490,3 +490,11 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 | `findInvalidModelId` / `sanitizeList` 回归 | `test/admin-api.spec.ts`：id 归一化（`p');alert(1);//` → `p---alert-1----`、数字 id → `'123'`、`<img>` → `-img-`）+ 缺失 id 丢弃 + 归一后 Key 仍可用 |
 | 内联脚本语法守卫 | 首页与管理台的 `<script>` 均通过 `new Function` 解析（防手改前端脚本留下语法错误） |
 | `npm ls --depth=0` | 依赖树干净：hono 4.12.27 / esbuild 0.28.1 / vitest 2.1.9 / typescript 6.0.3 / wrangler 4.107.0 |
+
+### 18.3 自查补记：本轮修复自身引入的缺陷（已修）
+
+- **`src/opencode.ts` `storeFailure` 二次读取 body（严重）**：加 256KB 上限时把 `await response.arrayBuffer()` 写在了新的 `let body` 之外，返回值里仍是原始的 `body: await response.arrayBuffer()` —— 实际效果是「上限逻辑全部作废 + 第二次读取抛 `TypeError: Body is unusable`」。之所以之前的测试没抓到：官方线路失败会被镜像成功掩盖，`storeFailure` 的异常落在外层 `try/catch` 里，只有「官方与镜像同时失败」时才会把 502 暴露给客户端。现已返回 `body`，并补了两条回归用例：
+  - 「官方与镜像都失败时回放最后一次失败响应（状态码与正文保留）」—— 断言 `[429, 503]` 含 `res.status` 且正文含 `down`（502 是传输失败兜底，不该出现在这里）；
+  - 「失败响应体过大时只回简短说明，不整包读进内存」—— 500 + 300KB 体，断言回包含「过大」且长度 < 1000。
+- **`src/opencode.ts` 桩吞噬流的 `pendingCalls` 可能在流结束时不落地**：name 始终未到的调用被永久缓存，客户端只会看到 `finish_reason=tool_calls` 却没有任何调用。现于 `flush` 中把残留缓存原样补发（合成一个 `delta.tool_calls` 事件）。同时补两条用例覆盖「name 晚到」的两种走向：客户端工具名晚到 → 缓冲后透传改名（不丢调用）；桩工具参数先到 → 整段吞掉且不残留 `tool_calls` 结束原因。
+

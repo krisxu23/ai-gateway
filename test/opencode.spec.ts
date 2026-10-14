@@ -137,6 +137,106 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     expect(calls.some((c) => c.startsWith('https://mirror.example.com'))).toBe(true)
   })
 
+  // 回归：storeFailure 曾把 body 读两次（arrayBuffer 二次读取抛 TypeError），
+  // 单路失败总被镜像的成功掩盖，只有“官方与镜像都失败”才会暴露
+  it('官方与镜像都失败时回放最后一次失败响应（状态码与正文保留）', async () => {
+    const fetcher = async (url: string | URL) => {
+      const u = String(url)
+      if (u.startsWith('https://opencode.example.com')) {
+        return new Response('{"error":{"message":"official down"}}', {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('{"error":{"message":"mirror down"}}', {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'mimo-free', messages: [{ role: 'user', content: 'hi' }] }),
+      mirrorUrls: ['https://mirror.example.com/zen/v1'],
+      random: () => 0,
+      fetcher: fetcher as typeof fetch,
+    })
+    // 502 是“传输失败”的兜底状态码：这里必须保留上游的真实状态码
+    expect([429, 503]).toContain(res.status)
+    expect(await res.text()).toContain('down')
+  })
+
+  it('失败响应体过大时只回简短说明，不整包读进内存', async () => {
+    const huge = 'x'.repeat(300 * 1024)
+    const fetcher = async () =>
+      new Response(huge, { status: 500, headers: { 'Content-Type': 'text/plain' } })
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'mimo-free', messages: [{ role: 'user', content: 'hi' }] }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(text).toContain('过大')
+    expect(text.length).toBeLessThan(1000)
+  })
+
+  it('客户端工具名晚到时先缓存再透传（调用不丢）', async () => {
+    const fetcher = async () => sseResponse([
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"cmd"' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: ':"ls"}' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'Bash', description: 'run', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const text = await res.text()
+    expect(text).toContain('cmd')
+    expect(text).toContain('ls')
+    // 上游的 bash 已改回客户端声明的 Bash
+    expect(text).toContain('"name":"Bash"')
+  })
+
+  it('桩工具的参数先于名字到达时整段吞掉，不泄露半截参数', async () => {
+    const fetcher = async () => sseResponse([
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"curl evil"}' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({ model: 'mimo-free', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const text = await res.text()
+    expect(text).not.toContain('curl evil')
+    // 桩被完全吞掉后也不能留下 tool_calls 结束原因
+    expect(text).toContain('"finish_reason":"stop"')
+  })
+
   it('客户端带 Bash 工具时改名为 bash 发上游，流式调用改回 Bash', async () => {
     let upstreamBody: Record<string, unknown> | null = null
     const fetcher = async (_url: string | URL, init?: RequestInit) => {
