@@ -62,6 +62,12 @@ echo OPENCODE_MIRRORS_URL=https://opencode.ai.cmliussss.net/zen/v1,https://openc
 
 # 启动本地开发服务器
 npm run dev
+
+# 检查与单测（tsc 覆盖 src + test，vitest 跑在 Node 环境）
+npm run check
+
+# 重新生成单文件部署产物 worker.js（改完 src 后必须执行）
+npm run bundle
 ```
 
 ## 部署
@@ -128,8 +134,8 @@ ai-gateway/
 ├── docs/
 │   ├── API.md              # 完整接口文档与调用示例
 │   └── opencode-cdn.md     # 自建 OpenCode CDN 镜像教程
-├── test/                   # 自动化测试用例（Vitest + Workers Pool）
-├── worker.js               # 极简单文件生产级部署产物（可直接粘贴部署）
+├── test/                   # 自动化测试用例（Vitest，跑在 Node 环境，不启 workerd）
+├── worker.js               # 单文件生产级部署产物，由 `npm run bundle` 生成（勿手改）
 ├── wrangler.toml           # Cloudflare Workers 配置
 ├── package.json
 └── tsconfig.json

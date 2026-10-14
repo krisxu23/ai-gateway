@@ -101,6 +101,24 @@ function normalizeArray<T>(
   return items.map((item) => (typeof item === 'string' ? mapFn(item) : (item as T)))
 }
 
+// 模型 ID 会渲染进管理台 HTML 属性，且可来自上游 /models 接口，属于不可信输入：
+// 只放行安全字符集，从源头堵死注入（渲染侧的 data-mid 传递是第二道防线）
+const MODEL_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/
+
+/** 返回第一个非法模型 ID，全部合法时返回 null */
+export function findInvalidModelId(items: unknown): string | null {
+  if (!Array.isArray(items)) return null
+  for (const item of items) {
+    const raw = typeof item === 'string' ? item : (item as { id?: unknown } | null)?.id
+    const id = String(raw ?? '')
+    if (!MODEL_ID_RE.test(id)) return id
+  }
+  return null
+}
+
+const invalidModelMessage = (id: string) =>
+  `模型 ID "${id.slice(0, 64)}" 含非法字符，仅允许字母、数字与 . _ : / -`
+
 export async function handleStatus(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
@@ -157,13 +175,18 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
   }
 
+  const badModel = findInvalidModelId(body.models)
+  if (badModel !== null) {
+    return c.json<ApiResponse>({ success: false, message: invalidModelMessage(badModel) }, 400)
+  }
+
   const now = new Date().toISOString()
   const provider: Provider = {
     id: body.id,
     name: body.name,
     baseUrl: body.baseUrl.replace(/\/$/, ''),
     apiType: body.apiType || 'openai',
-apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
+    apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
       : [],
@@ -196,6 +219,10 @@ if (body.apiKeys !== undefined) {
   }
   if (body.enabled !== undefined) updates.enabled = body.enabled
   if (body.models !== undefined) {
+    const badModel = findInvalidModelId(body.models)
+    if (badModel !== null) {
+      return c.json<ApiResponse>({ success: false, message: invalidModelMessage(badModel) }, 400)
+    }
     updates.models = normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
   }
 
@@ -382,14 +409,10 @@ export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
   const randomPart = crypto.randomUUID().replace(/-/g, '')
   const key = `${PROXY_KEY_PREFIX}${randomPart}`
 
-  // 计算过期时间
-  let expiresAt: string | null = null
-  if (body.expiresIn && body.expiresIn !== 'forever') {
-    const ttl = EXPIRY_OPTIONS[body.expiresIn]
-    if (ttl) {
-      expiresAt = new Date(Date.now() + ttl * 1000).toISOString()
-    }
-  }
+  // 计算过期时间；typeof 判定同时挡掉原型链命中："__proto__"/"constructor" 会取到
+  // 非 number 对象，参与运算得 NaN，toISOString 直接抛错
+  const ttl = body.expiresIn ? EXPIRY_OPTIONS[body.expiresIn] : undefined
+  const expiresAt = typeof ttl === 'number' ? new Date(Date.now() + ttl * 1000).toISOString() : null
 
   const proxyKey = {
     id,

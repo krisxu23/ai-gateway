@@ -203,6 +203,16 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('data: [DONE]')
   })
 
+  it('上游未发 response.completed 就断开时补发 finish_reason=length 收尾块', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"content":"partial"')
+    expect(out).toContain('"finish_reason":"length"')
+    expect(out).toContain('data: [DONE]')
+  })
+
   it('function_call 事件转为 tool_calls 增量', async () => {
     const upstream = sseChunks([
       'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
@@ -256,9 +266,10 @@ describe('createResponsesToChatStream', () => {
       ],
       incomplete_details: null,
     }
-    const result = responsesToChatBody(body as unknown as Parameters<typeof responsesToChatBody>[0], 'muse', true)
-    expect(result.choices[0].message.tool_calls).toBeUndefined()
-    expect(result.choices[0].finish_reason).toBe('stop')
+    const result = responsesToChatBody(body as unknown as Parameters<typeof responsesToChatBody>[0], true)
+    const choice = (result.choices as Array<Record<string, unknown>>)[0]
+    expect((choice.message as Record<string, unknown>).tool_calls).toBeUndefined()
+    expect(choice.finish_reason).toBe('stop')
   })
 
   it('多行/分块输入正确重组', async () => {

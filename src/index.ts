@@ -24,7 +24,9 @@ import { seedInitialData, getSession } from './storage'
 const app = new Hono<{ Bindings: Env }>()
 
 // ===== 全局中间件 =====
-app.use('*', cors())
+// 只给 /v1/* 开 CORS：管理台接口不需要跨域，收敛通配头减少暴露面
+// （admin Cookie 已是 httpOnly + SameSite=Lax，此处为纵深防御）。
+app.use('/v1/*', cors())
 // 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
 // tail 日志足够排查问题。
 

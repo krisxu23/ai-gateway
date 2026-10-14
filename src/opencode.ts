@@ -3,9 +3,11 @@ import {
   chatBodyToResponsesBody,
   contentText,
   createResponsesToChatStream,
+  isStubToolName,
   mapFreeLaneClientTools,
   responsesToChatBody,
   STUB_SWALLOW_NOTE,
+  STUB_TOOL_NAMES,
   zenModelNeedsResponses,
 } from './opencode-responses'
 
@@ -196,7 +198,7 @@ function createRequestHeaders(apiKey: string, requestId: string, sessionId: stri
 // bash/read 两个 function tools, 缺一即 FreeTierError。
 // ---------------------------------------------------------------------------
 
-const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read']
+const FREE_LANE_GATE_TOOL_NAMES = STUB_TOOL_NAMES
 
 function freeLaneGateTool(name: string) {
   return {
@@ -387,7 +389,10 @@ async function collapseChatSseToJson(
     }
   }
   for (let i = 0; i < toolCalls.length; i++) {
-    const fn = toolCalls[i].function as Record<string, unknown>
+    const call = toolCalls[i]
+    // 上游跳过某个 index 时数组会留空洞，直接跳过，避免读 .function 抛错
+    if (!call) continue
+    const fn = call.function as Record<string, unknown>
     const name = typeof fn.name === 'string' ? fn.name : ''
     const lower = name.toLowerCase()
     // 模型对 bash/read 的调用: 若来自客户端改名(back 有映射)则改回原名透传;
@@ -395,13 +400,13 @@ async function collapseChatSseToJson(
     if (name && (back[lower] || back[name])) {
       fn.name = back[lower] || back[name]
     }
-    (toolCalls[i].function as Record<string, unknown>).arguments = argBufs[i] ?? ''
+    fn.arguments = argBufs[i] ?? ''
   }
   // 桩判定: bash/read 且不在改名映射里。
   // 既支持纯桩场景 (swallowStubs)，也支持混合场景 (injectedStubs.has)。
   const isStub = (name: string) => {
     const lower = name.toLowerCase()
-    if (lower !== 'bash' && lower !== 'read') return false
+    if (!isStubToolName(name)) return false
     if (back[lower] || back[name]) return false
     return injectedStubs.size > 0
       ? (injectedStubs.has(lower) || injectedStubs.has(name))
@@ -410,6 +415,7 @@ async function collapseChatSseToJson(
   const shouldFilter = swallowStubs || injectedStubs.size > 0
   const finalToolCalls = shouldFilter
     ? toolCalls.filter((tc) => {
+        if (!tc) return false
         const fn = (tc.function ?? {}) as Record<string, unknown>
         const name = typeof fn.name === 'string' ? fn.name : ''
         return !isStub(name)
@@ -482,7 +488,7 @@ function createStubSwallowingChatStream(
             const fn = (call.function ?? {}) as Record<string, unknown>
             const name = typeof fn.name === 'string' ? fn.name : ''
             const lower = name.toLowerCase()
-            const isStubCandidate = lower === 'bash' || lower === 'read'
+            const isStubCandidate = isStubToolName(name)
             if (idx >= 0) {
               seenIndexes.add(idx)
               // 桩(我们注入、back 无映射) → 吞噬; 客户端改名来的 → 改回原名保留。
@@ -538,6 +544,17 @@ function createStubSwallowingChatStream(
     if (out !== null) controller.enqueue(encoder.encode(`data: ${out}\n\n`))
   }
 
+  const emitBlock = (controller: TransformStreamDefaultController<Uint8Array>, raw: string) => {
+    const block = raw.replace(/\r/g, '')
+    // 不含 data 字段的事件(注释 / event: 字段)整段原样透传，保留 SSE 的
+    // 空行分隔语义，避免与后续 data 行併进同一个事件
+    if (!block.split('\n').some((line) => line.trim().startsWith('data:'))) {
+      if (block.trim()) controller.enqueue(encoder.encode(`${block}\n\n`))
+      return
+    }
+    for (const line of block.split('\n')) emitLine(controller, line)
+  }
+
   return new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       buf += decoder.decode(chunk, { stream: true })
@@ -545,22 +562,27 @@ function createStubSwallowingChatStream(
       while ((boundary = findSseBoundary(buf)) !== null) {
         const raw = buf.slice(0, boundary.index)
         buf = buf.slice(boundary.index + boundary.length)
-        for (const line of raw.replace(/\r/g, '').split('\n')) emitLine(controller, line)
+        emitBlock(controller, raw)
       }
     },
     flush(controller) {
       const tail = buf
       buf = ''
-      for (const line of tail.replace(/\r/g, '').split('\n')) emitLine(controller, line)
+      emitBlock(controller, tail)
     },
   })
 }
 
 async function storeFailure(response: Response): Promise<StoredFailure> {
+  const headers = new Headers(response.headers)
+  // body 已被 arrayBuffer() 解码，回放时不能再声称压缩与原长度，
+  // 否则客户端会按 content-encoding 解压失败
+  headers.delete('content-encoding')
+  headers.delete('content-length')
   return {
     status: response.status,
     statusText: response.statusText,
-    headers: new Headers(response.headers),
+    headers,
     body: await response.arrayBuffer(),
   }
 }
@@ -798,10 +820,15 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
       return collapseChatSseToJson(response, gateModel, stubOnly, back, injectedStubs)
     }
     if (clientWantsStream && (injectedStubs.size > 0 || Object.keys(back).length > 0) && isSse) {
+      // body 被重新编码过，不能再声称压缩与原长度：客户端会按 content-encoding
+      // 解压已解压过的流而报错（与 storeFailure 同理）
+      const headers = new Headers(response.headers)
+      headers.delete('content-encoding')
+      headers.delete('content-length')
       return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back, injectedStubs, stubOnly === false)), {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers,
+        headers,
       })
     }
     return response

@@ -43,13 +43,13 @@ const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh']
  */
 export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn\'t have.)'
 
-/** 桩工具名(吞噬判定用, 与 opencode.ts 的 FREE_LANE_GATE_TOOL_NAMES 同构)。 */
-function isStubToolName(name: unknown): boolean {
+/** 免费通道的桩工具名：gate 注入与吞噬判定共用同一定义，避免两处分叉。 */
+export const STUB_TOOL_NAMES = ['bash', 'read'] as const
+
+/** 桩工具名判定(吞噬用)。大小写归一: 上游可能输出首字母大写的 Bash/Read。 */
+export function isStubToolName(name: unknown): boolean {
   if (typeof name !== 'string') return false
-  // 大小写归一: 上游模型可能输出首字母大写的 Bash/Read, 与 opencode.ts 的
-  // lower 归一对齐, 避免大写桩调用透给客户端。
-  const lower = name.toLowerCase()
-  return lower === 'bash' || lower === 'read'
+  return (STUB_TOOL_NAMES as readonly string[]).includes(name.toLowerCase())
 }
 
 // normalizeReasoningEffort 把客户端的 reasoning_effort 归一为 Responses 的
@@ -422,7 +422,12 @@ export function createResponsesToChatStream(
       if (finished) return
       // 与 handleLine 一致的宽松解析: 兼容无空格的 data:{...} 紧凑格式。
       if (buf.startsWith('data: ') || buf.startsWith('data:')) handleLine(buf.replace(/\r$/, ''), controller)
-      if (!finished) controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      if (!finished) {
+        // 上游在 response.completed 之前断开: 补一个带 finish_reason 的收尾块,
+        // 让客户端能区分"回答被截断"与"模型正常结束"(否则截断会被当成干净停止)。
+        controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, 'length')))
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      }
     },
   })
 }

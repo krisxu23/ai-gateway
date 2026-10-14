@@ -36,7 +36,6 @@ export interface Session {
 
 export interface ProxyRequestBody {
   model?: string
-  messages?: Array<{ role: string; content: string }>
   [key: string]: unknown
 }
 

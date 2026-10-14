@@ -43,6 +43,7 @@ const FORWARD_HEADER_TIMEOUT_MS = 30000
 async function fetchWithHeaderTimeout(
   url: string,
   init: RequestInit,
+  clientSignal?: AbortSignal,
   timeoutMs = FORWARD_HEADER_TIMEOUT_MS
 ): Promise<Response> {
   const controller = new AbortController()
@@ -50,21 +51,37 @@ async function fetchWithHeaderTimeout(
     () => controller.abort(new Error(`上游在 ${timeoutMs / 1000}s 内未返回响应头`)),
     timeoutMs
   )
+  // 客户端断开时立即掐掉上游请求，避免继续消耗免费额度
+  const onClientAbort = () => controller.abort(clientSignal?.reason)
+  if (clientSignal?.aborted) controller.abort(clientSignal.reason)
+  else clientSignal?.addEventListener('abort', onClientAbort)
   try {
     return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timer)
+    clientSignal?.removeEventListener('abort', onClientAbort)
   }
 }
 
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   const cacheKey = HEALTH_KEY(providerId)
+  // 返回副本：调用方会原地修改（recordKeyFailure / delete），若 KV 写入失败，
+  // 内存缓存不应被未落盘的状态污染
   const cached = healthCacheGet(cacheKey)
-  if (cached) return cached
+  if (cached) return { ...cached }
   const raw = await env.KV.get(cacheKey)
-  const parsed: HealthMap = raw ? JSON.parse(raw) : {}
+  let parsed: HealthMap = {}
+  if (raw) {
+    try {
+      const value: unknown = JSON.parse(raw)
+      if (value && typeof value === 'object') parsed = value as HealthMap
+    } catch {
+      // 损坏的健康数据不应让每个转发请求都 500：重置为全健康
+      console.warn(`[proxy] key 健康数据损坏，已重置: ${cacheKey}`)
+    }
+  }
   healthCacheSet(cacheKey, parsed)
-  return parsed
+  return { ...parsed }
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
@@ -315,6 +332,12 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     let lastError: Response | null = null
     let healthUpdated = false
     let failuresSeen = false
+    let clientAborted = false
+    // 丢弃上一个失败响应：body 未消费会一直占着子请求（只有最后一次的 body
+    // 会在下面读出来作为错误详情）
+    const dropLastError = async () => {
+      await lastError?.body?.cancel().catch(() => {})
+    }
 
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
@@ -323,7 +346,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           method: c.req.method,
           headers: buildAuthHeaders(apiKey, provider.apiType),
           body: JSON.stringify(forwardBody),
-        })
+        }, c.req.raw.signal)
 
         if (response.ok) {
           // 成功：重置健康状态
@@ -335,6 +358,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
             await writeHealth(c.env, providerId, healthData)
           }
 
+          // 只透传 Content-Type 与 Cache-Control：上游的 x-ratelimit-* 等头部对
+          // OpenAI 客户端无用；body 未做任何解码，因此不能带 content-encoding /
+          // content-length（未转发客户端的 Accept-Encoding，上游一般返回未压缩体）
           return new Response(response.body, {
             status: response.status,
             headers: {
@@ -346,6 +372,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
         // 429 限流：跳过当前 key，不标记失败
         if (response.status === 429) {
+          await dropLastError()
           lastError = response
           continue
         }
@@ -354,6 +381,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         if (response.status === 401 || response.status === 403 || response.status >= 500) {
           if (recordKeyFailure(healthData, apiKey)) healthUpdated = true
           failuresSeen = true
+          await dropLastError()
           lastError = response
           continue
         }
@@ -362,9 +390,15 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
+        // 客户端主动断开：不再尝试其它 key，也不把这次中断算作 key 失败
+        if (c.req.raw.signal.aborted) {
+          clientAborted = true
+          break
+        }
         const error = err as Error
         if (recordKeyFailure(healthData, apiKey)) healthUpdated = true
         failuresSeen = true
+        await dropLastError()
         lastError = new Response(JSON.stringify({
           error: { message: error.message || '请求失败', type: 'proxy_error' },
         }), { status: 502 })
@@ -374,6 +408,13 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // 写回健康状态。失败时无论是否达到阈值都补写一次 KV，保证跨 isolate 可见
     if (healthUpdated || failuresSeen) await writeHealth(c.env, providerId, healthData)
+
+    // 客户端已断开：响应无人接收，但给出明确语义而不是"没有可用 Key"
+    if (clientAborted) {
+      return new Response(JSON.stringify({
+        error: { message: '客户端已断开连接', type: 'client_closed_request' },
+      }), { status: 499, headers: { 'Content-Type': 'application/json' } })
+    }
 
     // 所有 key 均失败
     if (lastError) {

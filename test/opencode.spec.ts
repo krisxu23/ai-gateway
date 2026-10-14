@@ -18,9 +18,8 @@ function sseResponse(events: string[]): Response {
   })
 }
 
-function chunk(content: string, index?: number): string {
+function chunk(content: string): string {
   const delta: Record<string, unknown> = { content }
-  void index
   return `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`
 }
 

@@ -8,7 +8,8 @@
     "deploy": "wrangler deploy",
     "build": "wrangler deploy --dry-run",
     "test": "vitest run",
-    "check": "tsc --noEmit && vitest run"
+    "check": "tsc --noEmit && vitest run",
+    "bundle": "esbuild src/index.ts --bundle --format=esm --minify --charset=utf8 --outfile=worker.js"
   },
   "keywords": [
     "cloudflare",
@@ -22,8 +23,8 @@
     "hono": "^4.12.27"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.10.15",
     "@cloudflare/workers-types": "^4.20260702.1",
+    "esbuild": "^0.28.1",
     "typescript": "^6.0.3",
     "vitest": "^2.1.9",
     "wrangler": "^4.107.0"

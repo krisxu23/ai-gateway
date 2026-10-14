@@ -24,8 +24,14 @@ function cacheGet<T>(key: string): T | undefined {
   return entry.value as T
 }
 
-function cacheSet<T>(key: string, value: T): void {
-  memCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS })
+function cacheSet<T>(key: string, value: T, ttlMs = CACHE_TTL_MS): void {
+  memCache.set(key, { value, expiresAt: Date.now() + ttlMs })
+}
+
+// 转发 Key 的停用/删除需要尽快生效（可能是在抹销已泄露的 Key），因此单独用更短
+// 的缓存窗口；其他配置沿用 60s。跨 isolate 的最终一致窗口就等于这个 TTL。
+const CACHE_TTL_BY_KEY: Record<string, number> = {
+  [KV_KEYS.PROXY_KEYS]: 5 * 1000,
 }
 
 /** 通用缓存列表读取：优先内存，未命中再读 KV */
@@ -33,15 +39,39 @@ async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
   const cached = cacheGet<T[]>(key)
   if (cached) return cached
   const data = await env.KV.get(key)
-  const parsed = data ? (JSON.parse(data) as T[]) : []
-  cacheSet(key, parsed)
+  let parsed: T[] = []
+  if (data) {
+    try {
+      const value: unknown = JSON.parse(data)
+      if (Array.isArray(value)) parsed = value as T[]
+      else console.warn(`[storage] KV 数据不是数组，已按空列表处理: ${key}`)
+    } catch {
+      // 脏数据（人工误写/写入被截断）不应让整个网关 500：按空列表处理，
+      // 下一次成功写入会自动覆盖；转发 Key 走空列表是 fail-closed
+      console.warn(`[storage] KV 数据解析失败，已按空列表处理: ${key}`)
+    }
+  }
+  cacheSet(key, parsed, CACHE_TTL_BY_KEY[key])
   return parsed
 }
 
 /** 通用缓存列表写入：先写 KV 成功后再更新内存缓存，防止脏数据污染 */
 async function setCachedList<T>(env: Env, key: string, list: T[]): Promise<void> {
   await env.KV.put(key, JSON.stringify(list))
-  cacheSet(key, list)
+  cacheSet(key, list, CACHE_TTL_BY_KEY[key])
+}
+
+// 同 isolate 内的写队列：把「读全表 → 改 → 写回」串行化，避免两个并发管理操作
+// 各自读到旧表再写回，后写者把先写者整体覆盖。
+// shortcut: 只覆盖单个 isolate；跨 isolate 的并发仍可能丢更新（KV 没有 CAS，
+// 真正解决需要 Durable Object，管理操作频率极低，暂不引入）。
+const writeQueues = new Map<string, Promise<unknown>>()
+
+function serialized<T>(key: string, task: () => Promise<T>): Promise<T> {
+  // 前一个任务失败也要继续执行后续任务，所以 then 的拒绝分支同样接 task
+  const run = (writeQueues.get(key) ?? Promise.resolve()).then(task, task)
+  writeQueues.set(key, run.catch(() => {}))
+  return run
 }
 
 // ===== 提供商 CRUD =====
@@ -59,26 +89,32 @@ export async function setProviders(env: Env, providers: Provider[]): Promise<voi
   await setCachedList(env, KV_KEYS.PROVIDERS, providers)
 }
 
-export async function addProvider(env: Env, provider: Provider): Promise<void> {
-  const providers = await getProviders(env)
-  await setProviders(env, [...providers, provider])
+export function addProvider(env: Env, provider: Provider): Promise<void> {
+  return serialized(KV_KEYS.PROVIDERS, async () => {
+    const providers = await getProviders(env)
+    await setProviders(env, [...providers, provider])
+  })
 }
 
-export async function updateProvider(env: Env, id: string, updates: Partial<Provider>): Promise<Provider | null> {
-  const providers = await getProviders(env)
-  const index = providers.findIndex((p) => p.id === id)
-  if (index === -1) return null
-  const updated: Provider = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
-  await setProviders(env, providers.map((p, i) => (i === index ? updated : p)))
-  return updated
+export function updateProvider(env: Env, id: string, updates: Partial<Provider>): Promise<Provider | null> {
+  return serialized(KV_KEYS.PROVIDERS, async () => {
+    const providers = await getProviders(env)
+    const index = providers.findIndex((p) => p.id === id)
+    if (index === -1) return null
+    const updated: Provider = { ...providers[index], ...updates, updatedAt: new Date().toISOString() }
+    await setProviders(env, providers.map((p, i) => (i === index ? updated : p)))
+    return updated
+  })
 }
 
-export async function deleteProvider(env: Env, id: string): Promise<boolean> {
-  const providers = await getProviders(env)
-  const filtered = providers.filter((p) => p.id !== id)
-  if (filtered.length === providers.length) return false
-  await setProviders(env, filtered)
-  return true
+export function deleteProvider(env: Env, id: string): Promise<boolean> {
+  return serialized(KV_KEYS.PROVIDERS, async () => {
+    const providers = await getProviders(env)
+    const filtered = providers.filter((p) => p.id !== id)
+    if (filtered.length === providers.length) return false
+    await setProviders(env, filtered)
+    return true
+  })
 }
 
 // ===== Session 管理 =====
@@ -98,8 +134,14 @@ export async function createSession(env: Env, username: string, ttlSeconds: numb
 export async function getSession(env: Env, sessionId: string): Promise<Session | null> {
   const data = await env.KV.get(KV_KEYS.SESSION_PREFIX + sessionId)
   if (!data) return null
-  const session: Session = JSON.parse(data)
-  if (session.expiresAt < Date.now()) {
+  let session: Session | null = null
+  try {
+    const value: unknown = JSON.parse(data)
+    if (value && typeof value === 'object') session = value as Session
+  } catch {
+    // 损坏的 session 直接当作无效
+  }
+  if (!session || typeof session.expiresAt !== 'number' || session.expiresAt < Date.now()) {
     await deleteSession(env, sessionId)
     return null
   }
@@ -120,26 +162,32 @@ export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
   await setCachedList(env, KV_KEYS.PROXY_KEYS, keys)
 }
 
-export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {
-  const keys = await getProxyKeys(env)
-  await setProxyKeys(env, [...keys, key])
+export function addProxyKey(env: Env, key: ProxyKey): Promise<void> {
+  return serialized(KV_KEYS.PROXY_KEYS, async () => {
+    const keys = await getProxyKeys(env)
+    await setProxyKeys(env, [...keys, key])
+  })
 }
 
-export async function deleteProxyKey(env: Env, id: string): Promise<boolean> {
-  const keys = await getProxyKeys(env)
-  const filtered = keys.filter((k) => k.id !== id)
-  if (filtered.length === keys.length) return false
-  await setProxyKeys(env, filtered)
-  return true
+export function deleteProxyKey(env: Env, id: string): Promise<boolean> {
+  return serialized(KV_KEYS.PROXY_KEYS, async () => {
+    const keys = await getProxyKeys(env)
+    const filtered = keys.filter((k) => k.id !== id)
+    if (filtered.length === keys.length) return false
+    await setProxyKeys(env, filtered)
+    return true
+  })
 }
 
-export async function updateProxyKey(env: Env, id: string, updates: Partial<ProxyKey>): Promise<ProxyKey | null> {
-  const keys = await getProxyKeys(env)
-  const idx = keys.findIndex(k => k.id === id)
-  if (idx === -1) return null
-  const updated: ProxyKey = { ...keys[idx], ...updates }
-  await setProxyKeys(env, keys.map((k, i) => (i === idx ? updated : k)))
-  return updated
+export function updateProxyKey(env: Env, id: string, updates: Partial<ProxyKey>): Promise<ProxyKey | null> {
+  return serialized(KV_KEYS.PROXY_KEYS, async () => {
+    const keys = await getProxyKeys(env)
+    const idx = keys.findIndex((k) => k.id === id)
+    if (idx === -1) return null
+    const updated: ProxyKey = { ...keys[idx], ...updates }
+    await setProxyKeys(env, keys.map((k, i) => (i === idx ? updated : k)))
+    return updated
+  })
 }
 
 export async function validateProxyKey(env: Env, key: string): Promise<boolean> {
