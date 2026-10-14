@@ -34,6 +34,32 @@ const CACHE_TTL_BY_KEY: Record<string, number> = {
   [KV_KEYS.PROXY_KEYS]: 5 * 1000,
 }
 
+/** 元素必须是普通对象（数组/标量/nil 都不算） */
+const isObj = (item: unknown): item is Record<string, unknown> =>
+  typeof item === 'object' && item !== null && !Array.isArray(item)
+
+/**
+ * KV 里可能残留历史版本或人工编辑写入的畸形数据。下游代码直接假定字段形状
+ * （p.models.filter(...)、k.key.length ...），一处畸形就会让首页、管理台、
+ * /v1/models 与转发全部 500（管理员无法通过界面自救）。因此在读取出口统一
+ * 归一化：丢弃非对象条目，把被依赖的字段补成正确类型。
+ */
+function sanitizeList(key: string, raw: unknown[]): unknown[] {
+  const items = raw.filter(isObj)
+  if (key === KV_KEYS.PROVIDERS) {
+    return items.map((p) => ({
+      ...p,
+      name: String(p.name ?? ''),
+      models: Array.isArray(p.models) ? p.models.filter(isObj) : [],
+      apiKeys: Array.isArray(p.apiKeys) ? p.apiKeys.filter(isObj) : [],
+    }))
+  }
+  if (key === KV_KEYS.PROXY_KEYS) {
+    return items.map((k) => ({ ...k, key: String(k.key ?? ''), name: String(k.name ?? '') }))
+  }
+  return items
+}
+
 /** 通用缓存列表读取：优先内存，未命中再读 KV */
 async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
   const cached = cacheGet<T[]>(key)
@@ -43,7 +69,7 @@ async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
   if (data) {
     try {
       const value: unknown = JSON.parse(data)
-      if (Array.isArray(value)) parsed = value as T[]
+      if (Array.isArray(value)) parsed = sanitizeList(key, value) as T[]
       else console.warn(`[storage] KV 数据不是数组，已按空列表处理: ${key}`)
     } catch {
       // 脏数据（人工误写/写入被截断）不应让整个网关 500：按空列表处理，
@@ -207,14 +233,16 @@ export async function seedInitialData(env: Env): Promise<void> {
 
   if (!migrationCompleted) {
     if (opencode && !providers.some((p) => p.id === opencode.id)) {
-      await setProviders(env, [
-        ...providers,
-        {
-          ...opencode,
-          apiKeys: opencode.apiKeys.map((k) => ({ ...k })),
-          models: opencode.models.map((m) => ({ ...m })),
-        },
-      ])
+      await serialized(KV_KEYS.PROVIDERS, () =>
+        setProviders(env, [
+          ...providers,
+          {
+            ...opencode,
+            apiKeys: opencode.apiKeys.map((k) => ({ ...k })),
+            models: opencode.models.map((m) => ({ ...m })),
+          },
+        ])
+      )
     }
     await env.KV.put(KV_KEYS.OPENCODE_MIGRATION, '1')
   }

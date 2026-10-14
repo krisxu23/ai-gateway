@@ -310,6 +310,8 @@ export function modelRowHTML(pid: string, m: Model, mi: number): string {
 export async function renderAdminPage(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
+  // 本页内联了完整转发 Key（data-full / data-copy-val），不能被浏览器或中间层缓存
+  c.header('Cache-Control', 'no-store')
   const enabledProvidersCount = providers.filter((provider) => provider.enabled).length
   const modelsCount = providers.reduce((total, provider) => total + provider.models.length, 0)
   const enabledModelsCount = providers.reduce((total, provider) => total + provider.models.filter((model) => model.enabled).length, 0)
@@ -466,12 +468,6 @@ function pM(msg, def) {
     document.getElementById('pMo').addEventListener('click', function() { closeM(); r(inp.value.trim()) })
   })
 }
-function aM(msg, t) {
-  const i = t === 'success' ? 'fa-check-circle c-s' : 'fa-exclamation-circle c-d'
-  // msg 可能含上游返回的原始文本, 统一 HTML 转义后插入
-  showM('<h3><i class="fas ' + i + '"></i> ' + (t === 'success' ? '成功' : '提示') + '</h3><p>' + escapeHtml(msg) + '</p><div class="fa"><button class="btn btn-p" onclick="closeM()">确定</button></div>')
-}
-
 function toast(msg, t) {
   const el = document.getElementById('toast')
   const i = t === 'success' ? 'fa-check-circle' : 'fa-times-circle'

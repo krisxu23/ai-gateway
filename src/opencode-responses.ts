@@ -294,12 +294,16 @@ export function createResponsesToChatStream(
   const swallowedIds = new Set<string>()
   let nextIdx = 0
   let finished = false
+  // 是否已下发过正文增量: 流在 response.completed 之前断开时据此区分
+  // "回答被截断"(length) 与 "上游就发了个空回复"(stop)
+  let sawText = false
 
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
     const type = typeof ev.type === 'string' ? ev.type : ''
     switch (type) {
       case 'response.output_text.delta':
         if (typeof ev.delta === 'string' && ev.delta) {
+          sawText = true
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.delta })))
         }
         break
@@ -432,7 +436,10 @@ export function createResponsesToChatStream(
       if (!finished) {
         // 上游在 response.completed 之前断开: 补一个带 finish_reason 的收尾块,
         // 让客户端能区分"回答被截断"与"模型正常结束"(否则截断会被当成干净停止)。
-        controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, 'length')))
+        // 已下发工具调用时报 tool_calls(与非流式路径一致, agent 客户端才会执行);
+        // 什么都没发过时报 stop(上游只是空回复, 不是截断)。
+        const finish = nextIdx > 0 ? 'tool_calls' : sawText ? 'length' : 'stop'
+        controller.enqueue(encoder.encode(sseChunk(model, chunkId, {}, finish)))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       }
     },

@@ -8,8 +8,9 @@ import {
   isOpenCodeProvider,
   generateOpenCodeId,
   resolveSessionId,
-  type OpenCodeTestResult,
+  collapseChatSseToJson,
 } from '../src/opencode'
+import { createResponsesToChatStream, STUB_SWALLOW_NOTE } from '../src/opencode-responses'
 
 function sseResponse(events: string[]): Response {
   return new Response(new TextEncoder().encode(events.join('')), {
@@ -22,6 +23,30 @@ function chunk(content: string): string {
   const delta: Record<string, unknown> = { content }
   return `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`
 }
+
+// 回归：非流式客户端走 responses 通道时，桩调用已经被流式翻译层“消费”掉了，
+// collapseChatSseToJson 再也看不到桩 → 必须把 swallowStubs 传下去，否则客户端收到
+// 一个它没有的工具调用，白白空转一轮。
+describe('responses 通道 + 非流式客户端', () => {
+  it('桩调用被折叠吞掉并补上提示句', async () => {
+    const upstream = sseResponse([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const translated = new Response(
+      upstream.body!.pipeThrough(createResponsesToChatStream('muse', false, {}, new Set())),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    )
+    const collapsed = await collapseChatSseToJson(translated, 'muse', true, {}, new Set(['bash', 'read']))
+    const payload = (await collapsed.json()) as {
+      choices: Array<{ message: Record<string, unknown>; finish_reason: string }>
+    }
+    expect(payload.choices[0].message.tool_calls).toBeUndefined()
+    expect(payload.choices[0].message.content).toBe(STUB_SWALLOW_NOTE)
+    expect(payload.choices[0].finish_reason).toBe('stop')
+  })
+})
 
 describe('resolveOpenCodeUrls', () => {
   it('兼容换行/逗号/空格分隔并去重', () => {
@@ -52,7 +77,7 @@ describe('isOpenCodeProvider / filterOpenCodeModels', () => {
 describe('proxyOpenCodeRequest: chat 路径', () => {
   it('无 key 无镜像时走官方匿名兜底（Bearer public）', async () => {
     const seenAuth: string[] = []
-    const fetcher = async (url: string | URL, init?: RequestInit) => {
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
       seenAuth.push(String((init?.headers as Headers).get('Authorization')))
       return sseResponse([chunk('hi'), 'data: [DONE]\n\n'])
     }

@@ -47,7 +47,11 @@ function isPrivateIPv4(host: string): boolean {
 function isPrivateIPv6(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, '').toLowerCase()
   if (h === '::1' || h === '::' || h === '0:0:0:0:0:0:0:1' || h === '0:0:0:0:0:0:0:0') return true
-  if (h.startsWith('fe80') || h.startsWith('fc') || h.startsWith('fd')) return true // link-local / ULA
+  // fe00::/8: 含 link-local fe80::/10 与 site-local fec0::/10；全局单播在 2000::/3，
+  // 不在 fe00::/8 内，所以按首字节整段拦截
+  if (h.startsWith('fe') || h.startsWith('fc') || h.startsWith('fd')) return true
+  // 6to4 (2002::/16) 与 NAT64 (64:ff9b::/96) 都能内嵌 IPv4，已弃用前缀统一拦截
+  if (h.startsWith('2002:') || h.startsWith('64:ff9b:')) return true
   // IPv4-mapped IPv6: ::ffff:w.x.y.z 或 ::ffff:hex:hex (WHATWG URL 规范化产物)
   if (h.startsWith('::ffff:') || h.startsWith('0:0:0:0:0:ffff:')) {
     const rest = h.replace(/^(0:0:0:0:0:ffff:|::ffff:)/, '')
@@ -88,7 +92,6 @@ export function checkSafeUpstreamUrl(url: string): string | null {
   }
   return null
 }
-
 /**
  * 将 string[] 或正规对象数组统一转换为正规对象数组
  * 例: ["k1","k2"] → [{key:"k1",enabled:true},{key:"k2",enabled:true}]
@@ -114,14 +117,18 @@ export function findInvalidModelId(items: unknown): string | null {
   if (!Array.isArray(items)) return null
   for (const item of items) {
     const raw = typeof item === 'string' ? item : (item as { id?: unknown } | null)?.id
-    const id = String(raw ?? '')
-    if (!MODEL_ID_RE.test(id)) return id
+    // 非字符串 id(数字等)同样拒绝：落库后 m.id === modelId 永不匹配，模型静默 404
+    if (typeof raw !== 'string' || !MODEL_ID_RE.test(raw)) return String(raw ?? '')
   }
   return null
 }
 
 const invalidModelMessage = (id: string) =>
   `模型 ID "${id.slice(0, 64)}" 含非法字符，仅允许字母、数字与 . _ : / -`
+
+/** apiType 是二值枚举：非法值会让存储里留下永远不被解释的配置 */
+const isApiType = (value: unknown): value is 'openai' | 'anthropic' =>
+  value === 'openai' || value === 'anthropic'
 
 export async function handleStatus(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
@@ -184,6 +191,14 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: invalidModelMessage(badModel) }, 400)
   }
 
+  // 与 update 路径一致地拒绝非法值为，而不是静默地把它写成默认值
+  if (body.apiType !== undefined && !isApiType(body.apiType)) {
+    return c.json<ApiResponse>({ success: false, message: "apiType 只能是 'openai' 或 'anthropic'" }, 400)
+  }
+  if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+    return c.json<ApiResponse>({ success: false, message: 'enabled 必须是布尔值' }, 400)
+  }
+
   const now = new Date().toISOString()
   const provider: Provider = {
     id: body.id,
@@ -194,7 +209,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     models: body.models
       ? normalizeArray(body.models, (m) => ({ id: m, enabled: true }))
       : [],
-    enabled: body.enabled !== undefined ? body.enabled : true,
+    enabled: body.enabled ?? true,
     createdAt: now,
     updatedAt: now,
   }
@@ -217,11 +232,22 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
     }
     updates.baseUrl = body.baseUrl.replace(/\/$/, '')
   }
-  if (body.apiType !== undefined) updates.apiType = body.apiType
-if (body.apiKeys !== undefined) {
+  if (body.apiType !== undefined) {
+    if (!isApiType(body.apiType)) {
+      return c.json<ApiResponse>({ success: false, message: "apiType 只能是 'openai' 或 'anthropic'" }, 400)
+    }
+    updates.apiType = body.apiType
+  }
+  if (body.apiKeys !== undefined) {
     updates.apiKeys = normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true }))
   }
-  if (body.enabled !== undefined) updates.enabled = body.enabled
+  if (body.enabled !== undefined) {
+    // 字符串 "false" 是 truthy: 静默落库会让"停用"看起来成功但实际仍生效
+    if (typeof body.enabled !== 'boolean') {
+      return c.json<ApiResponse>({ success: false, message: 'enabled 必须为布尔值' }, 400)
+    }
+    updates.enabled = body.enabled
+  }
   if (body.models !== undefined) {
     const badModel = findInvalidModelId(body.models)
     if (badModel !== null) {
@@ -398,12 +424,13 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
 
 export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
   const keys = await getProxyKeys(c.env)
-  const maskedKeys = keys.map((k) => ({
-    ...k,
-    key: k.key.length > 12
-      ? k.key.substring(0, 8) + '****' + k.key.substring(k.key.length - 4)
-      : k.key,
-  }))
+  const maskedKeys = keys.map((k) => {
+    const full = String(k.key ?? '')
+    return {
+      ...k,
+      key: full.length > 12 ? `${full.substring(0, 8)}****${full.substring(full.length - 4)}` : full,
+    }
+  })
   return c.json<ApiResponse>({ success: true, data: maskedKeys })
 }
 
@@ -450,7 +477,13 @@ export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<{ enabled?: boolean }>()
   const updates: Partial<import('./types').ProxyKey> = {}
-  if (body.enabled !== undefined) updates.enabled = body.enabled
+  if (body.enabled !== undefined) {
+    // 字符串 "false" 是 truthy: 静默落库会让"吊销"看起来成功但 Key 仍可用
+    if (typeof body.enabled !== 'boolean') {
+      return c.json<ApiResponse>({ success: false, message: 'enabled 必须为布尔值' }, 400)
+    }
+    updates.enabled = body.enabled
+  }
   const updated = await updateProxyKey(c.env, id, updates)
   if (!updated) {
     return c.json<ApiResponse>({ success: false, message: '转发 Key 不存在' }, 404)

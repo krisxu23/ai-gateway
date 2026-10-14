@@ -342,7 +342,7 @@ function findSseBoundary(buf: string): { index: number; length: number } | null 
  * swallowStubs 为 true 时(客户端原本零 tools): 启用按名过滤 bash/read 桩,
  * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
  */
-async function collapseChatSseToJson(
+export async function collapseChatSseToJson(
   response: Response,
   model: string,
   swallowStubs = false,
@@ -356,12 +356,12 @@ async function collapseChatSseToJson(
   const toolCalls: Array<Record<string, unknown>> = []
   const argBufs: string[] = []
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  for (const chunk of normalized.split('\n\n')) {
+  outer: for (const chunk of normalized.split('\n\n')) {
     for (const rawLine of chunk.split('\n')) {
       const line = rawLine.trim()
       if (!line.startsWith('data:')) continue
       const data = line.slice(5).trim()
-      if (data === '[DONE]') break
+      if (data === '[DONE]') break outer
       let evt: Record<string, unknown>
       try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
       const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
@@ -476,7 +476,9 @@ function createStubSwallowingChatStream(
     try {
       evt = JSON.parse(data) as Record<string, unknown>
     } catch {
-      return data // 非 JSON 行原样透传
+      // 非 JSON 载荷(截断的半截 JSON / 异常格式)直接丢弃: 客户端无法解析,
+      // 原样透传只会让下游解析报错
+      return null
     }
     const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
     if (choice) {
@@ -768,7 +770,15 @@ async function proxyOpenCodeResponses(
     const translatedHeaders = new Headers(response.headers)
     translatedHeaders.delete('content-encoding')
     translatedHeaders.delete('content-length')
-    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly, back, injectedStubs)), {
+    // 非流式客户端下面还要再把 SSE 折叠回 JSON, 由折叠那一步吞桩并补
+    // STUB_SWALLOW_NOTE(流式路径自己吞掉, 没有折叠步骤可补提示句), 所以这里
+    // 先让桩调用穿过流式翻译。
+    const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(
+      model,
+      clientWantsStream && stubOnly,
+      back,
+      clientWantsStream ? injectedStubs : new Set<string>()
+    )), {
       status: response.status,
       statusText: response.statusText,
       headers: translatedHeaders,
@@ -878,7 +888,8 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
       if (response.ok) return passthroughOk(response)
 
       officialFailure = await storeFailure(response)
-      if (response.status !== 401 && response.status !== 403 && response.status !== 429) break
+      // 5xx 也换下一个 Key: 单个 Key 的上游抖动/过载不该让官方线路整体放弃
+      if (response.status < 500 && response.status !== 401 && response.status !== 403 && response.status !== 429) break
     } catch (error) {
       lastTransportError = error
       break

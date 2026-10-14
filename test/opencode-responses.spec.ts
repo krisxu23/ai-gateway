@@ -361,4 +361,23 @@ describe('createResponsesToChatStream', () => {
     const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
     expect(out).toContain('"content":"compact"')
   })
+
+  // 回归：收尾兜底曾硬编码 length，把已下发的工具调用说成“截断”，agent 客户端会丢弃调用
+  it('已发出工具调用后上游断开: 收尾块记为 tool_calls', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"tool_calls"')
+    expect(out).not.toContain('"finish_reason":"length"')
+  })
+
+  // 回归：什么都没下发时上游就断开（空回复）不是截断
+  it('上游空流断开: 收尾块记为 stop', async () => {
+    const upstream = sseChunks(['data: {"type":"response.created","response":{}}\n\n'])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"stop"')
+    expect(out).not.toContain('"finish_reason":"length"')
+  })
 })

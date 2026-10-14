@@ -116,6 +116,25 @@ async function persistHealth(env: Env, providerId: string, health: HealthMap): P
   }
 }
 
+/**
+ * 读一次上游错误体，返回原文与解析结果（非 JSON 时为 null）。
+ * 必须先 text() 再 JSON.parse：response.json() 失败时 body 已被消费，
+ * 再调 text() 会抛 "Body is unusable"，把上游错误变成误导读数。
+ */
+/** Response 构造器禁止 101/204/205/304 带 body：越界状态码一律回落 502 */
+const clampErrorStatus = (status: number): number => (status >= 400 && status <= 599 ? status : 502)
+
+async function readErrorBody(response: Response): Promise<{ raw: string; json: Record<string, unknown> | null }> {
+  const raw = await response.text().catch(() => '')
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') return { raw, json: parsed as Record<string, unknown> }
+  } catch {
+    // 非 JSON 错误体（HTML/纯文本）：按原文处理
+  }
+  return { raw, json: null }
+}
+
 /** 解析模型 ID，如 "deepseek/deepseek-chat" → { providerId, modelId } */
 function parseModelId(model: string): { providerId: string; modelId: string } | null {
   const slashIndex = model.indexOf('/')
@@ -181,16 +200,9 @@ export async function testModelConnection(
       return { success: true, message: '连接成功', statusCode: response.status }
     }
 
-    // 先取 text 再尝试 JSON.parse：response.json() 失败时 body 已被消费，
-    // 再调 text() 会抛 "Body is unusable"，把上游错误变成误导读数
-    const rawError = await response.text()
-    let errorBody = rawError
-    try {
-      const errorData = JSON.parse(rawError) as { error?: { message?: string } }
-      errorBody = errorData?.error?.message || rawError
-    } catch {
-      // 非 JSON 错误体（HTML/纯文本）：原样使用
-    }
+    const { raw, json } = await readErrorBody(response)
+    const detail = (json?.error as { message?: unknown } | undefined)?.message
+    const errorBody = typeof detail === 'string' && detail ? detail : raw
 
     return {
       success: false,
@@ -389,6 +401,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
             await persistHealth(c.env, providerId, healthData)
           }
 
+          // 上一个 Key 的失败响应体已无用，立即取消，避免其流悬挂到请求结束
+          await dropLastError()
+
           // 只透传 Content-Type 与 Cache-Control：上游的 x-ratelimit-* 等头部对
           // OpenAI 客户端无用；body 未做任何解码，因此不能带 content-encoding /
           // content-length（未转发客户端的 Accept-Encoding，上游一般返回未压缩体）
@@ -418,15 +433,11 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         }
 
         // 其他错误（400/404 等）直接返回
-        // 同上：先读 text 再解析，避免二次读取抛错把上游 4xx 改写成网关 500
-        const rawError = await response.text()
-        let errorData: Record<string, unknown>
-        try {
-          errorData = JSON.parse(rawError) as Record<string, unknown>
-        } catch {
-          errorData = { error: { message: rawError.substring(0, 500) } }
-        }
-        return c.json(errorData, response.status as Parameters<typeof c.json>[1])
+        const { raw, json } = await readErrorBody(response)
+        return c.json(
+          json ?? { error: { message: raw.substring(0, 500) } },
+          clampErrorStatus(response.status) as Parameters<typeof c.json>[1]
+        )
       } catch (err) {
         // 客户端主动断开：不再尝试其它 key，也不把这次中断算作 key 失败
         if (c.req.raw.signal.aborted) {
@@ -456,14 +467,14 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // 所有 key 均失败
     if (lastError) {
-      const errorBody = await lastError.text().catch(() => '所有 API Key 均失败')
+      const { raw } = await readErrorBody(lastError)
       return c.json({
         error: {
           message: `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
           type: 'key_exhausted',
-          detail: errorBody.substring(0, 500),
+          detail: (raw || '所有 API Key 均失败').substring(0, 500),
         },
-      }, (lastError.status || 502) as Parameters<typeof c.json>[1])
+      }, clampErrorStatus(lastError.status) as Parameters<typeof c.json>[1])
     }
 
     return c.json({

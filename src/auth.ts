@@ -126,7 +126,8 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
   setCookie(c, 'session_id', sessionId, {
     httpOnly: true,
     secure: true,
-    sameSite: 'Lax',
+    // Strict: 跨站顶层导航不带 session cookie（挡住 <a href="/admin/logout"> 式登出 CSRF）
+    sameSite: 'Strict',
     path: '/',
     maxAge: SESSION_TTL,
   })

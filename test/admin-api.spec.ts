@@ -1,9 +1,9 @@
 // 管理台 API 的端到端行为测试（真 Hono 路由 + 内存 KV 桩）。
 // 覆盖：登录限流、转发 Key 过期时间、模型 ID 校验、列表并发写、吊销与脏数据容错。
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { Hono } from 'hono'
 import { handleLogin } from '../src/auth'
-import { handleCreateProvider, handleCreateProxyKey } from '../src/admin'
+import { handleCreateProvider, handleCreateProxyKey, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
 import { addProxyKey, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
 import { modelRowHTML } from '../src/pages'
@@ -40,6 +40,35 @@ describe('storage 脏数据容错', () => {
     await env.KV.put('providers', '42')
     await expect(getProxyKeys(env)).resolves.toEqual([])
     await expect(getProviders(env)).resolves.toEqual([])
+  })
+})
+
+// 条目/字段形状畸形（历史版本或人工写 KV）曾让首页、管理台与 /v1/models 全部 500。
+// 用 vi.resetModules() 取一个全新的 storage 模块实例，避开上面用例已经填好的模块级缓存。
+describe('storage 字段形状归一化', () => {
+  it('丢弃非对象条目，并把被依赖的字段补成正确类型', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const env = makeEnv()
+    await env.KV.put('proxy:keys', JSON.stringify([null, 42, { id: 'k1', key: 123 }, { id: 'k2', name: null }]))
+    await env.KV.put('providers', JSON.stringify([
+      null,
+      { id: 'p1', name: null, models: null, apiKeys: 'nope' },
+      { id: 'p2', name: 'P2', models: [null, { id: 'm1', enabled: true }], apiKeys: [null, { key: 'sk', enabled: true }] },
+    ]))
+
+    const keys = await storage.getProxyKeys(env)
+    expect(keys.map((k) => k.id)).toEqual(['k1', 'k2'])
+    expect(keys[0].key).toBe('123') // k.key.length / substring 不再抛
+    expect(keys[1].name).toBe('')
+
+    const providers = await storage.getProviders(env)
+    expect(providers.map((p) => p.id)).toEqual(['p1', 'p2'])
+    expect(providers[0].name).toBe('')
+    expect(providers[0].models).toEqual([]) // models: null → []
+    expect(providers[0].apiKeys).toEqual([]) // apiKeys: 'nope' → []
+    expect(providers[1].models).toEqual([{ id: 'm1', enabled: true }])
+    expect(providers[1].apiKeys).toEqual([{ key: 'sk', enabled: true }])
   })
 })
 
@@ -132,6 +161,26 @@ describe('提供商模型 ID 校验', () => {
     }), makeEnv())
     expect(res.status).toBe(201)
   })
+
+  it('数字 id 也被拒绝（落库后 m.id === modelId 永远匹配不上）', async () => {
+    const res = await app.request('/admin/api/providers', jsonInit({
+      id: 'p5',
+      name: 'P5',
+      baseUrl: 'https://api.example.com/v1',
+      models: [{ id: 123, enabled: true }],
+    }), makeEnv())
+    expect(res.status).toBe(400)
+  })
+
+  it('非法 apiType 返回 400', async () => {
+    const res = await app.request('/admin/api/providers', jsonInit({
+      id: 'p6',
+      name: 'P6',
+      baseUrl: 'https://api.example.com/v1',
+      apiType: 'Anthropic-ish',
+    }), makeEnv())
+    expect(res.status).toBe(400)
+  })
 })
 
 describe('转发 Key 列表写入', () => {
@@ -189,6 +238,45 @@ describe('提供商列表条目校验', () => {
       models: [null, 'ok-model'],
     }), makeEnv())
     expect(res.status).toBe(400)
+  })
+})
+
+// 回归：body 里的 enabled 必须真的是 boolean，"false"/0 等曾被当真值静默启用
+describe('enabled 字段类型校验', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.patch('/admin/api/proxy-keys/:id', handleUpdateProxyKey)
+  app.put('/admin/api/providers/:id', handleUpdateProvider)
+  app.post('/admin/api/providers', handleCreateProvider)
+
+  const send = (env: Env, path: string, method: string, body: string) =>
+    app.request(path, { method, headers: { 'Content-Type': 'application/json' }, body }, env)
+
+  it('转发 Key 的 enabled: "false" 返回 400（不再静默当作启用）', async () => {
+    const res = await send(makeEnv(), '/admin/api/proxy-keys/k1', 'PATCH', JSON.stringify({ enabled: 'false' }))
+    expect(res.status).toBe(400)
+  })
+
+  it('提供商的 enabled: 0 返回 400', async () => {
+    const res = await send(makeEnv(), '/admin/api/providers/p1', 'PUT', JSON.stringify({ enabled: 0 }))
+    expect(res.status).toBe(400)
+  })
+
+  it('新建提供商时 enabled: "false" 也返回 400（不再静默启用）', async () => {
+    const res = await send(makeEnv(), '/admin/api/providers', 'POST', JSON.stringify({
+      id: 'p9',
+      name: 'P9',
+      baseUrl: 'https://api.example.com/v1',
+      enabled: 'false',
+    }))
+    expect(res.status).toBe(400)
+  })
+
+  it('enabled: false 正常保存', async () => {
+    const env = makeEnv()
+    await addProxyKey(env, proxyKey('k1', 'sk_cf_a'))
+    const res = await send(env, '/admin/api/proxy-keys/k1', 'PATCH', JSON.stringify({ enabled: false }))
+    expect(res.status).toBe(200)
+    expect(await validateProxyKey(env, 'sk_cf_a')).toBe(false)
   })
 })
 

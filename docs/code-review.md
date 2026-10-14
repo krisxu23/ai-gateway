@@ -315,3 +315,57 @@ responsesToChatBody(body as unknown as Parameters<...>[0], 'muse', true)
 ### 测试环境需知（避免误判为缺陷）
 
 `src/storage.ts` 的内存缓存是**模块级、按 KV key 名索引**的（生产环境一个 isolate 只对应一个 KV namespace，语义正确）。测试里多个 `makeEnv()` 共用该缓存，会出现跨用例「看到别的 env 的数据」的现象；因此用例应**按 id 查找**而不是取 `list[0]`（`test/admin-api.spec.ts` 中已注明）。
+
+## 十二、第四轮修复记录（两路独立审查 + 差异复核）
+
+第四轮采用两路并行独立审查（R4-A 只审 `src/opencode.ts` + `src/opencode-responses.ts`；R4-B 审其余全部源码与前端内联 JS），随后又对「本轮未提交的 diff」做了一次独立复核（专门找「修复本身引入的回归」）。
+
+### 12.1 已修复
+
+| 编号 | 问题 | 位置 | 处置 |
+| --- | --- | --- | --- |
+| R4-A-1【高】 | 流式翻译的收尾兜底**硬编码** `finish_reason: 'length'`：上游在 `response.completed` 之前断开时，已经下发的工具调用被报成「被截断」，agent 客户端会丢弃调用 | `src/opencode-responses.ts` flush | 改为按状态判定：已下发工具调用 → `tool_calls`；只下发过正文 → `length`；什么都没下发（空流）→ `stop` |
+| R4-A-3【中】 | 同上：空流（200 + `text/event-stream` 但无内容）也被报成 `length` | 同上 | 同上 |
+| R4-A-4【中】 | 桩吞噬流的收尾把**半截 JSON** 原样透传（与 responses 路径「直接丢弃」不一致），客户端会拿到非法参数 | `src/opencode.ts` `createStubSwallowingChatStream` | 解析失败的 `data:` 行一律丢弃 |
+| R4-A-7【低】 | 官方多 Key 轮换遇到 5xx 就 `break`，不再尝试后面的 Key | `src/opencode.ts` 官方分支 | 仅 401/403/429 视为 Key 问题，其余状态码继续轮换 |
+| R4-A-9【低】 | `collapseChatSseToJson` 遇到 `[DONE]` 只 `break` 内层循环，尾随行仍被解析 | `src/opencode.ts` | `[DONE]` 终止整个解析 |
+| R4-A-11【低】 | responses 通道 + **非流式**客户端：桩调用已被流式翻译层消费，折叠阶段无桩可识别 → 客户端收到一个它没有的工具调用（白跑一轮） | `src/opencode.ts` `proxyOpenCodeResponses` | 折叠时把 `swallowStubs` 一并传入 |
+| R4-B-M1【中】 | `models` / `apiKeys` / `proxy:keys` 数组里的脏元素（`null`、字段类型错）会让首页、管理台、`/v1/models`、转发**全部 500**，管理员无法通过界面自救 | 12 处读取点 | 在 `storage.ts` 读取出口统一归一化 `sanitizeList`：丢弃非对象条目，`name`/`key` 强制 `String`，`models`/`apiKeys` 非数组归零 |
+| R4-B-M2【中】 | `enabled` 缺布尔校验：`{"enabled":"false"}` 是 truthy，**吊销静默失效**且界面仍显示「已启用」 | `src/admin.ts` create/update 三处 | 非布尔值一律 400 |
+| R4-B-L1【低】 | `GET /admin/logout` 可被跨站顶层导航触发（Lax 会随导航发送 cookie） | `src/auth.ts` | 会话 cookie 改 `SameSite=Strict` |
+| R4-B-L2【低】 | 成功分支返回时未取消上一次失败响应的 body | `src/proxy.ts` | 成功分支返回前 `dropLastError()` |
+| R4-B-L3【低】 | 上游返回 101/204/205/304 时 `c.json(body, status)` 会抛错，被吞成 500，掩盖真实状态码 | `src/proxy.ts` | `clampErrorStatus` 把状态码限定在 400–599，否则回落 502 |
+| R4-B-L4【低】 | SSRF 私有地址覆盖不全：`fe00::/8`、`2002::/16`、`64:ff9b::/96` 未拦 | `src/admin.ts` `isPrivateIPv6` | 补上前缀（纵深防御） |
+| R4-B-L5【低】 | 非字符串模型 ID 能通过校验并落库，之后 `m.id === modelId` 永不匹配 → 该模型永远不可用 | `src/admin.ts` `findInvalidModelId` | 非字符串直接判非法 |
+| R4-B-L8【低】 | `apiType` 取值不校验，存储里会留下永远不被解释的枚举值 | `src/admin.ts` | create/update 都限定 `'openai' \| 'anthropic'` |
+| R4-B-L11【低】 | `seedInitialData` 绕过写队列，冷启动 seed 可能与管理员写入互相覆盖 | `src/storage.ts` | 初始化写入走 `serialized()` |
+| R4-B-L12【低】 | 管理页把完整转发 Key 内联进 HTML 却不带 `Cache-Control`，Key 会进浏览器磁盘缓存 | `src/pages.ts` | `renderAdminPage` 加 `Cache-Control: no-store` |
+
+### 12.2 复核后有意保留（附理由）
+
+| 编号 | 问题 | 保留理由 |
+| --- | --- | --- |
+| R4-A-2【中】 | 工具调用「已开始」即报 `tool_calls`，参数被 `max_output_tokens` 截断时可能给出半截 JSON；`response.incomplete` 的原因未读取 | 上游是否发 `function_call_arguments.done` 未验证；要精确区分需引入参数完整性状态机并改变响应语义，属改动伪装链路可观测行为的范围 |
+| R4-A-5【低】 | 参数增量先于函数名到达时，桩的前缀会泄漏 | 上游实测为 name-first，无法复现 |
+| R4-A-6【低】 | 会话种子取「首条 user 文本」，不同客户端首条消息相同时会共用同一个 `ses_` | 属伪装核心的会话派生逻辑（硬性约束不动），已加 `shortcut:` 注释说明限制 |
+| R4-A-8【低】 | 匿名兜底不含 429 | 429 不是鉴权失败，重试同一端点收益存疑 |
+| R4-A-10【低】 | `emitLine` 对非 `data:` 行即刻输出，可能改变 SSE 事件分组 | 仅影响客户端普遍忽略的字段分组 |
+| R4-B-L6【低】 | `normalizeArray` 保留数组条目 | 现存危害为零（下游 `k?.enabled` 与 `findInvalidModelId` 各自兜住） |
+| R4-B-L7【低】 | 内联 `onclick` 仍把 `p.id` / `k.id` 拼进 JS 字符串（模型 ID 已改 `data-mid`） | 写入侧有 `/^[A-Za-z0-9._-]+$/` 白名单与 `crypto.randomUUID()`，不可注入；不为不可利用路径重构 15 处模板 |
+| R4-B-L9【低】 | 全局 `onError` 把所有 `SyntaxError` 映射 400 | 目前只有 `c.req.json()` 会抛 `SyntaxError` |
+| R4-B-L10【低】 | 转发 Key 用字符串 `===` 比较 | 32 位 hex 随机值 + 公网抖动使时序攻击不可行；复用 `auth.ts` 会形成 `storage → auth` 循环依赖 |
+| R4-B-L13【低】 | 首页回显 `Host` 头 | 已 `escapePageHtml`，无 XSS；仅在 Host 被伪造时显示可控字符串 |
+
+### 12.3 审查方已排除的误报（本轮新增）
+
+`/admin` 无鉴权绕过（实测 302 → `/admin/login`）、`securityHeaders` 在 `next()` 之后 `c.header()` 生效、后台内联 `<script>` 无未转义插值、CORS/CSRF 核心防线成立、`writeHealth` 的 `{...null}` 已被消毒、错误体二次读取问题已消除、`cloneHealth` 确实隔离了缓存引用、登录限流不会永久锁死管理员、`timingSafeEqual` 降级实现正确、`Bearer ` 前缀无绕过、opencode 流式响应头已剥离 `content-encoding`/`content-length`、`typeof ttl === 'number'` 原型链防护有效。
+
+## 十三、第四轮验证记录（修复后）
+
+| 命令 | 结果 |
+| --- | --- |
+| `npx tsc --noEmit` | 零错误 |
+| `npx vitest run` | 4 文件 / **77 用例**全过 |
+| `npm run bundle` | `worker.js` 159485 B，与 `src/` 一致 |
+
+本轮新增回归用例 10 条：收尾块 `finish_reason` 判定 2 条（已下发工具调用 → `tool_calls`、空流 → `stop`）、KV 字段形状归一化 1 条、`enabled` 布尔校验 4 条（Key 传 `"false"`、提供商传 `0`、新建传 `"false"`、合法 `false` 正常停用）、非法 `apiType` 1 条、数字模型 ID 1 条、responses 通道 + 非流式客户端的桩吞噬 1 条（覆盖 R4-A-11 的回归）。

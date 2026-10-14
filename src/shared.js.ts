@@ -12,9 +12,6 @@ export function renderSiteFooter(title: string): string {
 // 共享 JS 工具函数 — 注入到后台页面的 <script> 块中
 export const SHARED_JS = `
 // ── 工具函数 ──
-function normalizeUrl(url) {
-    return url.replace(/\\/$/, '')
-  }
 function escapeHtml(value) {
   return String(value == null ? '' : value)
     .replace(/&/g, '&amp;')
