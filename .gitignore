@@ -6,3 +6,5 @@ dist/
 worker-configuration.d.ts
 .zcode/
 docs/
+# 临时审查导出文件
+.review-*.md
