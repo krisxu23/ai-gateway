@@ -73,11 +73,32 @@ function isPrivateIPv6(host: string): boolean {
     }
     return true // 无法安全还原的映射地址统一拦截
   }
+  // IPv4-compatible IPv6: ::w.x.y.z（WHATWG URL 规范化成 ::7f00:1 这类形态）。
+  // 不属于 ::ffff: 映射段，前缀判定漏掉，但同样能指向回环/内网
+  if (h.startsWith('::')) {
+    const rest = h.slice(2)
+    if (rest.includes('.')) return isPrivateIPv4(rest)
+    const parts = rest.split(':')
+    if (parts.length === 2) {
+      const p1 = parseInt(parts[0], 16)
+      const p2 = parseInt(parts[1], 16)
+      if (!Number.isNaN(p1) && !Number.isNaN(p2)) {
+        const a = (p1 >> 8) & 0xff
+        const b = p1 & 0xff
+        const c = (p2 >> 8) & 0xff
+        const d = p2 & 0xff
+        return isPrivateIPv4(`${a}.${b}.${c}.${d}`)
+      }
+    }
+  }
   return false
 }
 
 /** 校验上游 url；不安全时返回错误消息，安全时返回 null。 */
 export function checkSafeUpstreamUrl(url: string): string | null {
+  // 类型先判：new URL() 会把任意值 ToString（数组/对象也能“通过”格式校验），
+  // 随后调用方的 .replace() 会抛 TypeError，把本应 400 的输入变成 500
+  if (typeof url !== 'string') return 'url 格式无效'
   let u: URL
   try {
     u = new URL(url)
@@ -182,11 +203,13 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     body.baseUrl = OPENCODE_DEFAULT_URL
   }
 
-  if (!body.id || !body.name || !body.baseUrl) {
-    return c.json<ApiResponse>({ success: false, message: 'id、name、baseUrl 为必填项' }, 400)
+  // 类型一并校验：name 传数组/对象时会被原样落库，列表页渲染出 "[object Object]"
+  if (typeof body.id !== 'string' || typeof body.name !== 'string' || typeof body.baseUrl !== 'string'
+    || !body.id || !body.name || !body.baseUrl) {
+    return c.json<ApiResponse>({ success: false, message: 'id、name、baseUrl 为必填项且必须是字符串' }, 400)
   }
 
-  if (typeof body.id !== 'string' || !/^[A-Za-z0-9._-]+$/.test(body.id)) {
+  if (!/^[A-Za-z0-9._-]+$/.test(body.id)) {
     return c.json<ApiResponse>({ success: false, message: '提供商 id 只能包含字母、数字、点、下划线和连字符' }, 400)
   }
 
@@ -238,7 +261,12 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
   const body = await readJsonBody<UpdateProviderRequest>(c)
 
   const updates: Partial<Provider> = {}
-  if (body.name !== undefined) updates.name = body.name
+  if (body.name !== undefined) {
+    if (typeof body.name !== 'string') {
+      return c.json<ApiResponse>({ success: false, message: 'name 必须是字符串' }, 400)
+    }
+    updates.name = body.name
+  }
   if (body.baseUrl !== undefined) {
     const ssrfError = checkSafeUpstreamUrl(body.baseUrl)
     if (ssrfError) {

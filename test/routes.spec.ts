@@ -6,7 +6,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { clearHealthCache, handleModels, handleProxy } from '../src/proxy'
 import { adminAuthMiddleware, handleLogin, handleLogout, proxyKeyAuthMiddleware } from '../src/auth'
-import { handleDeleteProvider, handleGetProxyKeys, handleStatus } from '../src/admin'
+import { handleCreateProvider, handleDeleteProvider, handleGetProxyKeys, handleStatus, handleUpdateProvider } from '../src/admin'
 import {
   addProxyKey,
   clearListCache,
@@ -67,6 +67,8 @@ function makeApp() {
   app.post('/admin/login', handleLogin)
   app.get('/admin/logout', handleLogout)
   app.get('/admin/api/status', handleStatus)
+  app.post('/admin/api/providers', handleCreateProvider)
+  app.put('/admin/api/providers/:id', handleUpdateProvider)
   app.get('/admin/api/proxy-keys', handleGetProxyKeys)
   app.delete('/admin/api/providers/:id', handleDeleteProvider)
   return app
@@ -242,13 +244,17 @@ describe('鉴权链', () => {
     const app = makeApp()
 
     expect((await app.request('/v1/models', {}, env)).status).toBe(401)
-    for (const auth of [`Bearer `, 'Bearer sk_cf_wrong', 'Basic abc', `bearer ${VALID_KEY}`]) {
+    for (const auth of [`Bearer `, 'Bearer sk_cf_wrong', 'Basic abc', 'bearer sk_cf_wrong']) {
       const res = await app.request('/v1/models', { headers: { Authorization: auth } }, env)
       expect(res.status, auth).toBe(401)
     }
 
     await seedValidKey(env)
-    expect((await app.request('/v1/models', { headers: { Authorization: `Bearer ${VALID_KEY}` } }, env)).status).toBe(200)
+    // scheme 大小写不敏感（RFC 6750）：三种写法都要放行
+    for (const auth of [`Bearer ${VALID_KEY}`, `bearer ${VALID_KEY}`, `BEARER ${VALID_KEY}`]) {
+      const res = await app.request('/v1/models', { headers: { Authorization: auth } }, env)
+      expect(res.status, auth).toBe(200)
+    }
   })
 
   it('管理台：无 Cookie 时接口 401、页面重定向到登录页，登录页本身放行', async () => {
@@ -375,8 +381,7 @@ describe('app 装配（src/index.ts）', () => {
     expect(badJson.status).toBe(400)
   })
 
-  it('冷启动首个请求会灌入默认 opencode 提供商（seed 中间件只跑一次）', async () => {
-    // seedPromise 是模块级状态：用全新模块实例才能真正验证“首个请求触发 seed”
+  it('冷启动首个请求会灌入默认 opencode 提供商（seed 中间件只跑一次）', async () => {    // seedPromise 是模块级状态：用全新模块实例才能真正验证“首个请求触发 seed”
     vi.resetModules()
     const freshApp = (await import('../src/index')).default
     const env = makeEnv()
@@ -386,6 +391,41 @@ describe('app 装配（src/index.ts）', () => {
     await expect(getProviders(env)).resolves.toHaveLength(1)
     const providers = await getProviders(env)
     expect(providers[0].id).toBe('opencode')
+  })
+
+  it('种子数据写入失败不会让请求 500（尽力而为，下次请求重试）', async () => {
+    vi.resetModules()
+    const freshApp = (await import('../src/index')).default
+    const failingKv = {
+      get: async () => null,
+      put: async () => { throw new Error('KV 写入失败') },
+      delete: async () => {},
+    }
+    const env = makeEnv({ KV: failingKv as unknown as KVNamespace })
+    expect((await freshApp.request('/', {}, env)).status).toBe(200)
+  })
+
+  it('name / baseUrl 传非字符串时返回 400 而不是 500', async () => {
+    const env = makeEnv()
+    const app = makeApp()
+    const auth = await adminHeaders(env)
+    const jsonHeaders = { ...auth, 'Content-Type': 'application/json' }
+    const post = (body: unknown) => app.request('/admin/api/providers', {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    }, env)
+
+    // baseUrl 传数组：new URL() 会 ToString 成合法地址，随后 .replace() 抛 TypeError
+    expect((await post({ id: 'p9', name: 'P9', baseUrl: ['https://up.example.com'] })).status).toBe(400)
+    // name 传对象：过去会原样落库，列表页渲染出 "[object Object]"
+    expect((await post({ id: 'p9', name: { a: 1 }, baseUrl: 'https://up.example.com' })).status).toBe(400)
+    // 更新路径同样拒非法类型
+    expect((await app.request('/admin/api/providers/p1', {
+      method: 'PUT',
+      headers: jsonHeaders,
+      body: JSON.stringify({ name: [1] }),
+    }, env)).status).toBe(400)
   })
 })
 

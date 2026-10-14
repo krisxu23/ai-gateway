@@ -569,7 +569,9 @@ async function addAllUpstream(panelId) {
   const ids = Array.from(grid.querySelectorAll('.mdl-item .fx1'))
     .map(s => s.textContent.trim()).filter(Boolean)
   if (!ids.length) { toast('发现列表为空', 'error'); return }
-  const existing = {}
+  // 无原型对象：键是模型 id，允许下划线，"__proto__" 这类键会使普通对象
+  // 的赋值变成改原型，从而静默漏加模型
+  const existing = Object.create(null)
   getMdl(id).forEach(m => { existing[m.id] = true })
   let added = 0
   ids.forEach(mid => {
@@ -577,8 +579,9 @@ async function addAllUpstream(panelId) {
     if (!existing[mid]) { existing[mid] = true; addMdlToEdit(id, mid); added++ }
   })
   if (!added) { toast('列表内模型均已存在，无需入库', 'error'); return }
-  // 先保存再报成功：save 校验失败时会自己 toast，先报“已加入”会误导
-  if (await save(id)) toast('已加入 ' + added + ' 个模型并保存成功')
+  // 先报进度再保存：save 成功后自己 toast 并 reload（reload 会清掉这条提示）
+  toast('已加入 ' + added + ' 个模型，正在保存…')
+  await save(id)
 }
 
 // 关闭可用模型面板（仅隐藏，不清空已获取的模型数据）
@@ -768,7 +771,7 @@ function getMdl(id) {
 async function save(id) {
   const nm = document.getElementById('nm-' + id).value.trim(), url = document.getElementById('url-' + id).value.trim()
   // 与服务端字段校验对齐：名称/地址清空后保存会让列表页标题变空
-  if (!nm || !url) { toast('请填写名称和 API 地址', 'error'); return }
+  if (!nm || !url) { toast('请填写名称和 API 地址', 'error'); return false }
   const apiType = document.getElementById('at-' + id).value
   const keys = getKeys(id)
   const models = getMdl(id), enabled = document.getElementById('en-' + id).checked
@@ -777,8 +780,9 @@ async function save(id) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name: nm, baseUrl: url, apiType, apiKeys: keys, models, enabled })
   })
-  if (d.success) { toast('已保存', 'success'); location.reload() }
-  else toast(d.message || '保存失败', 'error')
+  if (d.success) { toast('已保存', 'success'); location.reload(); return true }
+  toast(d.message || '保存失败', 'error')
+  return false
 }
 
 async function del(id) {

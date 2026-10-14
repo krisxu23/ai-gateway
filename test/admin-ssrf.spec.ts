@@ -81,4 +81,14 @@ describe('admin: checkSafeUpstreamUrl (SSRF防护)', () => {
     // 局域网 192.168.1.1
     expect(checkSafeUpstreamUrl('https://[::ffff:192.168.1.1]')).toBe('不允许访问私有/回环/链路本地地址')
   })
+
+  it('彻底防御 IPv4-compatible IPv6 变体 (::127.0.0.1 / ::10.x)', () => {
+    // WHATWG URL 会把 [::127.0.0.1] 规范化成 [::7f00:1]
+    expect(checkSafeUpstreamUrl('https://[::127.0.0.1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[::7f00:1]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[::0.0.0.0]')).toBe('不允许访问私有/回环/链路本地地址')
+    expect(checkSafeUpstreamUrl('https://[::10.0.0.1]')).toBe('不允许访问私有/回环/链路本地地址')
+    // 公网地址不能被误拦
+    expect(checkSafeUpstreamUrl('https://[::8.8.8.8]')).toBeNull()
+  })
 })

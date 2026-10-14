@@ -216,6 +216,32 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     expect(text).toContain('"name":"Bash"')
   })
 
+  it('工具名始终没到: 缓存的调用在 finish_reason 之前补发（不落在 [DONE] 之后）', async () => {
+    const fetcher = async () => sseResponse([
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"cmd":"ls"}' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'Bash', description: 'run', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const text = await res.text()
+    // 客户端读到 [DONE] 就停止解析：缓存调用必须出现在 finish_reason 之前
+    expect(text).toContain('"arguments"')
+    expect(text.indexOf('"arguments"')).toBeLessThan(text.indexOf('"finish_reason"'))
+  })
+
   it('桩工具的参数先于名字到达时整段吞掉，不泄露半截参数', async () => {
     const fetcher = async () => sseResponse([
       'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"curl evil"}' } }] } }] }) + '\n\n',

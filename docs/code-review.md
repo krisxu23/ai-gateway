@@ -549,3 +549,43 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 | `npm run bundle` | worker.js 165919 B；与提交版逐字节相同（新增的两个“仅供测试”导出被 tree-shaking 掉，index.ts 的注释改动被 minify 剥离） |
 | 新增用例 | test/routes.spec.ts 21 条（转发链路 6 + 鉴权链 4 + 管理接口 3 + app 装配 4 + 初始化种子 4） |
 | 已知覆盖盲区（有意） | `src/pages.ts` 深度渲染分支、`src/opencode.ts` 镜像失败循环/保活体积上限的直接用例、`testModelConnection`（网络） |
+
+## 二十二、第八轮修复记录（R8-B：全源码对抗性通读）
+
+> 第二路审查（runId `del_mv7ixwbw_ymkv`）做的是「对抗性通读 + 实测」：把 esbuild 打的真实 Hono app 配上内存 KV 桩跑实际请求。基线 HEAD `6b963b6`，报告结论「无高危，无越权、无未转义注入、无鉴权绕过」。下列为处理结果。
+
+### 22.1 已修复（10 项）
+
+| 编号 | 严重度 | 问题 | 位置 | 修法 |
+| --- | --- | --- | --- | --- |
+| R8B-1 | 中 | `baseUrl` / `url` 传数组等非字符串值时 `new URL()` 会 ToString 通过格式校验，随后调用方 `.replace()` 抛 TypeError → 500（实测 4 处入口：创建/更新提供商、test-key、test-model）；`name` 传对象会被原样落库，列表页渲染出 `[object Object]` | src/admin.ts:75（`checkSafeUpstreamUrl`）、:184（必填项）、:243（更新 name） | `checkSafeUpstreamUrl` 开头加 `typeof url !== 'string'` → 一处覆盖 4 个入口；必填项校验加三字段 `typeof === 'string'`；更新路径补 `name` 类型校验（400） |
+| R8B-2 | 中 | 缓存工具调用（name 晚到）的补发写在 `flush()` 里，落在 `finish_reason` 与 `[DONE]` **之后** → 客户端读到 `[DONE]` 就停止解析，补发等于没发；且补发块缺 `id`/`object` 字段 | src/opencode.ts（`createStubSwallowingChatStream`） | 抽出 `flushPendingCalls()`，在 `emitBlock` 遇到含 `finish_reason` 的块时**先**补发再输出该块，`flush()` 保留兜底；补发块补上 `id`/`object` |
+| R8B-3 | 中 | `storeFailure` 在上游声明 `content-length` 超限时既不读也不取消响应体 → 连接挂着不放 | src/opencode.ts:620-627 | 该分支显式 `await response.body?.cancel()` |
+| R8B-4 | 低 | 一键入库的 `if (await save(id))` 恒为假（`save()` 无返回值）→ 成功提示是死代码 | src/pages.ts（内联 JS） | `save()` 成功 `return true`、失败 `return false`；提示改为保存前的进度句（`save` 成功后会自己 toast 并 `reload`） |
+| R8B-5 | 低 | IPv4-compatible IPv6（`[::127.0.0.1]` → 规范化为 `::7f00:1`）不在 `::ffff:` 段，前缀判定漏放；`[::10.x]` 同类 | src/admin.ts（`isPrivateIPv6`） | 新增 `::` 还原最后 32 bit 交给 `isPrivateIPv4` 判定 |
+| R8B-6 | 低 | 健康表 / 一键入库去重表用普通对象字面量且键来自外部字符串：键恰为 `__proto__` 时赋值改写原型而不产生自有属性 → 该 Key 永不降权、「一键入库」静默漏加模型 | src/proxy.ts（`cloneHealth`/`writeHealth`）、src/pages.ts（`existing`） | 三处改为 `Object.create(null)`（并加注释说明原因） |
+| R8B-7 | 低 | 客户端断开（499）分支未取消上一次失败响应体；`readErrorBody` 把上游裸 JSON 数组当错误对象透传（客户端取 `body.error.message` 得 undefined） | src/proxy.ts | 499 分支补 `await dropLastError()`；解析结果排除数组 |
+| R8B-8 | 低 | `Authorization` 的 `Bearer` 前缀大小写敏感，违反 RFC 6750（scheme 大小写不敏感） | src/auth.ts（`proxyKeyAuthMiddleware`） | 改为 `/^bearer\s+(.+)$/i`；空 token 仍由 `validateProxyKey` 判否 |
+| R8B-9 | 低 | 冷启动种子填充失败会 rethrow，把当前请求变成 500 | src/index.ts | 只 `console.warn`（保留 `seedPromise = null` 以便下次重试） |
+| R8B-10 | 低 | 新增用例把「小写 bearer + 有效 Key」写在**尚未灌入有效 Key** 的环节，断言 401 恒成立，等于没测「放宽大小写」这条路径 | test/routes.spec.ts | 401 环节改用无效 Key，灌入有效 Key 后追加 `Bearer`/`bearer`/`BEARER` 三种写法均 200 |
+
+### 22.2 复核后有意保留（2 项）
+
+| 编号 | 问题 | 保留理由 |
+| --- | --- | --- |
+| R8B-11 | `/v1/*` 的 subPath 直接取自 pathname：持转发 Key 者可请求上游同主机的任意路径（如 `/v1/admin`） | 上游主机与所用 API Key 都是管理员自己配置/授权的，转发到同主机等于管理员已授予的能力；`/v1/../x` 这类逃逸在 WHATWG URL 规范化阶段就变成 `/x`，根本不会命中 `/v1/*` 路由（实测 404）。收紧成路径白名单会挡住合法的非标准子路径（如各家的 `/v1/beta/...`） |
+| R8B-12 | 流式与非流式对 `response.incomplete` 的 `finish_reason` 判定不同（非流式仅认 `max_output_tokens`；流式把任何 incomplete 记为 `length`） | 两条链路的数据完整性保证不同：流式开始输出后无法回头补内容，按截断上报更安全；非流式的 output item 天然完整。两者都是前几轮审查后的有意选择，改动会牵动第四/七轮的状态机修复 |
+
+### 22.3 已排除（复核后确认无问题）
+
+`/admin/login` 中间件顺序与登录页放行、provider id 注入、`renderHomePage` 的 `name.charAt(0)`、`sanitizeList` 脏数据容错、`updateProvider` 部分字段更新、`fetchOpenCodeModels` 索引取值、`storeFailure` 二次读取（已修）、`validateProxyKey` 空 token（已修）、`readJsonBody` 的 null 体（已修）、SSRF 各种变体（含 `0x7f000001`、`2130706433`、根点、内嵌凭据）、内联 `onclick` 里的 provider/proxy id（写入侧白名单 + UUID）、`closeM` resolver 悬挂、responses 流边界、`/v1//admin` 路由覆盖。
+
+## 二十三、第八轮最终验证记录
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run check` | tsc 零错误（src + test）+ 5 文件 **131 用例全过** |
+| `npm run bundle` | worker.js 重建，与 src 同步 |
+| 本轮新增用例 | 6 条：`/v1/*` CORS 与管理台无 CORS、安全响应头、404 JSON 与非法 JSON 400、冷启动 seeding、种子失败不 500、name/baseUrl 类型校验、Bearer 大小写、IPv4-compatible IPv6、pendingCalls 补发顺序 |
+
+**未覆盖（已知盲区，有意保留）**：`testModelConnection` / `testOpenCodeModel` / `fetchOpenCodeModels`（需要真实网络）、`renderLoginPage` / `renderHomePage` / `renderAdminPage` 的像素级断言（只覆盖 200 与内联脚本语法）、`src/opencode.ts` 的 `createKeepAliveStream` 保活细节、`storeFailure` 体积上限的回放路径。

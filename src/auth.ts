@@ -148,13 +148,13 @@ export async function handleLogout(c: Context<{ Bindings: Env }>) {
 /** 转发 API Key 验证中间件 */
 export async function proxyKeyAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
   const authHeader = c.req.header('Authorization')
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  // RFC 6750 的 scheme 大小写不敏感；空 token 交给 validateProxyKey 判否
+  const token = authHeader && /^bearer\s+(.+)$/i.exec(authHeader)?.[1]
+  if (!token) {
     return c.json({
       error: { message: '缺少或无效的 Authorization 头，格式: Bearer sk_cf_*', type: 'authentication_error' },
     }, 401)
   }
-
-  const token = authHeader.slice(7)
   const isValid = await validateProxyKey(c.env, token)
   if (!isValid) {
     return c.json({

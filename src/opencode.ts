@@ -581,7 +581,26 @@ function createStubSwallowingChatStream(
       if (block.trim()) controller.enqueue(encoder.encode(`${block}\n\n`))
       return
     }
+    // finish_reason 一到就补发缓存里 name 始终未到的调用：必须早于这一块的
+    // finish_reason 行，更不能晚于 [DONE]（客户端读到 [DONE] 就停止解析）
+    if (block.includes('"finish_reason"')) flushPendingCalls(controller)
     for (const line of block.split('\n')) emitLine(controller, line)
+  }
+
+  // name 始终没到的调用: 流结束前原样补发, 免得客户端只收到一条
+  // finish_reason=tool_calls 却看不到任何调用
+  const flushPendingCalls = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    if (pendingCalls.size === 0) return
+    const calls: Array<Record<string, unknown>> = []
+    for (const queue of pendingCalls.values()) calls.push(...queue)
+    pendingCalls.clear()
+    controller.enqueue(
+      encoder.encode(`data: ${JSON.stringify({
+        id: 'chatcmpl-opencode-pending',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { tool_calls: calls } }],
+      })}\n\n`)
+    )
   }
 
   return new TransformStream<Uint8Array, Uint8Array>({
@@ -598,16 +617,8 @@ function createStubSwallowingChatStream(
       const tail = buf
       buf = ''
       emitBlock(controller, tail)
-      // name 始终没到的调用: 流结束了不会再来 name, 把缓存原样补发, 免得客户端
-      // 只收到一条 finish_reason=tool_calls 却看不到任何调用
-      if (pendingCalls.size > 0) {
-        const calls: Array<Record<string, unknown>> = []
-        for (const queue of pendingCalls.values()) calls.push(...queue)
-        pendingCalls.clear()
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`)
-        )
-      }
+      // 流直接结束、连 finish_reason 都没有的情况: 兜底补发一次
+      flushPendingCalls(controller)
     },
   })
 }
@@ -624,6 +635,8 @@ async function storeFailure(response: Response): Promise<StoredFailure> {
   const declared = Number(response.headers.get('content-length') ?? '')
   let body: ArrayBuffer | Uint8Array
   if (Number.isFinite(declared) && declared > MAX_STORED_FAILURE_BYTES) {
+    // 声明超限时既不读也不取消会把上游连接挂住：显式取消
+    await response.body?.cancel().catch(() => {})
     headers.set('content-type', 'application/json; charset=utf-8')
     body = new TextEncoder().encode(
       JSON.stringify({ error: { message: `上游错误响应体过大(${declared} 字节), 已省略` } })

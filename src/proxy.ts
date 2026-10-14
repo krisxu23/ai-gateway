@@ -70,7 +70,12 @@ async function fetchWithHeaderTimeout(
 
 /** 逐条浅拷贝：KeyHealth 本身可变（failures 自增、demotedAt 补写） */
 function cloneHealth(health: HealthMap): HealthMap {
-  return Object.fromEntries(Object.entries(health).map(([key, value]) => [key, { ...value }]))
+  // 用无原型对象：键来自提供商配置里的 apiKey，若某个 key 恰为 "__proto__"，
+  // 普通对象的赋值会去改原型而不是新增自有属性（该 key 永远记不上失败、也永远
+  // 不落 KV）。无原型对象保证任意字符串键都是自有属性。
+  const out = Object.create(null) as HealthMap
+  for (const [key, value] of Object.entries(health)) out[key] = { ...value }
+  return out
 }
 
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
@@ -95,8 +100,8 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
-  // 只保存有失败记录的 key，避免 KV 膨胀
-  const filtered: HealthMap = {}
+  // 只保存有失败记录的 key，避免 KV 膨胀（无原型对象，见 cloneHealth 的说明）
+  const filtered = Object.create(null) as HealthMap
   for (const [k, v] of Object.entries(health)) {
     if (v.failures > 0) filtered[k] = v
   }
@@ -133,7 +138,9 @@ async function readErrorBody(response: Response): Promise<{ raw: string; json: R
   const raw = await response.text().catch(() => '')
   try {
     const parsed: unknown = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object') return { raw, json: parsed as Record<string, unknown> }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { raw, json: parsed as Record<string, unknown> }
+    }
   } catch {
     // 非 JSON 错误体（HTML/纯文本）：按原文处理
   }
@@ -473,6 +480,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // 客户端已断开：响应无人接收，但给出明确语义而不是"没有可用 Key"
     if (clientAborted) {
+      await dropLastError()
       return new Response(JSON.stringify({
         error: { message: '客户端已断开连接', type: 'client_closed_request' },
       }), { status: 499, headers: { 'Content-Type': 'application/json' } })

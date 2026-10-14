@@ -47,8 +47,10 @@ let seedPromise: Promise<void> | null = null
 app.use('*', async (c, next) => {
   if (!seedPromise) {
     seedPromise = seedInitialData(c.env).catch((err) => {
+      // 种子填充是尽力而为：失败只记录并允许下次请求重试，不把当前请求变成 500
+      // （KV 真不可用时，后续读写自己会失败，不需要在这里叠加一个错误）
       seedPromise = null
-      throw err
+      console.warn('初始数据填充失败:', err)
     })
   }
   await seedPromise
