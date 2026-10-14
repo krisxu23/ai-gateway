@@ -143,10 +143,11 @@ async function getCachedList<T>(env: Env, key: string): Promise<T[]> {
 
 /** 通用缓存列表写入：先写 KV 成功后再更新内存缓存，防止脏数据污染 */
 async function setCachedList<T>(env: Env, key: string, list: T[]): Promise<void> {
-  await env.KV.put(key, JSON.stringify(list))
-  // 内存缓存必须与读 KV 的出口一致：写路径的入参没过 sanitizeList，若原样缓存
-  // （E.g. enabled:"false"），60s 内该 Key 仍被当作启用、停用模型仍出现在 /v1/models。
-  cacheSet(key, sanitizeList(key, list) as T[], CACHE_TTL_BY_KEY[key])
+  // 写路径与读出口用同一份归一化结果：即落盘的就是后续读到的形状，KV 里不再
+  // 残留 enabled:"false" 这类脏形状（否则 60s 内缓存与 KV 读出的行为不一致）。
+  const sanitized = sanitizeList(key, list) as T[]
+  await env.KV.put(key, JSON.stringify(sanitized))
+  cacheSet(key, sanitized, CACHE_TTL_BY_KEY[key])
 }
 
 // 同 isolate 内的写队列：把「读全表 → 改 → 写回」串行化，避免两个并发管理操作

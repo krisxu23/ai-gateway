@@ -100,6 +100,21 @@ describe('storage 字段形状归一化', () => {
     expect(providers[0].apiKeys[0].enabled).toBe(false)
   })
 
+  // 写路径也必须归一化：否则同 isolate 的缓存与 60s 后读 KV 的行为会不一致
+  it('写入时即归一化落盘（落盘形状与内存缓存一致）', async () => {
+    vi.resetModules()
+    const storage = await import('../src/storage')
+    const env = makeEnv()
+    await storage.setProviders(env, [
+      { id: 'p10', name: 'P10', baseUrl: 'https://up.example.com', enabled: 'false', models: [{ id: 'm10', enabled: 'false' }], apiKeys: [{ key: 'sk10', enabled: 'false' }] },
+    ] as unknown as Parameters<typeof storage.setProviders>[1])
+
+    const stored = JSON.parse(env.store.get('providers')!) as Array<Record<string, unknown>>
+    expect(stored[0].enabled).toBe(false)
+    expect((stored[0].models as Array<{ enabled: boolean }>)[0].enabled).toBe(false)
+    expect(await storage.getProviders(env)).toEqual(stored)
+  })
+
   // 空 token 不应与“被清洗成 `key: ''` 的脏条目”相等而放行（空的 Bearer 头）
   it('空 token 不会被 key 为空的脏条目放行', async () => {
     vi.resetModules()
