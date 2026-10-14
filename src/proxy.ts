@@ -84,7 +84,14 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   // 会让嵌套的 KeyHealth 与缓存共享引用，KV 写入失败时内存缓存被未落盘的状态污染。
   const cached = healthCacheGet(cacheKey)
   if (cached) return cloneHealth(cached)
-  const raw = await env.KV.get(cacheKey)
+  let raw: string | null = null
+  try {
+    raw = await env.KV.get(cacheKey)
+  } catch (error) {
+    // 旁路数据：KV 抖动不该把本可成功的转发变成 500（写侧 persistHealth 同样兜底）
+    console.warn(`[proxy] key 健康状态读取失败，按全健康处理: ${(error as Error).message}`)
+    return {}
+  }
   let parsed: HealthMap = {}
   if (raw) {
     try {
@@ -117,7 +124,10 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
 }
 
 // 健康状态是尽力而为的旁路数据：KV 抖动不能把已成功的模型响应变成 500。
-// shortcut: 同 isolate 并发写仍是整表读改写（可能丢计数），跨 isolate 精确一致需 Durable Object
+// shortcut: 同一 isolate 的并发失败请求仍是整表读改写，会互相覆盖计数（R11-C 实测
+// 10 个并发失败请求最终只记下 ~6 次），跨 isolate 精确一致需要 Durable Object。
+// 后果仅是把“连续失败 5 次降权”实际延后到 ~8 次：失败 Key 仍在同一请求内立刻换下一个，
+// 不影响单次请求的正确性，故接受。
 async function persistHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
   try {
     await writeHealth(env, providerId, health)
@@ -134,7 +144,16 @@ async function persistHealth(env: Env, providerId: string, health: HealthMap): P
 /** Response 构造器禁止 101/204/205/304 带 body：越界状态码一律回落 502 */
 const clampErrorStatus = (status: number): number => (status >= 400 && status <= 599 ? status : 502)
 
+/** 上游错误体只用于取 500 字片段：声明长度超过此值时直接丢弃，避免把几十 MB 的错误页
+ *  读进内存（换 Key 重试时每个 key 各缓冲一次，会顶到 Worker 的 128MB 上限） */
+const MAX_ERROR_BODY_BYTES = 64 * 1024
+
 async function readErrorBody(response: Response): Promise<{ raw: string; json: Record<string, unknown> | null }> {
+  const declared = Number(response.headers.get('content-length') ?? '')
+  if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES) {
+    await response.body?.cancel().catch(() => {})
+    return { raw: `上游错误响应体过大（>${MAX_ERROR_BODY_BYTES / 1024}KB），已忽略`, json: null }
+  }
   const raw = await response.text().catch(() => '')
   try {
     const parsed: unknown = JSON.parse(raw)
@@ -192,7 +211,7 @@ export async function testModelConnection(
   apiType?: 'openai' | 'anthropic'
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
-    const cleanBase = baseUrl.replace(/\/$/, '')
+    const cleanBase = baseUrl.replace(/\/+$/, '')
     const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
     const url = `${cleanBase}/${endpoint}`
 
@@ -339,7 +358,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }, 500)
     }
 
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
+    const cleanBase = provider.baseUrl.replace(/\/+$/, '')
     const forwardUrl = `${cleanBase}/${subPath}${url.search}`
 
     // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
@@ -456,8 +475,13 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         // 否则其 body 悬挂到请求结束
         await dropLastError()
         const { raw, json } = await readErrorBody(response)
+        // `{}` 这类没有任何字段的合法 JSON 会让 OpenAI SDK 报 "unknown error"：
+        // 这时不能回落到原文（原文就是那个 `{}`），直接用状态码；非 JSON 的错误页
+        // 仍保留原文（HTML 里常有可诊断信息）
+        const usable = json !== null && Object.keys(json).length > 0
+        const fallback = json === null && raw.trim() ? raw.substring(0, 500) : `上游返回 HTTP ${response.status}`
         return c.json(
-          json ?? { error: { message: raw.substring(0, 500) } },
+          usable ? json : { error: { message: fallback } },
           clampErrorStatus(response.status) as Parameters<typeof c.json>[1]
         )
       } catch (err) {
@@ -470,8 +494,10 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         if (recordKeyFailure(healthData, apiKey)) healthUpdated = true
         failuresSeen = true
         await dropLastError()
+        // 内部异常原文只进日志，不透给调用方
+        console.error(`[proxy] Key 请求异常: ${error.message}`)
         lastError = new Response(JSON.stringify({
-          error: { message: error.message || '请求失败', type: 'proxy_error' },
+          error: { message: '上游请求异常', type: 'proxy_error' },
         }), { status: 502 })
         continue
       }
@@ -509,9 +535,11 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       error: { message: '没有可用的 API Key', type: 'configuration_error' },
     }, 500)
   } catch (err) {
-    const error = err as Error
+    // 内部错误原文（可能含 KV/上游主机名）只进日志：透给调用方既是信息泄露，
+    // 也让客户端拿到不该出现的错误文案
+    console.error('[proxy] 转发内部错误:', err)
     return c.json({
-      error: { message: error.message || '代理转发内部错误', type: 'server_error' },
+      error: { message: '网关内部错误，请稍后重试', type: 'server_error' },
     }, 500)
   }
 }
@@ -521,8 +549,9 @@ export async function handleModels(c: Context<{ Bindings: Env }>) {
   const providers = await getProviders(c.env)
   const created = Math.floor(Date.now() / 1000)
 
+  // baseUrl 为空的提供商在 handleProxy 里必然 502，不该出现在模型列表里误导调用方
   const data = providers
-    .filter((p) => p.enabled)
+    .filter((p) => p.enabled && p.baseUrl.trim() !== '')
     .flatMap((p) =>
       p.models
         .filter((m) => m.enabled)

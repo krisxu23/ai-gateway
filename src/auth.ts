@@ -83,8 +83,18 @@ export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: N
   return next()
 }
 
+/** 登录字段上限：超长输入没有合法用途，且哈希开销随输入线性增长 */
+const MAX_LOGIN_FIELD_LEN = 256
+/** 登录请求体上限：未认证接口不该被超大体放大内存/CPU（解析发生在字段校验之前） */
+const MAX_LOGIN_BODY_BYTES = 8 * 1024
+
 /** 管理员登录 */
 export async function handleLogin(c: Context<{ Bindings: Env }>) {
+  // 先按声明长度挡掉超大体：c.req.json() 会把整个 body 读进内存后才轮到字段校验
+  const declared = Number(c.req.header('content-length') ?? '')
+  if (Number.isFinite(declared) && declared > MAX_LOGIN_BODY_BYTES) {
+    return c.json({ success: false, message: '请求体过大' }, 413)
+  }
   // body 为字面量 null 时解构会抛 TypeError（被 onError 判成 500）；非字符串值按空串处理
   const body = await c.req.json<Record<string, unknown> | null>()
   const username = typeof body?.username === 'string' ? body.username : ''
@@ -92,14 +102,20 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
   const { ADMIN_USERNAME: adminUser, ADMIN_PASSWORD: adminPass } = c.env
 
   if (!adminUser || !adminPass) {
+    // 503 而非 500：这是「功能不可用」而非「内部故障」，避免监控误判
     return c.json({
       success: false,
       message: '未配置管理员账号，请在 Cloudflare 环境变量中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD',
-    }, 500)
+    }, 503)
   }
 
   // 限流在输入校验之前：被锁定时不再泄露任何信息
-  const ip = c.req.header('CF-Connecting-IP') || 'unknown'
+  // CF-Connecting-IP 由边缘注入、公网流量必有；非边缘部署（自建反代）才回落到
+  // x-real-ip / x-forwarded-for 首段（前者优先，避免被伪造的 XFF 绕过限流）
+  const ip = c.req.header('CF-Connecting-IP')
+    || c.req.header('x-real-ip')
+    || c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+    || 'unknown'
   const now = Date.now()
   if (loginBlocked(ip, now)) {
     return c.json({ success: false, message: '登录失败次数过多，请 15 分钟后再试' }, 429)
@@ -107,6 +123,12 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
 
   if (!username || !password) {
     return c.json({ success: false, message: '请输入用户名和密码' }, 400)
+  }
+
+  // 超长输入没有合法用途：不进入哈希，且计入失败次数（未认证请求不能靠超长字段放大 CPU）
+  if (username.length > MAX_LOGIN_FIELD_LEN || password.length > MAX_LOGIN_FIELD_LEN) {
+    recordLoginFailure(ip, now)
+    return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
 
   // 常量时间比较：用户名和密码都先哈希再比较，长度恒为 64 字符，

@@ -282,7 +282,16 @@ ${H('登录')}
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: u, password: p })
       })
-      var data = await response.json()
+      var data = null
+      try {
+        data = await response.json()
+      } catch (e) {
+        // 网关/边缘的错误页是 HTML，不是 JSON：报状态码而不是误报“网络不通”
+        showError('服务返回异常（HTTP ' + response.status + '），请稍后重试。')
+        submit.disabled = false
+        submit.removeAttribute('data-state')
+        return
+      }
       if (data.success) {
         submit.setAttribute('data-state', 'success')
         window.location.href = '/admin'
@@ -444,6 +453,7 @@ function copyText(t, el) {
     }, 1800)
   }).catch(() => {
     el.setAttribute('data-state', 'error')
+    setTimeout(() => el.removeAttribute('data-state'), 1800)
   })
 }
 
@@ -460,12 +470,15 @@ function closeM() { document.getElementById('modal').classList.add('hd') }
 function closeModal() { const r = window.r; window.r = null; closeM(); if (r) r(null) }
 function cM(msg) {
   return new Promise(r => {
+    // 连点两次会让第二次覆盖 window.r，前一个 Promise 永不落地
+    if (window.r) window.r(false)
     showM('<h3><i class="fas fa-question-circle c-p"></i> 确认</h3><p>' + escapeHtml(msg) + '</p><div class="fa"><button class="btn btn-s" onclick="closeM();r(false)">取消</button><button class="btn btn-p" onclick="closeM();r(true)">确定</button></div>')
     window.r = r
   })
 }
 function pM(msg, def) {
   return new Promise(r => {
+    if (window.r) window.r(null)
     showM('<h3><i class="fas fa-pen c-p"></i> ' + escapeHtml(msg) + '</h3><div class="fg"><input type="text" id="pv" value="' + escapeHtml(def || '') + '" placeholder="请输入"></div><div class="fa"><button class="btn btn-s" id="pMc">取消</button><button class="btn btn-p" id="pMo">确定</button></div>')
     window.r = r
     const inp = document.getElementById('pv')
@@ -504,9 +517,10 @@ async function apiJson(url, opts) {
   return d
 }
 
-// 连通性测试失败时的文案：status 为 0 表示请求根本没发出去，显示 “HTTP 0” 没有意义
+// 连通性测试失败时的文案：优先用服务端给的可读原因（如「仅允许 https:// 上游地址」），
+// 没有原因时再回落到状态码；status 为 0 表示请求根本没发出去
 function httpMsg(result) {
-  return result.status ? 'HTTP ' + result.status : (result.message || '请求失败')
+  return result.message || (result.status ? 'HTTP ' + result.status : '请求失败')
 }
 
 // providers
@@ -541,7 +555,9 @@ function renderModelGrid(models, editId, providerId) {
       return m && typeof m.id === 'string' && /^[A-Za-z0-9._:/-]+$/.test(m.id) && (m.id === 'big-pickle' || m.id.endsWith('-free'))
     })
   }
-  if (!models || models.length === 0) return '<span class="mu">未返回模型列表</span>'
+  // 上游 200 但 data 不是数组（如 {"data":{...}}）时不能直接 .map：抛错会让调用方的
+  // showResult 不再执行，结果区永久停在“测试中...
+  if (!Array.isArray(models) || models.length === 0) return '<span class="mu">未返回模型列表</span>'
   var h = models.map(function(m) {
     var modelId = String(m.id || '')
     var safeId = escapeHtml(modelId)
@@ -603,7 +619,7 @@ function testNewAKey(btn) {
   if (!url) { toast('请先填写 API 地址', 'error'); return }
   const apiType = document.getElementById('afmt').value
   const tr = document.getElementById('atestR')
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   testKeyConnection(url, apiType, k, providerId).then(function(result) {
     if (result.success && result.data) {
       document.getElementById('amcl').innerHTML = renderModelGrid(result.data.data || [], null, providerId)
@@ -643,7 +659,7 @@ function testNewMdl(btn) {
   // 非 opencode 提供商没填 Key 时不再用 'dummy' 真发请求（必然 401，会误导为模型 ID 问题）
   if (!configuredKey && providerId !== 'opencode') { toast('请先填写 API Key', 'error'); return }
   const apiKey = configuredKey
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   testModelConnection(url, apiType, apiKey, mid, providerId).then(function(result) {
     showResult(tr, result.success, result.success ? '' : httpMsg(result))
   })
@@ -721,7 +737,7 @@ async function testKeyRow(id, idx) {
   if (!k) { toast('请输入 API Key', 'error'); return }
   const apiType = document.getElementById('at-' + id).value
   const tr = document.getElementById('tr-' + id)
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   const result = await testKeyConnection(url, apiType, k, id)
   showResult(tr, result.success, result.success ? '' : httpMsg(result))
   if (result.success && result.data) {
@@ -736,7 +752,7 @@ async function fetchEditModels(id) {
   const apiKey = keys.length > 0 ? keys[0].key : ''
   const apiType = document.getElementById('at-' + id).value
   const tr = document.getElementById('tr-' + id)
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   const result = await testKeyConnection(url, apiType, apiKey, id)
   showResult(tr, result.success, result.success ? '' : (result.message || '获取模型失败'))
   if (result.success && result.data) {
@@ -817,7 +833,7 @@ function addMdl(id) {
 // 直连实测：用当前表单里的地址与 Key 直接调用上游，不经已保存配置校验。
 async function testMdlDirect(id, mid) {
   const tr = document.getElementById('tr-' + id)
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   const url = document.getElementById('url-' + id).value.trim()
   if (!url) { showResult(tr, false, '请先填写 API 地址'); return }
   const apiType = document.getElementById('at-' + id).value
@@ -829,7 +845,7 @@ async function testMdlDirect(id, mid) {
     body: JSON.stringify({ url: url, apiKey: apiKey, apiType: apiType, model: mid, providerId: id })
   })
   if (d.success && d.data) {
-    showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || ('HTTP ' + d.data.statusCode)))
+    showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || (d.data.statusCode ? 'HTTP ' + d.data.statusCode : '测试失败')))
   } else {
     showResult(tr, false, d.message || '测试失败')
   }
@@ -844,19 +860,15 @@ function rmMdl(id, idx) {
 
 async function testMdl(id, mid) {
   const tr = document.getElementById('tr-' + id)
-  showSpinner(tr)
+  if (!showSpinner(tr)) return
   const d = await apiJson('/admin/api/providers/' + encodeURIComponent(id) + '/test-model', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ modelId: mid })
   })
   if (d.success && d.data) {
-    if (d.data.success && d.data.message) {
-      // 后端降级直测时会附带“尚未保存”提醒，成功态也要展示出来。
-      tr.innerHTML = '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功 <span class="mu">' + escapeHtml(d.data.message) + '</span></div>'
-    } else {
-      showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'))
-    }
+    // 后端降级直测时会附带“尚未保存”提醒，成功态也要展示出来。
+    showResult(tr, d.data.success, d.data.success ? '' : (d.data.message || '连接失败'), d.data.success ? d.data.message : '')
   } else {
     showResult(tr, false, d.message || '测试失败')
   }

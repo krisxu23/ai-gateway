@@ -35,10 +35,7 @@ const securityHeaders = async (c: Context<{ Bindings: Env }>, next: () => Promis
   c.header('X-Frame-Options', 'DENY')
   c.header('X-Content-Type-Options', 'nosniff')
 }
-app.use('/admin/*', securityHeaders)
-app.use('/', securityHeaders)
-// 转发响应也补 nosniff（JSON/SSE 本不会被嗅探成脚本，属便宜的纵深防御）
-app.use('/v1/*', securityHeaders)
+app.use('*', securityHeaders)
 // 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
 // tail 日志足够排查问题。
 
@@ -106,8 +103,9 @@ app.notFound((c) => {
 
 // ===== 错误处理 =====
 app.onError((err, c) => {
-  // 请求体非法 JSON (c.req.json() 抛 SyntaxError) 是客户端错误，应返 400 而非 500
-  if (err instanceof SyntaxError) {
+  // 只把「请求体不是合法 JSON」的 SyntaxError（c.req.json() 抛的）映射为 400；
+  // 其它来源的 SyntaxError（如 JSON.parse 解析 KV 脏数据）仍是服务端问题，按 500 上报
+  if (err instanceof SyntaxError && /\bJSON\b|Unexpected (token|end)/i.test(err.message)) {
     return c.json({ error: { message: '请求体必须是合法的 JSON', type: 'invalid_request_error' } }, 400)
   }
   console.error('未捕获的错误:', err)

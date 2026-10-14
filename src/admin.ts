@@ -142,10 +142,13 @@ function findInvalidEnabled(items: unknown): boolean {
 function hasKeylessApiKey(items: unknown): boolean {
   if (!Array.isArray(items)) return false
   return items.some((item) => {
-    if (typeof item !== 'object' || item === null) return false
+    // Key 简写字符串会被归一化成 { key, enabled: true }：空串/全空白同样是“启用但无 key”
+    if (typeof item === 'string') return item.trim() === ''
+    // 数组/数字等脏条目由存储层归一化时丢弃，不参与转发
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return false
     const entry = item as { key?: unknown; enabled?: unknown }
     if (entry.enabled === false) return false
-    return !(typeof entry.key === 'string' && entry.key !== '')
+    return !(typeof entry.key === 'string' && entry.key.trim() !== '')
   })
 }
 
@@ -266,7 +269,7 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   const provider: Provider = {
     id: body.id,
     name: body.name,
-    baseUrl: body.baseUrl.replace(/\/$/, ''),
+    baseUrl: body.baseUrl.replace(/\/+$/, ''),
     apiType: body.apiType || 'openai',
     apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
     models: body.models
@@ -307,7 +310,7 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
     if (ssrfError) {
       return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
     }
-    updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+    updates.baseUrl = body.baseUrl.replace(/\/+$/, '')
   }
   if (body.models !== undefined && !Array.isArray(body.models)) {
     return c.json<ApiResponse>({ success: false, message: 'models 必须是数组' }, 400)
@@ -441,7 +444,7 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
     })
   }
 
-  const cleanBase = url.replace(/\/$/, '')
+  const cleanBase = url.replace(/\/+$/, '')
   try {
     const response = await fetch(`${cleanBase}/models`, {
       method: 'GET', headers: buildAuthHeaders(apiKey, apiType), signal: AbortSignal.timeout(15000),
@@ -487,7 +490,7 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
     })
   }
 
-  const cleanBase = url.replace(/\/$/, '')
+  const cleanBase = url.replace(/\/+$/, '')
   const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
 
   try {

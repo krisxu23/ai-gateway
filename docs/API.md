@@ -43,8 +43,13 @@ https://你的域名
 | 状态码 | 场景 | 响应 |
 |--------|------|------|
 | 400 | 用户名/密码为空 | `{ "success": false, "message": "请输入用户名和密码" }` |
-| 401 | 用户名或密码错误 | `{ "success": false, "message": "用户名或密码错误" }` |
-| 500 | 未配置管理员账号 | `{ "success": false, "message": "未配置管理员账号，请在 Cloudflare 环境变量中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD" }` |
+| 401 | 用户名或密码错误（也含用户名/密码长度 >256 字符：不进入哈希直接拒，并计入失败次数） | `{ "success": false, "message": "用户名或密码错误" }` |
+| 413 | 请求体超过 8KB | `{ "success": false, "message": "请求体过大" }` |
+| 429 | 同一来源连续失败 5 次，锁定 15 分钟 | `{ "success": false, "message": "登录失败次数过多，请 15 分钟后再试" }` |
+| 503 | 未配置管理员账号（功能不可用，非内部故障） | `{ "success": false, "message": "未配置管理员账号，请在 Cloudflare 环境变量中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD" }` |
+
+> 来源识别顺序：`CF-Connecting-IP` → `x-real-ip` → `x-forwarded-for` 首段。Cloudflare 边缘
+> 一定会注入 `CF-Connecting-IP`，后两者仅供自建反代部署使用。
 
 #### GET /admin/logout
 

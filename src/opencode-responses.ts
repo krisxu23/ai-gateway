@@ -300,9 +300,11 @@ export function createResponsesToChatStream(
   // 是否已下发过正文增量: 流在 response.completed 之前断开时据此区分
   // "回答被截断"(length) 与 "上游就发了个空回复"(stop)
   let sawText = false
-  // 正文是否已定稿(response.output_text.done 到达)：终态之后再到 delta 属上游重排，
-  // 追加会把同一段正文发两遍
-  let textFinalized = false
+  // 已下发给客户端的正文（用于与 done 的全文对账：既不重复也不丢尾部）
+  let emittedText = ''
+  // 上游在 response.output_text.done 里下发过的全文：done 之后又重放同一段 delta
+  // 属上游重排，按原样再发一遍会把同一段正文发两遍
+  let doneText = ''
   // 已下发工具调用的“参数完整性”：流式下 arguments 是边收边发的，只有拿到
   // “参数收完”的信号(output_item.done / function_call_arguments.done)或参数本身
   // 已是完整 JSON，才能报告 tool_calls —— 客户端在 tool_calls 下会直接执行参数，
@@ -387,21 +389,31 @@ export function createResponsesToChatStream(
   const handleEvent = (controller: TransformStreamDefaultController<Uint8Array>, ev: Rec) => {
     const type = typeof ev.type === 'string' ? ev.type : ''
     switch (type) {
-      case 'response.output_text.delta':
-        if (!textFinalized && typeof ev.delta === 'string' && ev.delta) {
+      case 'response.output_text.delta': {
+        const delta = typeof ev.delta === 'string' ? ev.delta : ''
+        // done 已把同一段全文下发过：上游重放同一段，丢弃以免重复
+        if (delta && delta === doneText) break
+        if (delta) {
           sawText = true
-          controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.delta })))
+          emittedText += delta
+          controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: delta })))
         }
         break
-      case 'response.output_text.done':
-        // done 是正文的终态：之后到达的 delta 忽略，避免同一段正文发两遍
-        textFinalized = true
-        // 上游只在 done 里给全文(不发 delta)时不能丢正文
-        if (!sawText && typeof ev.text === 'string' && ev.text) {
-          sawText = true
-          controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.text })))
-        }
+      }
+      case 'response.output_text.done': {
+        const text = typeof ev.text === 'string' ? ev.text : ''
+        if (!text) break
+        doneText = text
+        // done 里的正文可能比已下发的增量更全（上游只在终态补全文）：只补差量，
+        // 既不重复也不把尾部丢掉；空的 done 不能当成“正文已定稿”，否则后续正文全丢
+        if (!text.startsWith(emittedText)) break
+        const rest = text.slice(emittedText.length)
+        if (!rest) break
+        sawText = true
+        emittedText = text
+        controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: rest })))
         break
+      }
       case 'response.output_item.added': {
         const item = asRecord(ev.item)
         if (item && item.type === 'function_call') {

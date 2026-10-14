@@ -364,7 +364,7 @@ export async function collapseChatSseToJson(
   const argBufs: string[] = []
   // 越界/非整数 index 的独立槽位：直接复用 toolCalls.length 会正好撞上下一个合法
   // index 通常要占的槽位，把两条调用合并（参数拼接、name 被覆盖）
-  const overflowSlot = new Map<number, number>()
+  const overflowSlot = new Map<string, number>()
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   outer: for (const chunk of normalized.split('\n\n')) {
     for (const rawLine of chunk.split('\n')) {
@@ -391,9 +391,12 @@ export async function collapseChatSseToJson(
               if (Number.isInteger(rawNum) && rawNum >= 0 && rawNum < MAX_TOOL_INDEX) {
                 idx = rawNum
               } else {
-                const slot = overflowSlot.get(rawNum)
+                // 槽位键按类型前缀区分：非数字 index(字符串) 若不区分会全部并到同一个
+                // 'NaN' 槽里，两条本应独立的调用被拼成一条
+                const slotKey = typeof rawIdx === 'string' ? `s:${rawIdx}` : `n:${String(rawNum)}`
+                const slot = overflowSlot.get(slotKey)
                 idx = slot === undefined ? MAX_TOOL_INDEX + overflowSlot.size : slot
-                overflowSlot.set(rawNum, idx)
+                overflowSlot.set(slotKey, idx)
               }
               if (!toolCalls[idx]) {
                 toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }

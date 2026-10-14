@@ -715,3 +715,101 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 **本轮新增用例（11 条）**：apiKeys 缺 key → 400；`models`/`apiKeys` 非数组 → 400；创建响应形状与 GET 一致（回读归一化）；参数 `done` 先于 `added` 的桩调用不泄露参数且整轮只调桩报 `stop`；终态 `output` 里的桩调用不被合成；`output_text.done` 之后的 `delta` 不重复正文；越界 `index` 与合法 `index` 各自独立；同一越界 `index` 的多个增量归并为一条；非整数 `index` 不与合法 `index` 合并；首页渲染 `#copy-status`；toast 缺省用中立样式。
 
 **第 25.2 节勘误**：R9A-H1 记录为 `MAX_TOOL_INDEX = 128`，实际代码与第十轮修复均为 `256`（`src/opencode.ts`），越界策略已由「合并到当前长度」改为 27.3 的独立溢出槽。
+
+## 二十九、第十一轮修复记录（三路独立审查 R11-A / R11-B / R11-C）
+
+基线 `b0f8aad`（工作区干净），三路均为只读 reviewer，实测 6 文件 159 用例全过。
+修复后：`npm run check` = tsc 零错 + 6 文件 **171** 用例全过（本轮新增 12 条回归用例），
+`worker.js` 重建为 168.0KB。
+
+### 29.1 R11-A（差异复核 + 翻译状态机）
+
+| # | 级别 | 问题 | 处置 |
+|---|------|------|------|
+| 1 | 中 | `hasKeylessApiKey` 只查 `enabled` 布尔：`apiKeys:[{"enabled":true}]`（缺 key）与字符串简写 `""` 都能通过，绕过「至少一个可用 Key」检查 → `Bearer undefined` 发给上游 | 改为同时校验字符串简写（trim 后非空）与对象 `key`（非空字符串）；并在 `sanitizeList` 补读侧不变式：`apiKeys` 里 `key` 非字符串或空白 → `enabled` 强制 false |
+| 2 | 中 | `overflowSlot` 用同一个溢出槽收纳所有越界 `tool_call.index`，不同非法 index 互相撞车（arguments 拼接、name 覆盖） | 溢出槽改按 `String(rawIdx)` 作键（`Map<string, number>`），非数字 index 也各占一格，不再合并 |
+| 3 | 中 | `response.output_text.done` 到达后把后续 delta **整体**丢弃：done 带空文本时会把后面真正的正文全丢 | 改为按内容对账：`doneText` 只用于丢弃与已发全文**完全相同**的重放 delta；空文本 done 不产生抑制；done 全文比已发增量更全时只补尾部差量 |
+| 4 | 低 | `id` / `call_id` 未做字符校验即拼进 SSE | 统一走白名单（`isSafeId`），非法即用合成 ID |
+| 5 | 低 | `new Map<number, number>()` 类型与实际字符串键不符（见第 2 项） | 类型改为 `Map<string, number>` |
+
+R11-A 已核实不成立：`synthesizeCall` 不重发 name、`diffArgs` 防重复拼接、`finalizedIds`
+丢弃收尾后的乱序事件、`storeFailure`/`restoreFailure` 头体自洽（`content-encoding` /
+`content-length` 已剥离）、桩事件在四种顺序下都不下发参数。
+
+### 29.2 R11-B（管理台前端与前后端契约）
+
+| # | 级别 | 问题 | 处置 |
+|---|------|------|------|
+| 1 | 中 | `httpMsg` 丢服务端 message（400 的 SSRF/URL 非法原因被吞成「HTTP 400」） | 改为优先用 `result.message`，无 message 才回落到状态码 |
+| 2 | 中 | 重名检查在 serialized 队列之外 → 并发同 id 创建都 201 落两条 | 移入 `addProvider` 的串行段内并返回 boolean，`handleCreateProvider` 据此 409 |
+| 3 | 中 | 健康表 / 页面里以配置值为键的普通对象字面量（`__proto__` 键写不进去） | 统一改 `Object.create(null)` |
+| 4 | 低 | `save(id)` 无返回值 → `addAllUpstream` 的成功提示是死代码 | `save` 成功 `return true`、失败 `return false`，调用方据此提示 |
+| 5 | 低 | 结果区并发测试：同一容器重复点击会互相覆盖响应，白烧上游配额 | `showSpinner(el)` 加 `dataset.busy` 在途守卫（已有在途测试时直接返回 false，调用方 `return`）；`showResult` 负责清除 busy |
+| 6 | 低 | `copyText` 失败态 `data-state='error'` 永久残留 | 1.8s 后 `removeAttribute('data-state')` |
+| 7 | 低 | 登录页 `await response.json()` 遇 HTML 错误页抛异常，被报成「网络不通」 | 包 try/catch，改报「服务返回异常（HTTP <status>），请稍后重试」并复位按钮 |
+| 8 | 低 | `testMdl` 成功且有 message 时自建 HTML，绕过 `showResult` 的 busy 清理 | 删掉自建分支，`showResult` 增加 `note` 参数承载该提醒 |
+| 9 | 低 | 编辑态模型面板 `models` 非数组时 `renderModelGrid` 抛错，结果区永久停在「测试中…」 | 加 `Array.isArray` 守卫 |
+| 10 | 低 | `cM`/`pM` 连点两次会覆盖 `window.r`，前一个 Promise 永不落地 | 覆盖前先以取消值结算前一个 resolver |
+
+R11-B 已核实不成立：`apiJson` 契约与全部调用方一致（双嵌套 `d.data.data` 是既定形状）、
+回滚选择器唯一、`escapeHtml` 覆盖三类上下文、`fetchEditModels` 去双重转义正确、
+`.al-s/.al-e/.al-i/.toast/.hd/.sr-only` 的状态类设置方与消费方一一对应、
+登录按钮 `disabled` 在所有非成功分支都会复位、服务端 message 在三态下都能透出。
+
+### 29.3 R11-C（转发主链路 / 鉴权 / 存储，对抗性通读 + 运行时探针）
+
+| # | 级别 | 问题 | 处置 |
+|---|------|------|------|
+| 1 | 中 | `readHealth` 的 KV 读没有 try/catch：KV 抖动会把本可成功的转发变成 500（同文件写侧 `persistHealth` 有兜底） | KV 读包 try/catch，失败按「全健康」返回（旁路数据不变现 500） |
+| 2 | 中 | 同一 isolate 并发失败请求整表读改写互相覆盖，实测 10 个并发失败只记下 ~6 次，`KEY_HEALTH_MAX_FAILURES=5` 实际延后 | **接受并登记**（见 29.4） |
+| 3 | 中低 | `validateProxyKey` 用 `!k.expiresAt` 真值判断：`expiresAt: 0`/`''` 等脏值被当成「永久有效」→ 已撤销 Key 复活（fail-open） | 只认 ISO 字符串或 null/undefined，其它值一律按已过期（fail-closed）；`sanitizeList` 有意**不**归一化 `expiresAt`，避免把脏值洗成「永不过期」 |
+| 4 | 中低 | `readErrorBody` 无体积上限：上游几十 MB 的错误页被完整读进内存（换 Key 时每个 key 各缓冲一次） | 读前检查 `content-length`，>64KB 直接 `cancel()` 并给固定文案；非声明长度的分块体仍整包读（已登记） |
+| 5 | 低 | 内部错误原文（含 KV/上游主机名）透给调用方 | 外层 catch 与 Key 异常分支都改为固定文案 + `console.error` 记详情 |
+| 6 | 低 | 上游 `{}` 空 JSON 错误体原样透传 → OpenAI SDK 报 unknown error | 空对象（无任何字段）改用状态码文案；非 JSON 原文仍保留（HTML 常有诊断信息） |
+| 7 | 低 | 上游 3xx / 空体错误 → 502 但 message 为空 | fallback 补 `上游返回 HTTP <status>` |
+| 8 | 低 | 缺少 `CF-Connecting-IP` 时所有来源共用 `unknown` 桶，一个攻击者可锁死管理员登录 | 回落链 `CF-Connecting-IP` → `x-real-ip` → `x-forwarded-for` 首段 → `unknown`（前者优先，公网流量必有前者） |
+| 9 | 低 | `/admin/login` 无字段长度与请求体上限；未配置管理员用 500 | 字段 >256 字符不哈希直接拒并计入失败；`content-length` >8KB 返 413；未配置改 503 |
+| 10 | 低 | `securityHeaders` 只挂 `/admin/*`、`/`，404 等响应缺 `nosniff` | 合并为一条 `app.use('*', securityHeaders)`（未命中路由时同样执行，已用 404 用例验证） |
+| 11 | 低 | `onError` 把**所有** SyntaxError 映射成 400（隐藏服务端 bug） | 仅在 message 匹配 `JSON` / `Unexpected (token|end)` 时映射 400，其余仍 500 |
+| 12 | 低 | `/v1/models` 会列出 `baseUrl` 为空的提供商（其请求必然 502） | 列表过滤掉空 `baseUrl` |
+| 13 | 信息 | `baseUrl.replace(/\/$/, '')` 只去掉一个斜杠 | 全部 6 处改为 `/\/+$/` |
+
+R11-C 已核实不成立：空 token 双保险（`auth.ts` 的 `(.+)` + `storage.ts` 的空 key 判否）、
+中间件顺序无越权、`clampErrorStatus` 边界、`dropLastError` 覆盖、`[DONE]` 双保险、
+`loginFailures` 有界淘汰、掩码四星一致、SSRF 各变体仍被拦、`worker.js` 与 src 同步。
+
+### 29.4 本轮登记为「有意保留」的 1 项
+
+- **健康状态计数在并发下丢失（R11-C N2，实测 ~40%）**：KV 无原子自增，
+  同一 isolate 的并发失败请求各持快照整表读改写，跨 isolate 更只能最终一致。
+  精确一致需要 Durable Object（为一条旁路降权计数引入新组件不成比例）。
+  后果仅是把「连续失败 5 次降权」实际延后到约 8 次：失败 Key 仍在同一请求内立即换下一个，
+  不影响单次请求的正确性。已在 `src/proxy.ts` 的 `persistHealth` 处写明实测幅度。
+
+### 29.5 第十一轮已排除（核实后不成立，不再重修）
+
+`/admin/login` 中间件顺序、`renderHomePage` 反射 Host（三处均 escapePageHtml）、
+路径归一 `/admin/./` → 302 `Secure` cookie 丢失（README 已写明以 `核心域名/admin` 访问）、
+`arrayBuffer()` 内存上限、`{}` 错误体已修、测试断言恒真类问题已在第九轮修完、
+`normalizeArray` 与 `sanitizeList` 的字符串简写往返、`getProxyKeys` 掩码非空断言。
+
+## 三十、第十一轮验证记录
+
+- `npx tsc --noEmit`：零错误（src + test）。
+- `npm run check`：6 个测试文件 **171** 用例全过（本轮新增 12 条，见下）。
+- `npm run bundle`：`worker.js` 168.0KB，已提交（与 src 同步）。
+- 本轮新增回归用例（`test/routes.spec.ts` → `第十一轮回归（R11-C…）`）：
+  1. 转发 Key `expiresAt` 脏值（0）按已过期处理（fail-closed）；
+  2. 合法未来 `expiresAt` 仍可用（防过严回归）；
+  3. 健康状态 KV 读取抛错时转发仍 200（旁路数据不变现 500）；
+  4. 上游错误体声明 >64KB 被丢弃（文案含「过大」）；
+  5. 上游空 JSON 对象 / 3xx 给出可诊断文案（`HTTP 400` / `HTTP 302` + 502）；
+  6. 内部错误不透原文（`网关内部错误`，且不含 KV 报错片段）；
+  7. `/v1/models` 不列 `baseUrl` 为空的提供商；
+  8. 登录超长字段 401、超大体 413；
+  9. 缺少 `CF-Connecting-IP` 时按 `x-real-ip` 分桶限流（同源 429、异源 200）；
+  10. 未配置管理员账号返回 503；
+  11. 404 响应带 `X-Frame-Options` / `nosniff`（验证 `app.use('*')` 对未命中路由同样生效）；
+  12. `baseUrl` 末尾多斜杠被归一为单个无斜杠路径。
+- 反向验证（断言确实走被测路径）：`expiresAt: 0` 用例在旧真值判断下为 200（当前 401）；
+  健康表/`/v1/models`/413/503/404 安全头等断言均指向新分支，改动前逐一确认会失败。

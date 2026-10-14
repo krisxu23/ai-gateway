@@ -640,3 +640,173 @@ describe('seedInitialData 初始化', () => {
     expect(await getProxyKeys(env)).toEqual([])
   })
 })
+
+describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数据）', () => {
+  it('转发 Key 的 expiresAt 是脏值（0 / 非字符串）时按已过期处理（fail-closed）', async () => {
+    const env = makeEnv()
+    await addProxyKey(env, {
+      id: 'pk-dirty', key: VALID_KEY, name: 'dirty', enabled: true,
+      createdAt: '2025-01-01T00:00:00.000Z', expiresAt: 0 as unknown as string,
+    })
+    await setProviders(env, [makeProvider()])
+    // 旧的 `!k.expiresAt` 真值判断会把 0 当成“永久有效”，已撤销的 Key 反而复活
+    const res = await makeApp().request('/v1/models', { headers: { Authorization: `Bearer ${VALID_KEY}` } }, env)
+    expect(res.status).toBe(401)
+  })
+
+  it('转发 Key 的 expiresAt 是合法的未来时间时仍可用', async () => {
+    const env = makeEnv()
+    await addProxyKey(env, {
+      id: 'pk-live', key: VALID_KEY, name: 'live', enabled: true,
+      createdAt: '2025-01-01T00:00:00.000Z', expiresAt: new Date(Date.now() + 60000).toISOString(),
+    })
+    await setProviders(env, [makeProvider()])
+    const res = await makeApp().request('/v1/models', { headers: { Authorization: `Bearer ${VALID_KEY}` } }, env)
+    expect(res.status).toBe(200)
+  })
+
+  it('健康状态 KV 读取失败不影响转发（旁路数据按全健康处理）', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider()])
+    const base = env.KV
+    env.KV = {
+      get: async (key: string) => {
+        if (key.startsWith(KV_KEYS.KEY_HEALTH_PREFIX)) throw new Error('KV 抖动')
+        return base.get(key)
+      },
+      put: base.put,
+      delete: base.delete,
+    } as unknown as KVNamespace
+    vi.stubGlobal('fetch', async () => new Response('{"ok":true}', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(200)
+  })
+
+  it('上游错误体声明过大时直接丢弃，不读进内存', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ apiKeys: [{ key: 'only', enabled: true }] })])
+    vi.stubGlobal('fetch', async () => {
+      const r = new Response('{}', { status: 400, headers: { 'Content-Type': 'application/json' } })
+      r.headers.set('Content-Length', '999999')
+      return r
+    })
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { message: string } }
+    expect(body.error.message).toContain('过大')
+  })
+
+  it('上游返回空 JSON 对象 / 3xx 时给出可诊断的文案', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ apiKeys: [{ key: 'only', enabled: true }] })])
+    const app = makeApp()
+
+    vi.stubGlobal('fetch', async () => new Response('{}', { status: 400, headers: { 'Content-Type': 'application/json' } }))
+    const empty = await app.request('/v1/chat/completions', chatInit(), env)
+    expect(empty.status).toBe(400)
+    expect(((await empty.json()) as { error: { message: string } }).error.message).toContain('HTTP 400')
+
+    vi.stubGlobal('fetch', async () => new Response('', { status: 302 }))
+    const redirect = await app.request('/v1/chat/completions', chatInit(), env)
+    expect(redirect.status).toBe(502)
+    expect(((await redirect.json()) as { error: { message: string } }).error.message).toContain('HTTP 302')
+  })
+
+  it('内部错误不把原始报错透给调用方', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    env.KV = {
+      get: async () => { throw new Error('KV 内部错误：secret-host') },
+      put: async () => {},
+      delete: async () => {},
+    } as unknown as KVNamespace
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(500)
+    const text = await res.text()
+    expect(text).toContain('网关内部错误')
+    expect(text).not.toContain('secret-host')
+  })
+
+  it('/v1/models 不列出 baseUrl 为空的提供商（其请求必然 502）', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ baseUrl: '' })])
+    const res = await makeApp().request('/v1/models', { headers: { Authorization: `Bearer ${VALID_KEY}` } }, env)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { data: unknown[] }).data).toEqual([])
+  })
+
+  it('登录接口：超长字段直接拒（不计入哈希），超大体返回 413', async () => {
+    const env = makeEnv()
+    const post = (payload: string, ip: string) => makeApp().request('/admin/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-real-ip': ip,
+        // 显式给出与 body 一致的长度：运行时未必自动补 content-length
+        'content-length': String(payload.length),
+      },
+      body: payload,
+    }, env)
+
+    const tooLong = await post(JSON.stringify({ username: 'a'.repeat(300), password: 'x' }), '9.9.9.9')
+    expect(tooLong.status).toBe(401)
+
+    const tooBig = await post(JSON.stringify({ username: 'admin', password: 'x'.repeat(9000) }), '9.9.9.8')
+    expect(tooBig.status).toBe(413)
+  })
+
+  it('登录限流在缺少 CF-Connecting-IP 时回落到 x-real-ip 分桶', async () => {
+    const env = makeEnv()
+    const app = makeApp()
+    const attempt = (ip: string, password: string) => app.request('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-real-ip': ip },
+      body: JSON.stringify({ username: 'admin', password }),
+    }, env)
+
+    for (let i = 0; i < 5; i++) expect((await attempt('7.7.7.7', 'wrong')).status).toBe(401)
+    // 同一来源被锁定
+    expect((await attempt('7.7.7.7', 'pw')).status).toBe(429)
+    // 另一来源不受影响 → 说明用的是 x-real-ip 而不是全局 'unknown' 桶
+    expect((await attempt('8.8.8.8', 'pw')).status).toBe(200)
+  })
+
+  it('未配置管理员账号时返回 503（功能不可用，不是内部故障）', async () => {
+    const env = makeEnv({ ADMIN_USERNAME: undefined, ADMIN_PASSWORD: undefined })
+    const res = await makeApp().request('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'pw' }),
+    }, env)
+    expect(res.status).toBe(503)
+  })
+
+  it('404 响应同样带安全响应头（securityHeaders 注册到 *）', async () => {
+    vi.resetModules()
+    const env = makeEnv()
+    const app = (await import('../src/index')).default
+    const res = await app.request('/nope', {}, env)
+    expect(res.status).toBe(404)
+    expect(res.headers.get('X-Frame-Options')).toBe('DENY')
+    expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+  })
+
+  it('提供商 baseUrl 末尾的多个斜杠被归一，避免拼出 //chat/completions', async () => {
+    const env = makeEnv()
+    const res = await makeApp().request('/admin/api/providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(await adminHeaders(env)) },
+      body: JSON.stringify({ id: 'p9', name: 'P9', baseUrl: 'https://up.example.com/v1//' }),
+    }, env)
+    expect(res.status).toBe(201)
+    const body = (await res.json()) as { data: { baseUrl: string } }
+    expect(body.data.baseUrl).toBe('https://up.example.com/v1')
+  })
+})

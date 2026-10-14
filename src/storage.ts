@@ -78,7 +78,14 @@ function sanitizeList(key: string, raw: unknown[]): unknown[] {
         baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
         enabled: p.enabled === true,
         models: Array.isArray(p.models) ? toStringEntries(p.models, 'id').map(withBoolEnabled) : [],
-        apiKeys: Array.isArray(p.apiKeys) ? toStringEntries(p.apiKeys, 'key').map(withBoolEnabled) : [],
+        // enabled 之外还要有非空 key：转发侧按 enabled 过滤，空 key 会被选中并把
+        // `Bearer ` 发给上游（写路径已拒绝，这里兜住历史/人工写入的脏数据）
+        apiKeys: Array.isArray(p.apiKeys)
+          ? toStringEntries(p.apiKeys, 'key').map((k) => ({
+              ...k,
+              enabled: k.enabled === true && typeof k.key === 'string' && k.key.trim() !== '',
+            }))
+          : [],
       })
     }
     return out
@@ -288,7 +295,13 @@ export async function validateProxyKey(env: Env, key: string): Promise<boolean> 
   if (!key) return false
   const keys = await getProxyKeys(env)
   const now = Date.now()
-  return keys.some((k) => k.key === key && k.enabled && (!k.expiresAt || now < new Date(k.expiresAt).getTime()))
+  // expiresAt 只认 ISO 字符串或 null/undefined：0、''、数字等脏值一律按「已过期」处理
+  // （fail-closed）——按真值判断的话，被清洗成 0 的字段会让已撤销的 Key 变成永久有效。
+  return keys.some((k) => {
+    if (k.key !== key || !k.enabled) return false
+    if (k.expiresAt == null) return true
+    return typeof k.expiresAt === 'string' && now < new Date(k.expiresAt).getTime()
+  })
 }
 
 // ===== 初始数据填充 =====

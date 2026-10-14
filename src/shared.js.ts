@@ -23,11 +23,16 @@ function escapeHtml(value) {
 
 // ── UI 函数 ──
 function showSpinner(el) {
+  // 同一结果容器上已有在途测试时不重复发起：并发响应会互相覆盖，白白消耗上游配额
+  if (el.dataset.busy) return false
+  el.dataset.busy = '1'
   el.innerHTML = '<span class="mu"><i class="fas fa-spinner fa-spin"></i> 测试中...</span>'
+  return true
 }
-function showResult(el, success, msg) {
+function showResult(el, success, msg, note) {
+  delete el.dataset.busy
   el.innerHTML = success
-    ? '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功</div>'
+    ? '<div class="al al-s"><i class="fas fa-check-circle"></i> 连接成功' + (note ? ' <span class="mu">' + escapeHtml(note) + '</span>' : '') + '</div>'
     : '<div class="al al-e"><i class="fas fa-times-circle"></i> ' + escapeHtml(msg || '连接失败') + '</div>'
 }
 
