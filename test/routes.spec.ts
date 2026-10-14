@@ -592,6 +592,30 @@ describe('页面渲染', () => {
     expect(loginHtml).toContain('type="password"')
     expect(loginHtml).not.toContain('s3cret-do-not-echo')
   })
+
+  it('渲染出的页面 id 不重复（getElementById 唯一性）', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider()])
+    const cookie = await createSession(env, 'admin', 60)
+
+    const home = await makePageApp().request('/', {}, env)
+    const login = await makePageApp().request('/admin/login', {}, env)
+    const admin = await makeApp().request('/admin', { headers: { Cookie: `session_id=${cookie}` } }, env)
+    expect(admin.status).toBe(200)
+
+    const pages: Array<[string, string]> = [
+      ['首页', await home.text()],
+      ['登录页', await login.text()],
+      ['管理台', await admin.text()],
+    ]
+    for (const [name, html] of pages) {
+      const ids = [...html.matchAll(/ id="([^"]+)"/g)].map((m) => m[1])
+      const seen = new Set<string>()
+      const dup = ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false)))
+      expect(dup, `${name} 出现重复 id`).toEqual([])
+    }
+  })
 })
 
 describe('seedInitialData 初始化', () => {
