@@ -363,6 +363,9 @@ export function createResponsesToChatStream(
   ): number | null => {
     // 已被吐掉的桩不能再合成：done 事件不带 name，用空名判定会把它当成真实调用下发
     if (swallowedIds.has(itemID)) return null
+    // 没有名字的调用客户端无法执行（参数再完整也没用）：宁可不发，也避免把桩的
+    // 「空名 + 真实参数」合成成一个客户端会照做的调用
+    if (typeof rawName !== 'string' || rawName === '') return null
     const { name, isStub } = resolveToolName(typeof rawName === 'string' ? rawName : '')
     if (isStub) return null
     let idx = toolIdx[itemID] as number | undefined
@@ -413,6 +416,9 @@ export function createResponsesToChatStream(
           const { name, isStub } = resolveToolName(typeof item.name === 'string' ? item.name : '')
           if (isStub) {
             swallowedIds.add(itemID)
+            // 有的上游只在 done 里给 item_id、在 added 里只给 call_id：两个都记上，
+            // 否则 id 对不上时参数会从 pendingDone 绕过去被合成下发
+            if (typeof item.call_id === 'string' && item.call_id) swallowedIds.add(item.call_id)
             // done 早于 added 到达时缓存的参数要一并丢掉, 否则收尾会把它合成成调用
             delete pendingDone[itemID]
             break

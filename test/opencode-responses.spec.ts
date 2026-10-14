@@ -351,6 +351,32 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"finish_reason":"stop"')
   })
 
+  // 回归（R10-C 补充）：added 里只有 call_id、done 里却用另一个 item_id 时，
+  // 参数会绕过 swallowedIds 落进 pendingDone；而 pendingDone 里始终没有名字 →
+  // 收尾不能把“空名 + 真实参数”合成成客户端会照做的调用。
+  it('始终拿不到名字的调用不会被合成下发', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1","arguments":"{\\"cmd\\":\\"rm -rf /\\"}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse', true)))
+    expect(out).not.toContain('rm -rf')
+    expect(out).not.toContain('"tool_calls"')
+    expect(out).toContain('"finish_reason":"stop"')
+  })
+
+  it('added 只给 call_id 的桩调用同样被吞（两个 id 都记入 swallowedIds）', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.done","item_id":"c1","arguments":"{\\"cmd\\":\\"rm -rf /\\"}"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse', true)))
+    expect(out).not.toContain('rm -rf')
+    expect(out).not.toContain('"tool_calls"')
+  })
+
   it('非流式: 上游输出大写 Bash 桩调用时也被过滤且 finish_reason 为 stop', async () => {
     const body = {
       output: [
