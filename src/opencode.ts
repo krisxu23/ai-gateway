@@ -362,6 +362,9 @@ export async function collapseChatSseToJson(
   let usage: unknown
   const toolCalls: Array<Record<string, unknown>> = []
   const argBufs: string[] = []
+  // 越界/非整数 index 的独立槽位：直接复用 toolCalls.length 会正好撞上下一个合法
+  // index 通常要占的槽位，把两条调用合并（参数拼接、name 被覆盖）
+  const overflowSlot = new Map<number, number>()
   const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   outer: for (const chunk of normalized.split('\n\n')) {
     for (const rawLine of chunk.split('\n')) {
@@ -381,10 +384,17 @@ export async function collapseChatSseToJson(
             for (const call of tc) {
               const rawIdx = call.index
               // index 只用于定位: 非整数/负数/越界一律当作新的一条，否则
-              // index=1e6 的输入会被序列化成上百万个 null（响应放大）
-              const idx = Number.isInteger(rawIdx) && (rawIdx as number) >= 0 && (rawIdx as number) < MAX_TOOL_INDEX
-                ? (rawIdx as number)
-                : toolCalls.length
+              // index=1e6 的输入会被序列化成上百万个 null（响应放大）。
+              // 越界值占用独立槽位（同一越界值只占一个），避免与合法 index 撞车。
+              const rawNum = typeof rawIdx === 'number' ? rawIdx : NaN
+              let idx: number
+              if (Number.isInteger(rawNum) && rawNum >= 0 && rawNum < MAX_TOOL_INDEX) {
+                idx = rawNum
+              } else {
+                const slot = overflowSlot.get(rawNum)
+                idx = slot === undefined ? MAX_TOOL_INDEX + overflowSlot.size : slot
+                overflowSlot.set(rawNum, idx)
+              }
               if (!toolCalls[idx]) {
                 toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
                 argBufs[idx] = ''

@@ -314,6 +314,43 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"finish_reason":"stop"')
   })
 
+  // 回归（R10-C）：桩在 added 被吞后只进 swallowedIds，而 arguments.done 不带 name，
+  // 参数会被缓存并在收尾合成成“空名 + 真实参数”的调用下发给客户端（桩参数泄露），
+  // 且整轮只有桩时 finish_reason 被报成 length（误导性的“被截断”）。
+  it('参数 done 先于 added 的桩调用不泄露参数，且整轮只调桩时报 stop', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.function_call_arguments.done","item_id":"i1","arguments":"{\\"cmd\\":\\"rm -rf /\\"}"}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse', true)))
+    expect(out).not.toContain('rm -rf')
+    expect(out).not.toContain('"tool_calls"')
+    expect(out).toContain('"finish_reason":"stop"')
+  })
+
+  it('终态 output 里的桩调用也不会被合成下发', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.completed","response":{"output":[{"type":"function_call","id":"i1","call_id":"c1","name":"bash","arguments":"{\\"cmd\\":\\"rm -rf /\\"}"}]}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse', true)))
+    expect(out).not.toContain('rm -rf')
+    expect(out).not.toContain('"tool_calls"')
+  })
+
+  // 回归（R10-C）：output_text.done 已给出全文后，上游又补一个 delta 会把正文发两遍
+  it('output_text.done 之后到达的 delta 不再重复正文', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_text.done","text":"Hello"}\n\n',
+      'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out.match(/"content":"Hello"/g)).toHaveLength(1)
+    expect(out).toContain('"finish_reason":"stop"')
+  })
+
   it('非流式: 上游输出大写 Bash 桩调用时也被过滤且 finish_reason 为 stop', async () => {
     const body = {
       output: [

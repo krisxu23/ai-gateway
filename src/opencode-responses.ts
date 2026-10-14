@@ -300,6 +300,9 @@ export function createResponsesToChatStream(
   // 是否已下发过正文增量: 流在 response.completed 之前断开时据此区分
   // "回答被截断"(length) 与 "上游就发了个空回复"(stop)
   let sawText = false
+  // 正文是否已定稿(response.output_text.done 到达)：终态之后再到 delta 属上游重排，
+  // 追加会把同一段正文发两遍
+  let textFinalized = false
   // 已下发工具调用的“参数完整性”：流式下 arguments 是边收边发的，只有拿到
   // “参数收完”的信号(output_item.done / function_call_arguments.done)或参数本身
   // 已是完整 JSON，才能报告 tool_calls —— 客户端在 tool_calls 下会直接执行参数，
@@ -358,6 +361,8 @@ export function createResponsesToChatStream(
     rawArgs: unknown,
     callId: string
   ): number | null => {
+    // 已被吐掉的桩不能再合成：done 事件不带 name，用空名判定会把它当成真实调用下发
+    if (swallowedIds.has(itemID)) return null
     const { name, isStub } = resolveToolName(typeof rawName === 'string' ? rawName : '')
     if (isStub) return null
     let idx = toolIdx[itemID] as number | undefined
@@ -380,12 +385,14 @@ export function createResponsesToChatStream(
     const type = typeof ev.type === 'string' ? ev.type : ''
     switch (type) {
       case 'response.output_text.delta':
-        if (typeof ev.delta === 'string' && ev.delta) {
+        if (!textFinalized && typeof ev.delta === 'string' && ev.delta) {
           sawText = true
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, { content: ev.delta })))
         }
         break
       case 'response.output_text.done':
+        // done 是正文的终态：之后到达的 delta 忽略，避免同一段正文发两遍
+        textFinalized = true
         // 上游只在 done 里给全文(不发 delta)时不能丢正文
         if (!sawText && typeof ev.text === 'string' && ev.text) {
           sawText = true
@@ -406,6 +413,8 @@ export function createResponsesToChatStream(
           const { name, isStub } = resolveToolName(typeof item.name === 'string' ? item.name : '')
           if (isStub) {
             swallowedIds.add(itemID)
+            // done 早于 added 到达时缓存的参数要一并丢掉, 否则收尾会把它合成成调用
+            delete pendingDone[itemID]
             break
           }
           const idx = nextIdx++
@@ -473,6 +482,9 @@ export function createResponsesToChatStream(
           ? ev.arguments
           : typeof item?.arguments === 'string' ? item.arguments : ''
         const rawName = typeof item?.name === 'string' ? item.name : ''
+        // 桩在 added 就被吐了: 这里的 done 不带 name, 缓存进 pendingDone 后会被收尾
+        // 合成成“空名 + 真实参数”的调用下发给客户端(桩参数泄露)
+        if (itemID && swallowedIds.has(itemID)) break
         const idx = itemID ? (toolIdx[itemID] as number | undefined) : undefined
         if (idx === undefined) {
           // added 还没到: 先缓存名字与参数, 等 added 建好索引再补发(或在收尾时
@@ -536,9 +548,12 @@ export function createResponsesToChatStream(
         // arguments 是边收边发的: 只有拿到"参数收完"的信号才算完整调用, 否则报
         // length —— 客户端在 tool_calls 下会直接执行参数, 半截 JSON 会被当合法参数。
         // nextIdx 只计真实下发的工具调用(桩不递增), 与被吞数量无关。
+        // 整轮只调了桩且无正文: 与非流式路径一致地以 stop 结束（桩被吞掉,
+        // 客户端不该看到任何调用, 也不该收到 length 这种“被截断”的误导信号）
+        const stubsOnly = nextIdx === 0 && swallowedIds.size > 0 && !sawText
         const finish = nextIdx > 0
           ? (allToolsFinalized() ? 'tool_calls' : 'length')
-          : incomplete || hitLimit ? 'length' : 'stop'
+          : stubsOnly ? 'stop' : incomplete || hitLimit ? 'length' : 'stop'
         const usageOut = usage
           ? {
               prompt_tokens: usage.input_tokens ?? 0,

@@ -364,6 +364,41 @@ describe('enabled 字段类型校验', () => {
   })
 })
 
+// 回归（R10-B）：缺 key 的 apiKeys 条目会被算作“已启用”→ 绕过“未配置可用 Key”
+// 守卫，把 `Bearer undefined` 发给上游；非数组则被 normalizeArray 当空数组 → 静默清空
+// 整个字段却返回 200；响应曾直接回显入参，与 GET 归一化后的形状不一致。
+describe('提供商字段结构校验', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.post('/admin/api/providers', handleCreateProvider)
+  app.put('/admin/api/providers/:id', handleUpdateProvider)
+
+  const post = (env: Env, body: unknown) =>
+    app.request('/admin/api/providers', jsonInit(body), env)
+
+  const base = { id: 'p1', name: 'P1', baseUrl: 'https://api.example.com/v1' }
+
+  it('apiKeys 条目缺少 key 时返回 400', async () => {
+    const res = await post(makeEnv(), { ...base, apiKeys: [{}] })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ message: expect.stringContaining('apiKeys') })
+  })
+
+  it('models / apiKeys 传非数组时返回 400（不再静默清空整个字段）', async () => {
+    expect((await post(makeEnv(), { ...base, models: 'gpt-4' })).status).toBe(400)
+    expect((await post(makeEnv(), { ...base, apiKeys: { key: 'sk-x' } })).status).toBe(400)
+  })
+
+  it('创建响应的形状与 GET 一致（回读归一化后的对象）', async () => {
+    const env = makeEnv()
+    const created = await (await post(env, { ...base, apiKeys: [{ key: 'sk-x' }] })).json() as {
+      data: { apiKeys: Array<{ key: string; enabled: boolean }> }
+    }
+    expect(created.data.apiKeys).toEqual([{ key: 'sk-x', enabled: false }])
+    const stored = (await getProviders(env)).find((p) => p.id === 'p1')!
+    expect(created.data.apiKeys).toEqual(stored.apiKeys)
+  })
+})
+
 describe('转发请求体校验', () => {
   const app = new Hono<{ Bindings: Env }>()
   app.all('/v1/*', handleProxy)
@@ -453,8 +488,28 @@ describe('管理台模型行渲染', () => {
 
 // 内联 JS 是模板字符串，tsc 不检查它；这里只用 new Function 做语法解析（不执行），
 // 拦住“手改前端脚本留下语法错误”这类静默事故。
-describe('页面内联脚本语法', () => {
-  it('管理台与首页的 <script> 都能被解析', async () => {
+// 回归（R10-A）：首页 `#copy-status` 曾被 getElementById 引用但从未渲染（死代码，
+// 复制成功/失败都没有读屏播报）；toast() 曾把任何非 success 的提示（含进度提示）
+// 渲染成红色错误样式。
+describe('前端渲染回归', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.get('/', (c) => renderHomePage(c, false))
+  app.get('/admin', renderAdminPage)
+
+  it('首页渲染复制状态播报节点', async () => {
+    const html = await (await app.request('/', undefined, makeEnv())).text()
+    expect(html).toContain('id="copy-status"')
+    expect(html).toContain('aria-live="polite"')
+  })
+
+  it('toast 缺省类型时用中立（info）样式而非错误样式', async () => {
+    const html = await (await app.request('/admin', undefined, makeEnv())).text()
+    // fa-info-circle 全文只出现在 toast 的中立分支里
+    expect(html).toContain('fa-info-circle')
+  })
+})
+
+describe('页面内联脚本语法', () => {  it('管理台与首页的 <script> 都能被解析', async () => {
     const env = makeEnv()
     const app = new Hono<{ Bindings: Env }>()
     app.get('/', (c) => renderHomePage(c, false))

@@ -623,7 +623,7 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 
 | 编号 | 问题 | 修复 |
 | --- | --- | --- |
-| R9A-H1 | `collapseChatSseToJson` 对 `tool_call.index` 无上界：上游给 `index: 999999` 会生成百万级稀疏数组 → 内存/序列化放大（DoS） | 加 `MAX_TOOL_INDEX = 128`，越界索引按“溢出槽位”合并（不再按 index 分配） |
+| R9A-H1 | `collapseChatSseToJson` 对 `tool_call.index` 无上界：上游给 `index: 999999` 会生成百万级稀疏数组 → 内存/序列化放大（DoS） | 加 `MAX_TOOL_INDEX = 256`，越界索引按独立溢出槽合并（第十轮 R10C-F2 改为 `overflowSlot` Map，不再按 index 分配） |
 | R9A-M1 | `output_item.done` 缺 `arguments` 时用 `'{}'` 覆盖已累计参数 → 客户端拼出非法 JSON 且被标记为“已收完” | 无 `arguments` 时沿用已累计值；只有 `isCompleteJson` 才 `finalizedIds.add` |
 | R9A-M2 | `allToolsFinalized()` 未校验 JSON 完整性（参数被截断也报 `tool_calls`） | `finalizedIds.has(id) \|\| isCompleteJson(toolArgs[id])` |
 | R9A-M3 | 工具调用先到、`output_item.added` 始终不来时调用彻底丢失 | 新增 `synthesizeCall()`：按 added 形状补发 name 并建索引，收尾前从 `pendingDone` 合成 |
@@ -669,3 +669,49 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 **本轮新增用例（5 条 + 3 处强化）**：嵌套 `enabled` 非布尔 → 400；写路径缓存过 `sanitizeList`（脏数据不会在 60s 内“复活”）；并发同 id 创建 → 一个 201 一个 409 且只落一条；`name` 空串 → 400；`/v1/*` 带 `nosniff`；强化：429 全部失败 → `type: rate_limited` 且健康表整体为空（原 `?? 0` 写法在 `writeHealth` 失效时也成立）、过期会话用 KV 里 `expiresAt` 已过去的记录覆盖（断言 `Max-Age=0` 且会话被删除）。
 
 **未覆盖（已知盲区，同第八轮）**：`testModelConnection` / `testOpenCodeModel` / `fetchOpenCodeModels`（需真实网络）、页面像素级断言、`createKeepAliveStream` 保活细节、`storeFailure` 体积上限回放、`loginFailures` 的 1000 条上限淘汰（需 1001 个真实源 IP，且有 400ms 失败延时，不适合单测）。
+
+## 二十七、第十轮修复记录（R10-A 前端 / R10-B 契约 / R10-C 状态机）
+
+### 27.1 R10-A：前端与 SSR 模板（`del_mv7k8pce_u3fl`）
+
+| 编号 | 问题 | 处置 |
+| --- | --- | --- |
+| R10A-F1 | 首页 `#copy-status` 被 `getElementById` 引用但从未渲染 → `if (status)` 是死代码，复制成功/失败都没有读屏播报 | 首页复制控件旁补 `<span id="copy-status" class="sr-only" role="status" aria-live="polite">`（`src/pages.ts`），`renderHomePage` 渲染；新增用例断言该节点存在 |
+| R10A-F2 | `toast(msg)` 未传类型时套 `al-e` + `fa-times-circle`（红色错误样式）：进度提示「正在保存…」与「列表内模型均已存在」都被渲染成失败 | `toast` 增加中立态（`al-i` + `fa-info-circle`）作为缺省；「均已存在」改传 `'info'` |
+| R10A-F3 | `.al-s` 独有 `margin-top: 20px`，`.al-e` 没有 → 测试结果区在成功/失败之间跳动，且 20px 绕过 `--space-*` 令牌 | 上边距移到 `.al`（`1.25rem`），三种状态一致；`.toast .al { margin-top: 0 }` 继续中和 toast（注释同步） |
+| R10A-F4 | 首页复制直接 `await navigator.clipboard.writeText`（无守卫，非安全上下文会抛未捕获错误），且错误态不像成功态那样复位 | 加 `navigator.clipboard` 守卫；抽出 `reset()` 在成功与失败两条分支都复位（1800ms） |
+| R10A-F5 | 注释「上一条的定时器不清理，会把新提示提前关掉」字面像在描述 bug | 改为「先清掉上一条定时器，否则它会把新提示提前关掉」 |
+
+同轮 R10-A 复核确认闭环（不重复修）：`apiJson` 与 9 处调用方契约一致、`save()` 布尔返回、`togglePb`/`toggleProxyKey` 的 busy 守卫与乐观回滚、`modelRowHTML` 的 `data-mid`（模型 ID 不再进 JS 字符串）、CSS 无 `</style>` 破坏序列、静态 `#amc` 与动态面板结构对称、登录页脚本可解析、`toggleKeyVis` 掩码与 SSR 一致。
+
+### 27.2 R10-B：管理接口契约（`del_mv7k8pcf_4qnn`）
+
+| 编号 | 问题 | 处置 |
+| --- | --- | --- |
+| R10B-B1 | `apiKeys` 里启用态但缺 `key` 的对象条目会被算作「已配置可用 Key」→ 绕过守卫，把 `Bearer undefined` 发给上游 | 新增 `hasKeylessApiKey()`：对象条目在非停用（`enabled !== false`）时必须有非空字符串 `key`，否则 400；已停用条目与非对象脏条目仍按原语义丢弃 |
+| R10B-B2 | `models`/`apiKeys` 传非数组时 `normalizeArray` 当空数组 → 静默清空整个字段却返回 200（数据丢失） | create/update 都显式 `!Array.isArray` → 400 |
+| R10B-B3 | create/update 的响应直接回显入参，与 GET/KV 归一化后的形状不一致（如 `{"key":"k"}` 实为 `enabled:false`） | 响应改为回读 `getProvider()`（缺失才回退内存对象） |
+| R10B-B4 | 转发 Key 的 `name` 未校验类型 | 非字符串 → 400 |
+| R10B-B5 | 「同 id 时非法输入 400 优先于状态冲突 409」是否为缺陷 | **已核实非问题**：先校验格式再判冲突是正确的校验语义（避免用 409 掩盖畸形输入），保留 |
+
+### 27.3 R10-C：OpenCode 翻译状态机（`del_mv7k9nev_e0d0`）
+
+| 编号 | 问题 | 处置 |
+| --- | --- | --- |
+| R10C-F1 | 桩调用参数泄漏：桩在 `output_item.added` 被吞后只进 `swallowedIds`，而 `function_call_arguments.done` 不带 name → 参数被缓存进 `pendingDone`，收尾被合成成「空名 + 真实参数」下发给客户端（四种事件顺序全泄漏，单测只覆盖了带 name 的路径） | 三处封堵：`synthesizeCall` 开头 `swallowedIds.has(itemID) → null`；done 分支算出 itemID 后 `swallowedIds.has(itemID) → break`；added 的桩分支 `delete pendingDone[itemID]` |
+| R10C-F2 | `collapseChatSseToJson` 里越界/非整数 `index` 复用 `toolCalls.length` —— 那正好是下一个合法 index 的槽位 → 两条调用被合并（参数拼接、name 被覆盖） | 越界值改为独立溢出槽：`overflowSlot: Map<number, number>`，同一越界值只占一个槽，取 `MAX_TOOL_INDEX + overflowSlot.size` |
+| R10C-F3 | 整轮只调了桩且无正文时，流式 `finish_reason` 报 `length`（非流式路径报 `stop`），客户端会以为被截断 | `stubsOnly = nextIdx === 0 && swallowedIds.size > 0 && !sawText` → 报 `stop`，与非流式对齐 |
+| R10C-F4 | `response.output_text.done` 已给出全文后又来 `delta` → 同一段正文发两遍 | 新增 `textFinalized`，done 时置位，之后忽略文本 delta |
+
+**有意保留**：上游无终结符直接断开时纯文本流报 `length`（同 25.3 R9A-L4）。
+
+## 二十八、第十轮验证记录
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run check` | tsc 零错误（src + test）+ 6 文件 **157 用例全过** |
+| `npm run bundle` | worker.js 重建 169,629 B（166.1kb），与 src 同步 |
+
+**本轮新增用例（11 条）**：apiKeys 缺 key → 400；`models`/`apiKeys` 非数组 → 400；创建响应形状与 GET 一致（回读归一化）；参数 `done` 先于 `added` 的桩调用不泄露参数且整轮只调桩报 `stop`；终态 `output` 里的桩调用不被合成；`output_text.done` 之后的 `delta` 不重复正文；越界 `index` 与合法 `index` 各自独立；同一越界 `index` 的多个增量归并为一条；非整数 `index` 不与合法 `index` 合并；首页渲染 `#copy-status`；toast 缺省用中立样式。
+
+**第 25.2 节勘误**：R9A-H1 记录为 `MAX_TOOL_INDEX = 128`，实际代码与第十轮修复均为 `256`（`src/opencode.ts`），越界策略已由「合并到当前长度」改为 27.3 的独立溢出槽。

@@ -69,6 +69,7 @@ ${H('首页')}
           <i class="far fa-copy" aria-hidden="true"></i><span>复制</span>
         </button>
       </div>
+      <span id="copy-status" class="sr-only" role="status" aria-live="polite"></span>
     </div>
 
     <figure class="request-panel" aria-labelledby="request-caption">
@@ -145,20 +146,25 @@ ${renderSiteFooter(SITE_CONFIG.title)}
       var text = button.getAttribute('data-copy') || ''
       var icon = button.querySelector('i')
       var label = button.querySelector('span')
+      var reset = function () {
+        button.removeAttribute('data-state')
+        if (icon) icon.className = 'far fa-copy'
+        if (label) label.textContent = '复制'
+      }
       try {
+        // 非安全上下文/部分 WebView 没有 clipboard API，直接调会抛未捕获错误
+        if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable')
         await navigator.clipboard.writeText(text)
         button.setAttribute('data-state', 'success')
         if (icon) icon.className = 'fas fa-check c-s'
         if (label) label.textContent = '已复制'
         if (status) status.textContent = '已复制 ' + text
-        window.setTimeout(function () {
-          button.removeAttribute('data-state')
-          if (icon) icon.className = 'far fa-copy'
-          if (label) label.textContent = '复制'
-        }, 1800)
+        window.setTimeout(reset, 1800)
       } catch (error) {
         button.setAttribute('data-state', 'error')
         if (status) status.textContent = '复制失败，请手动选择文本。'
+        // 与成功态一致地复位，否则红色错误边框会一直留着
+        window.setTimeout(reset, 1800)
       }
     })
   })
@@ -476,11 +482,11 @@ function pM(msg, def) {
 let toastTimer = 0
 function toast(msg, t) {
   const el = document.getElementById('toast')
-  const i = t === 'success' ? 'fa-check-circle' : 'fa-times-circle'
-  const cls = t === 'success' ? 'al-s' : 'al-e'
+  const i = t === 'success' ? 'fa-check-circle' : t === 'error' ? 'fa-times-circle' : 'fa-info-circle'
+  const cls = t === 'success' ? 'al-s' : t === 'error' ? 'al-e' : 'al-i'
   el.innerHTML = '<div class="al ' + cls + '"><i class="fas ' + i + '"></i> ' + escapeHtml(msg) + '</div>'
   el.classList.remove('hd')
-  // 上一条的定时器不清理，会把新提示提前关掉
+  // 先清掉上一条定时器，否则它会把新提示提前关掉
   clearTimeout(toastTimer)
   toastTimer = setTimeout(() => el.classList.add('hd'), 3000)
 }
@@ -578,7 +584,7 @@ async function addAllUpstream(panelId) {
     // 循环内同步标记：上游列表自身重复的 id 会被加两次
     if (!existing[mid]) { existing[mid] = true; addMdlToEdit(id, mid); added++ }
   })
-  if (!added) { toast('列表内模型均已存在，无需入库', 'error'); return }
+  if (!added) { toast('列表内模型均已存在，无需入库', 'info'); return }
   // 先报进度再保存：save 成功后自己 toast 并 reload（reload 会清掉这条提示）
   toast('已加入 ' + added + ' 个模型，正在保存…')
   await save(id)

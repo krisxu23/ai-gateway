@@ -341,8 +341,8 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .key-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-2xs); }
 
 /* feedback, model list and modal */
-.al { min-height: var(--control-h); padding: var(--space-xs); display: flex; align-items: center; gap: var(--space-2xs); border: .0625rem solid transparent; border-radius: var(--radius-control); font-size: var(--text-xs); }
-.al-s { border-color: var(--color-success); background: var(--color-success-soft); color: var(--color-success-ink); margin-top: 20px; }
+.al { min-height: var(--control-h); padding: var(--space-xs); display: flex; align-items: center; gap: var(--space-2xs); border: .0625rem solid transparent; border-radius: var(--radius-control); font-size: var(--text-xs); margin-top: 1.25rem; }
+.al-s { border-color: var(--color-success); background: var(--color-success-soft); color: var(--color-success-ink); }
 /* toast 里的 .al 已定位在右上角，再叠 20px 上边距会把它推离视口边缘 */
 .toast .al { margin-top: 0; }
 .al-e { border-color: var(--color-danger); background: var(--color-danger-soft); color: var(--color-danger-ink); }

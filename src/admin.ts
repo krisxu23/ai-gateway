@@ -134,6 +134,21 @@ function findInvalidEnabled(items: unknown): boolean {
   )
 }
 
+/**
+ * apiKeys 的对象条目缺非空 key 时会被当成「已启用」→ 绕过「未配置可用 Key」的
+ * 守卫，把 `Bearer undefined` 发给上游。已停用（enabled:false）的条目不参与转发，
+ * 缺 key 无害；非对象条目由存储层归一化时丢弃（Key 简写字符串不受影响）。
+ */
+function hasKeylessApiKey(items: unknown): boolean {
+  if (!Array.isArray(items)) return false
+  return items.some((item) => {
+    if (typeof item !== 'object' || item === null) return false
+    const entry = item as { key?: unknown; enabled?: unknown }
+    if (entry.enabled === false) return false
+    return !(typeof entry.key === 'string' && entry.key !== '')
+  })
+}
+
 // 模型 ID 会渲染进管理台 HTML 属性，且可来自上游 /models 接口，属于不可信输入：
 // 只放行安全字符集，从源头堵死注入（渲染侧的 data-mid 传递是第二道防线）
 const MODEL_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/
@@ -220,6 +235,17 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
   }
 
+  // 非数组会被 normalizeArray 当空数组 → 静默清空整字段(数据丢失且返回 200)
+  if (body.models !== undefined && !Array.isArray(body.models)) {
+    return c.json<ApiResponse>({ success: false, message: 'models 必须是数组' }, 400)
+  }
+  if (body.apiKeys !== undefined && !Array.isArray(body.apiKeys)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys 必须是数组' }, 400)
+  }
+  if (hasKeylessApiKey(body.apiKeys)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys 条目必须包含非空的 key' }, 400)
+  }
+
   const badModel = findInvalidModelId(body.models)
   if (badModel !== null) {
     return c.json<ApiResponse>({ success: false, message: invalidModelMessage(badModel) }, 400)
@@ -255,7 +281,9 @@ export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   if (!(await addProvider(c.env, provider))) {
     return c.json<ApiResponse>({ success: false, message: `提供商 id "${body.id}" 已存在` }, 409)
   }
-  return c.json<ApiResponse<Provider>>({ success: true, data: provider }, 201)
+  // 回读存储层归一化后的对象：直接回显入参会与 GET/KV 的形状不一致
+  // （例如 apiKeys 里 `{"key":"k"}` 实际以 enabled:false 落库）
+  return c.json<ApiResponse<Provider>>({ success: true, data: (await getProvider(c.env, provider.id)) ?? provider }, 201)
 }
 
 export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
@@ -280,6 +308,15 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
       return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
     }
     updates.baseUrl = body.baseUrl.replace(/\/$/, '')
+  }
+  if (body.models !== undefined && !Array.isArray(body.models)) {
+    return c.json<ApiResponse>({ success: false, message: 'models 必须是数组' }, 400)
+  }
+  if (body.apiKeys !== undefined && !Array.isArray(body.apiKeys)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys 必须是数组' }, 400)
+  }
+  if (hasKeylessApiKey(body.apiKeys)) {
+    return c.json<ApiResponse>({ success: false, message: 'apiKeys 条目必须包含非空的 key' }, 400)
   }
   if (body.apiType !== undefined) {
     if (!isApiType(body.apiType)) {
@@ -313,7 +350,8 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
     return c.json<ApiResponse>({ success: false, message: '提供商不存在' }, 404)
   }
 
-  return c.json<ApiResponse<Provider>>({ success: true, data: updated })
+  // 与创建路径同理：回读归一化后的对象，避免响应与 GET 的形状不一致
+  return c.json<ApiResponse<Provider>>({ success: true, data: (await getProvider(c.env, id)) ?? updated })
 }
 
 export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
@@ -488,6 +526,9 @@ export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
 
 export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
   const body = await readJsonBody<CreateProxyKeyRequest>(c)
+  if (body.name !== undefined && typeof body.name !== 'string') {
+    return c.json<ApiResponse>({ success: false, message: 'name 必须是字符串' }, 400)
+  }
   const id = crypto.randomUUID()
   const randomPart = crypto.randomUUID().replace(/-/g, '')
   const key = `${PROXY_KEY_PREFIX}${randomPart}`

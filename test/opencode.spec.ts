@@ -511,6 +511,56 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
   })
 })
 
+// 回归（R10-C）：越界/非整数的 tool_call.index 曾被当成新的一条并复用
+// toolCalls.length —— 那正好是下一个合法 index 的槽位，两条调用会被合并
+// （参数拼接、name 被覆盖），客户端会执行拼错的调用。
+describe('collapseChatSseToJson: 越界工具索引', () => {
+  const call = (index: unknown, id: string, name: string, args: string) =>
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index, id, function: { name, arguments: args } }] } }] })}\n\n`
+
+  async function callsOf(events: string[]) {
+    const res = await collapseChatSseToJson(sseResponse(events), 'm', false)
+    const body = await res.json() as {
+      choices: Array<{ message: { tool_calls: Array<{ id: string; function: { name: string; arguments: string } }> } }>
+    }
+    return body.choices[0].message.tool_calls
+  }
+
+  it('越界 index 与合法 index 各自独立', async () => {
+    const calls = await callsOf([
+      call(1000000, 'call_a', 'alpha', '{"a":1}'),
+      call(0, 'call_b', 'beta', '{"b":2}'),
+      'data: [DONE]\n\n',
+    ])
+    expect(calls).toHaveLength(2)
+    expect(calls.find((c) => c.id === 'call_a')!.function.name).toBe('alpha')
+    expect(calls.find((c) => c.id === 'call_a')!.function.arguments).toBe('{"a":1}')
+    expect(calls.find((c) => c.id === 'call_b')!.function.name).toBe('beta')
+    expect(calls.find((c) => c.id === 'call_b')!.function.arguments).toBe('{"b":2}')
+  })
+
+  it('同一越界 index 的多个增量仍归并到同一条调用', async () => {
+    const calls = await callsOf([
+      call(999999, 'call_a', 'alpha', '{"a":'),
+      call(999999, 'call_a', '', '1}'),
+      'data: [DONE]\n\n',
+    ])
+    expect(calls).toHaveLength(1)
+    expect(calls[0].function.arguments).toBe('{"a":1}')
+  })
+
+  it('非整数 index 不会与合法 index 合并', async () => {
+    const calls = await callsOf([
+      call('7', 'call_a', 'alpha', '{"a":1}'),
+      call(0, 'call_b', 'beta', '{"b":2}'),
+      'data: [DONE]\n\n',
+    ])
+    expect(calls).toHaveLength(2)
+    expect(calls.find((c) => c.id === 'call_a')!.function.arguments).toBe('{"a":1}')
+    expect(calls.find((c) => c.id === 'call_b')!.function.arguments).toBe('{"b":2}')
+  })
+})
+
 describe('generateOpenCodeId & resolveSessionId', () => {
   it('生成符合官方规范的时间序 ses_ 与 msg_ 标识', () => {
     const now = 1791898000000
