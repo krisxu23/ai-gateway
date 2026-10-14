@@ -589,3 +589,27 @@ Hono `/admin/*` 通配确实匹配 `/admin`（无鉴权绕过）；`nextRowIdx` 
 | 本轮新增用例 | 6 条：`/v1/*` CORS 与管理台无 CORS、安全响应头、404 JSON 与非法 JSON 400、冷启动 seeding、种子失败不 500、name/baseUrl 类型校验、Bearer 大小写、IPv4-compatible IPv6、pendingCalls 补发顺序 |
 
 **未覆盖（已知盲区，有意保留）**：`testModelConnection` / `testOpenCodeModel` / `fetchOpenCodeModels`（需要真实网络）、`renderLoginPage` / `renderHomePage` / `renderAdminPage` 的像素级断言（只覆盖 200 与内联脚本语法）、`src/opencode.ts` 的 `createKeepAliveStream` 保活细节、`storeFailure` 体积上限的回放路径。
+
+## 二十四、第八轮补充：覆盖盲区补测 + 真实运行时验证（e2aae9e / 8e2cac0 / e4d167f）
+
+### 24.1 ponytail 精简（e2aae9e）
+| 项 | 位置 | 处置 |
+| --- | --- | --- |
+| IPv6 映射地址还原重复两遍（`::ffff:x:y` 与 IPv4-compatible `::x:y`） | src/admin.ts | 抽出 `hexPairToIPv4()` 合并（文件 -26 行） |
+| 补发判定靠正文文本 `block.includes('"finish_reason"')` | src/opencode.ts | 改看 `handleData` 已解析出的 `choice.finish_reason`——正文里出现该字样不再提前补发（否则会把尚未判定为桩的调用泄给客户端） |
+
+### 24.2 新增用例（8 条）
+- test/routes.spec.ts：`handleTestKeyNew` 成功路径（拼 `/models`、Bearer、末尾斜杠去除、结果透传）与 SSRF 前置拒绝（http / `127.0.0.1` / `[::ffff:169.254.169.254]`，且 fetch 调用数为 0）；`renderHomePage` / `renderLoginPage` 不把提供商 Key 与管理员密码渲进 HTML。
+- test/proxy-connect.spec.ts（新文件）：`testModelConnection` 的 openai/anthropic 分支（路径、认证头、`max_tokens: 64`）、错误体三种形态（JSON `error.message` / HTML 原文 / 顶层数组不当错误对象解析）、传输异常兜底；`fetchOpenCodeModels` 官方 5xx → 镜像接管 → 只保留 `-free`/`big-pickle`。
+
+### 24.3 真实 workerd 端到端（`npx wrangler dev --local`，非最小化配置的直接运行）
+| 请求 | 结果 |
+| --- | --- |
+| `GET /` | 200（首页渲染） |
+| `GET /v1/models`（无 Authorization） | 401 `{"error":{"message":"缺少或无效的 Authorization 头…"}}` |
+| `GET /admin`（无 Cookie） | 302 → `/admin/login` |
+| `GET /admin/api/status`（无 Cookie） | 401 `{"success":false,"message":"未登录"}` |
+| `POST /admin/login`（未配管理员账号） | 500 + 明确提示配置环境变量 |
+| 冷启动播种后 `GET /v1/models`（带播种出的测试 Key） | 200，返回 4 个 opencode 免费模型（id 带 `opencode/` 前缀） |
+
+结论：`npm run check` = tsc 零错误 + 139 用例全过。
