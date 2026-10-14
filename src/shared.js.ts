@@ -20,11 +20,6 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
 }
-function buildAuthHeaders(apiType, key) {
-  return apiType === 'anthropic'
-    ? { 'x-api-key': key, 'anthropic-version': '2023-06-01' }
-    : { 'Authorization': 'Bearer ' + key }
-}
 
 // ── UI 函数 ──
 function showSpinner(el) {
