@@ -24,18 +24,19 @@ import { seedInitialData, getSession } from './storage'
 const app = new Hono<{ Bindings: Env }>()
 
 // ===== 全局中间件 =====
-// 只给 /v1/* 开 CORS：管理台接口不需要跨域，收敛通配头减少暴露面
-// （admin Cookie 已是 httpOnly + SameSite=Strict，此处为纵深防御）。
-app.use('/v1/*', cors())
-
-// 管理台/首页补基础安全响应头：内联脚本较多，CSP 需先做 nonce 化改造，暂不启用；
-// 先挡掉 iframe 嵌套（点击劫持）与 MIME 嗅探。必须注册在 handler 之前才会执行。
+// 安全响应头最先注册：CORS 预检（OPTIONS）由 cors 直接返回、不再调 next()，
+// 只有这样预检响应才能带上这些头。（内联脚本较多，CSP 需先做 nonce 化改造，
+// 暂不启用；先挡掉 iframe 嵌套与 MIME 嗅探。）
 const securityHeaders = async (c: Context<{ Bindings: Env }>, next: () => Promise<void>) => {
   await next()
   c.header('X-Frame-Options', 'DENY')
   c.header('X-Content-Type-Options', 'nosniff')
 }
 app.use('*', securityHeaders)
+
+// 只给 /v1/* 开 CORS：管理台接口不需要跨域，收敛通配头减少暴露面
+// （admin Cookie 已是 httpOnly + SameSite=Strict，此处为纵深防御）。
+app.use('/v1/*', cors())
 // 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
 // tail 日志足够排查问题。
 
@@ -103,8 +104,10 @@ app.notFound((c) => {
 
 // ===== 错误处理 =====
 app.onError((err, c) => {
-  // 只把「请求体不是合法 JSON」的 SyntaxError（c.req.json() 抛的）映射为 400；
-  // 其它来源的 SyntaxError（如 JSON.parse 解析 KV 脏数据）仍是服务端问题，按 500 上报
+  // 把 c.req.json() 抛出的「请求体不是合法 JSON」映射为 400：V8 的 JSON 解析
+  // 报错文案都含 "JSON" 或 "Unexpected ..."，只能按消息特征识别。KV 脏数据的
+  // JSON.parse 点各自有 try/catch（见 storage.ts），不会上抛到这里，
+  // 因此不会把服务端数据问题误报成客户端请求错误。
   if (err instanceof SyntaxError && /\bJSON\b|Unexpected (token|end)/i.test(err.message)) {
     return c.json({ error: { message: '请求体必须是合法的 JSON', type: 'invalid_request_error' } }, 400)
   }

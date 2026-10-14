@@ -1,4 +1,5 @@
 import type { ApiKeyEntry, Env } from './types'
+import { readCappedBytes } from './http'
 import {
   chatBodyToResponsesBody,
   contentText,
@@ -654,6 +655,12 @@ function createStubSwallowingChatStream(
         buf = buf.slice(boundary.index + boundary.length)
         emitBlock(controller, raw)
       }
+      // 桩判定必须看到整条事件：缓冲无上限时，一段没有空行的长流会一直堆内存
+      // 直到 OOM。宁可让客户端看到流中断（与上游失败等价），也不能放半个事件
+      // 过去——那可能把本该吞掉的桩调用漏给客户端。
+      if (buf.length > MAX_SSE_EVENT_CHARS) {
+        controller.error(new Error('上游 SSE 事件超出缓冲上限'))
+      }
     },
     flush(controller) {
       const tail = buf
@@ -666,6 +673,9 @@ function createStubSwallowingChatStream(
 }
 
 const MAX_STORED_FAILURE_BYTES = 256 * 1024
+/** 单条 SSE 事件的字符数上限（缓冲到空行边界为止）。正常事件最多几十 KB，
+ *  没有上限时一段"只发数据不发空行"的长流会把整个响应堆在内存里直到 OOM。 */
+const MAX_SSE_EVENT_CHARS = 8 * 1024 * 1024
 /** 上游 tool_call.index 的合理上界: 越界一律当作新的一条(防稀疏数组响应放大) */
 const MAX_TOOL_INDEX = 256
 
@@ -681,34 +691,31 @@ function isCompleteJsonArgs(raw: string): boolean {
 
 async function storeFailure(response: Response): Promise<StoredFailure> {
   const headers = new Headers(response.headers)
-  // body 已被 arrayBuffer() 解码，回放时不能再声称压缩与原长度，
-  // 否则客户端会按 content-encoding 解压失败
+  // body 已被解码，回放时不能再声称压缩与原长度，否则客户端会按
+  // content-encoding 解压失败；transfer-encoding/connection 是逐跳头，回放会报错
   headers.delete('content-encoding')
   headers.delete('content-length')
-  // 失败体要整包读进内存再回放: 加个上限, 避免镜像返回超大/恶意错误体打满内存
-  const declared = Number(response.headers.get('content-length') ?? '')
-  let body: ArrayBuffer | Uint8Array
-  if (Number.isFinite(declared) && declared > MAX_STORED_FAILURE_BYTES) {
-    // 声明超限时既不读也不取消会把上游连接挂住：显式取消
-    await response.body?.cancel().catch(() => {})
+  headers.delete('transfer-encoding')
+  headers.delete('connection')
+  // 失败体要整包读进内存再回放：限量读流（chunked 体没有 content-length，
+  // 按声明预判会漏），超限就换成一句说明
+  const bytes = await readCappedBytes(response, MAX_STORED_FAILURE_BYTES)
+  if (bytes === null) {
     headers.set('content-type', 'application/json; charset=utf-8')
-    body = new TextEncoder().encode(
-      JSON.stringify({ error: { message: `上游错误响应体过大(${declared} 字节), 已省略` } })
-    )
-  } else {
-    body = await response.arrayBuffer()
-    if (body.byteLength > MAX_STORED_FAILURE_BYTES) {
-      headers.set('content-type', 'application/json; charset=utf-8')
-      body = new TextEncoder().encode(
-        JSON.stringify({ error: { message: `上游错误响应体过大(${body.byteLength} 字节), 已省略` } })
-      )
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+      body: new TextEncoder().encode(
+        JSON.stringify({ error: { message: `上游错误响应体过大(>${MAX_STORED_FAILURE_BYTES} 字节), 已省略` } })
+      ),
     }
   }
   return {
     status: response.status,
     statusText: response.statusText,
     headers,
-    body,
+    body: bytes,
   }
 }
 
@@ -787,7 +794,7 @@ async function requestUpstream(
 // 心跳保活：每隔固定间隔向 SSE 流注入一条注释行。注释行（以冒号开头）对
 // 客户端透明，仅用于重置空闲计时，不影响任意下游解析器。
 const KEEPALIVE_INTERVAL_MS = 15000
-function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
+export function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
   let buf = ''
@@ -816,6 +823,12 @@ function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array> {
         const raw = buf.slice(0, boundary.index + boundary.length)
         buf = buf.slice(boundary.index + boundary.length)
         controller.enqueue(encoder.encode(raw))
+      }
+      // 一直没有事件边界的长流：原样冲出缓冲区。keep-alive 是纯透传，
+      // 不需要理解事件内容，拆行对客户端无害，但无上限缓存会 OOM
+      if (buf.length > MAX_SSE_EVENT_CHARS) {
+        controller.enqueue(encoder.encode(buf))
+        buf = ''
       }
     },
     flush(controller) {
@@ -1034,13 +1047,12 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     }
   }
 
-  // 兜底：官方匿名额度。当“无配置 Key 且未配镜像”或前面的尝试都没给到可用响应时，
-  // 官方地址本身接受 `Bearer public`，等价于一个匿名镜像。这避免了全新部署在配置
-  // 镜像前完全不可用；也覆盖了“Key 被 401、匿名额度仍可用”的场景。
-  // 仅在尚未拿到任何响应（含失败响应）时才试，避免重复请求已健康的端点。
-  // 鉴权类失败 (401/403) 时也降级到匿名额度重试，而不是把 401 直接返给客户端。
+  // 兜底：官方匿名额度。当“没有配置任何 Key”时（全新部署），官方带 Key 的
+  // 线路根本没跑过，官方匿名端点（Bearer public）就是唯一的官方出口 —— 镜像
+  // 失败也不能把它挡掉，否则“配好镜像之前 + 镜像抖动”会彻底不可用。
+  // 另：带 Key 的线路被 401/403 拒时也降级到匿名重试，而不是把 401 返给客户端。
   const shouldTryAnonymous =
-    (!officialFailure && !mirrorFailure) ||
+    enabledKeys.length === 0 ||
     ((officialFailure?.status === 401 || officialFailure?.status === 403) && !mirrorFailure)
   if (shouldTryAnonymous) {
     try {

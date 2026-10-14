@@ -90,13 +90,20 @@ const MAX_LOGIN_BODY_BYTES = 8 * 1024
 
 /** 管理员登录 */
 export async function handleLogin(c: Context<{ Bindings: Env }>) {
-  // 先按声明长度挡掉超大体：c.req.json() 会把整个 body 读进内存后才轮到字段校验
-  const declared = Number(c.req.header('content-length') ?? '')
-  if (Number.isFinite(declared) && declared > MAX_LOGIN_BODY_BYTES) {
+  // 先读文本再判长：只看 content-length 会被「分块/不声明长度」的请求绕过，
+  // 而 c.req.json() 会在字段校验前把整个 body 读进内存并解析
+  const raw = await c.req.text()
+  if (raw.length > MAX_LOGIN_BODY_BYTES) {
     return c.json({ success: false, message: '请求体过大' }, 413)
   }
-  // body 为字面量 null 时解构会抛 TypeError（被 onError 判成 500）；非字符串值按空串处理
-  const body = await c.req.json<Record<string, unknown> | null>()
+  let parsedBody: unknown = null
+  try {
+    parsedBody = JSON.parse(raw)
+  } catch {
+    return c.json({ success: false, message: '请求体必须是合法的 JSON' }, 400)
+  }
+  // body 为字面量 null / 非对象时按空值处理（解构会抛 TypeError，被 onError 判成 500）
+  const body = (parsedBody && typeof parsedBody === 'object' ? parsedBody : null) as Record<string, unknown> | null
   const username = typeof body?.username === 'string' ? body.username : ''
   const password = typeof body?.password === 'string' ? body.password : ''
   const { ADMIN_USERNAME: adminUser, ADMIN_PASSWORD: adminPass } = c.env
@@ -109,13 +116,11 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
     }, 503)
   }
 
-  // 限流在输入校验之前：被锁定时不再泄露任何信息
-  // CF-Connecting-IP 由边缘注入、公网流量必有；非边缘部署（自建反代）才回落到
-  // x-real-ip / x-forwarded-for 首段（前者优先，避免被伪造的 XFF 绕过限流）
-  const ip = c.req.header('CF-Connecting-IP')
-    || c.req.header('x-real-ip')
-    || c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    || 'unknown'
+  // 限流分桶只认边缘注入的 CF-Connecting-IP：该头由 Cloudflare 覆盖写入，客户端
+  // 伪造不了。不再回落到 x-real-ip / x-forwarded-for —— 二者客户端可控，回落会让
+  // 攻击者靠轮换头绕过限流，或借伪造头把任意 IP 的桶锁死 15 分钟。非边缘部署下
+  // 所有请求共享 'unknown' 桶（fail-closed，宁可互相限流也不放行爆破）。
+  const ip = c.req.header('CF-Connecting-IP') || 'unknown'
   const now = Date.now()
   if (loginBlocked(ip, now)) {
     return c.json({ success: false, message: '登录失败次数过多，请 15 分钟后再试' }, 429)

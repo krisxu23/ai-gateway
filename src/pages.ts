@@ -520,7 +520,9 @@ async function apiJson(url, opts) {
 // 连通性测试失败时的文案：优先用服务端给的可读原因（如「仅允许 https:// 上游地址」），
 // 没有原因时再回落到状态码；status 为 0 表示请求根本没发出去
 function httpMsg(result) {
-  return result.message || (result.status ? 'HTTP ' + result.status : '请求失败')
+  return result.status
+    ? 'HTTP ' + result.status + (result.message ? ': ' + result.message : '')
+    : (result.message || '请求失败')
 }
 
 // providers

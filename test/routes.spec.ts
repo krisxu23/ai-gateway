@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { clearHealthCache, handleModels, handleProxy } from '../src/proxy'
-import { adminAuthMiddleware, handleLogin, handleLogout, proxyKeyAuthMiddleware } from '../src/auth'
+import { adminAuthMiddleware, clearLoginFailures, handleLogin, handleLogout, proxyKeyAuthMiddleware } from '../src/auth'
 import { handleCreateProvider, handleDeleteProvider, handleGetProxyKeys, handleStatus, handleTestKeyNew, handleUpdateProvider } from '../src/admin'
 import {
   addProxyKey,
@@ -111,6 +111,9 @@ function healthOf(env: TestEnv, providerId: string): Record<string, { failures?:
 beforeEach(() => {
   clearListCache()
   clearHealthCache()
+  // 登录失败计数是模块级状态，跨用例必须清理（限流分桶现在 fail-closed 到 'unknown'，
+  // 不清理会让前一个用例的失败次数漂到后一个用例）
+  clearLoginFailures()
 })
 
 afterEach(() => {
@@ -419,6 +422,10 @@ describe('app 装配（src/index.ts）', () => {
     const preflight = await app.request('/v1/chat/completions', { method: 'OPTIONS' }, env)
     expect(preflight.status).toBe(204)
     expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('*')
+    // securityHeaders 必须注册在 cors 之前：预检由 cors 直接返回、不再调 next()，
+    // 反过来的话预检响应就带不上这些头
+    expect(preflight.headers.get('X-Content-Type-Options')).toBe('nosniff')
+    expect(preflight.headers.get('X-Frame-Options')).toBe('DENY')
 
     const admin = await app.request('/admin/api/status', {}, env)
     expect(admin.headers.get('Access-Control-Allow-Origin')).toBeNull()
@@ -708,12 +715,29 @@ describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数�
     expect(res.status).toBe(200)
   })
 
-  it('上游错误体声明过大时直接丢弃，不读进内存', async () => {
+  it('上游错误体超过上限时丢弃，不读进内存', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ apiKeys: [{ key: 'only', enabled: true }] })])
+    vi.stubGlobal('fetch', async () => new Response('x'.repeat(70 * 1024), {
+      status: 400, headers: { 'Content-Type': 'text/plain' },
+    }))
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { message: string } }
+    expect(body.error.message).toContain('过大')
+  })
+
+  it('上游声明的 content-length 不可信：小体仍按原文可读', async () => {
     const env = makeEnv()
     await seedValidKey(env)
     await setProviders(env, [makeProvider({ apiKeys: [{ key: 'only', enabled: true }] })])
     vi.stubGlobal('fetch', async () => {
-      const r = new Response('{}', { status: 400, headers: { 'Content-Type': 'application/json' } })
+      const r = new Response('upstream says: quota exceeded', {
+        status: 400, headers: { 'Content-Type': 'text/plain' },
+      })
+      // 高报：按声明长度预判的实现会据此误丢可读错误体
       r.headers.set('Content-Length', '999999')
       return r
     })
@@ -721,7 +745,22 @@ describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数�
     const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
     expect(res.status).toBe(400)
     const body = (await res.json()) as { error: { message: string } }
-    expect(body.error.message).toContain('过大')
+    expect(body.error.message).toBe('upstream says: quota exceeded')
+  })
+
+  it('非 OpenAI 形状的上游错误体被包成 {error:{message}}，原体保留在 upstream', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider({ apiKeys: [{ key: 'only', enabled: true }] })])
+    vi.stubGlobal('fetch', async () => new Response('{"detail":"model not found"}', {
+      status: 404, headers: { 'Content-Type': 'application/json' },
+    }))
+
+    const res = await makeApp().request('/v1/chat/completions', chatInit(), env)
+    expect(res.status).toBe(404)
+    const body = (await res.json()) as { error: { message: string }; upstream: unknown }
+    expect(body.error.message).toBe('model not found')
+    expect(body.upstream).toEqual({ detail: 'model not found' })
   })
 
   it('上游返回空 JSON 对象 / 3xx 时给出可诊断的文案', async () => {
@@ -786,7 +825,28 @@ describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数�
     expect(tooBig.status).toBe(413)
   })
 
-  it('登录限流在缺少 CF-Connecting-IP 时回落到 x-real-ip 分桶', async () => {
+  it('登录体上限不依赖 content-length：分块体同样被挡下', async () => {
+    const env = makeEnv()
+    const payload = JSON.stringify({ username: 'admin', password: 'x'.repeat(9000) })
+    // 不给 content-length（流式 body），旧实现会直接放过去整包解析
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload))
+        controller.close()
+      },
+    })
+    const req = new Request('http://localhost/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: stream,
+      duplex: 'half',
+    } as RequestInit)
+
+    const res = await makeApp().request(req, undefined, env)
+    expect(res.status).toBe(413)
+  })
+
+  it('缺少 CF-Connecting-IP 时所有请求共用一个桶（不能靠伪造头轮换绕过）', async () => {
     const env = makeEnv()
     const app = makeApp()
     const attempt = (ip: string, password: string) => app.request('/admin/login', {
@@ -795,10 +855,23 @@ describe('第十一轮回归（R11-C：转发健壮性 / 鉴权 / 存储脏数�
       body: JSON.stringify({ username: 'admin', password }),
     }, env)
 
+    // 每次换一个伪造来源也不能重置计数：全部落在 'unknown' 桶
+    for (let i = 0; i < 5; i++) expect((await attempt(`7.7.7.${i}`, 'wrong')).status).toBe(401)
+    expect((await attempt('8.8.8.8', 'wrong')).status).toBe(429)
+  })
+
+  it('CF-Connecting-IP 分桶：不同真实来源互不影响（边缘注入才能分桶）', async () => {
+    const env = makeEnv()
+    const app = makeApp()
+    const attempt = (ip: string, password: string) => app.request('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ username: 'admin', password }),
+    }, env)
+
     for (let i = 0; i < 5; i++) expect((await attempt('7.7.7.7', 'wrong')).status).toBe(401)
-    // 同一来源被锁定
     expect((await attempt('7.7.7.7', 'pw')).status).toBe(429)
-    // 另一来源不受影响 → 说明用的是 x-real-ip 而不是全局 'unknown' 桶
+    // 另一来源不受影响
     expect((await attempt('8.8.8.8', 'pw')).status).toBe(200)
   })
 

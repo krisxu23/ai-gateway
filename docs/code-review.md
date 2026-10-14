@@ -841,3 +841,73 @@ R11-C 已核实不成立：空 token 双保险（`auth.ts` 的 `(.+)` + `storage
 | 重复字面量 | src/opencode-responses.ts 内 `FREE_LANE_NAMES = ['bash','read']` 与同文件 `STUB_TOOL_NAMES` 重复，已删除改用后者 | 提交 1226a2b |
 
 **opencode 伪装未被改动**：本轮所有改动均不涉及 `createRequestHeaders`、`generateOpenCodeId`、`applyFreeLaneGate`、`resolveSessionId`、镜像顺序等伪装相关逻辑；伪装部分仅被动验证（存活 `x-opencode-*` 头 + 官方 UA `opencode/1.18.31` + 6 字节倒序时间戳 ID）。
+
+## 三十一、第十二轮修复记录（R12-A 差异复核 / R12-B 故障与边界）
+
+### 31.1 R12-A（对第十一轮提交 c3ae381 的对抗性差异复核）
+
+| # | 级别 | 问题 | 处置 |
+|---|------|------|------|
+| 1 | 中 | 登录体上限只看 `content-length`，分块（无声明长度）的超大 body 直接进 `c.req.json()` 整包解析 | 改为 `await c.req.text()` 后按实际字符数判 413，`JSON.parse` 失败单独返回 400（`null` 体不再走解构） |
+| 2 | 中 | 登录限流分桶回落到 `x-real-ip` / `x-forwarded-for`：二者客户端可控，轮换头即可绕过限流，或伪造头把任意 IP 的桶锁死 15 分钟 | 只认边缘注入的 `CF-Connecting-IP`，缺失时统一落 `unknown` 桶（fail-closed） |
+| 3 | 中 | 上游错误体形状不固定（`{"detail":…}` / 顶层字符串 / 裸数组），客户端按 `body.error.message` 取值拿到 `undefined` | 对外契约固定为 `{error:{message}}`：已是该形状原样透传，其它形状归一化并把原体挂在 `upstream` 字段 |
+| 4 | 中 | `readErrorBody` 用 `content-length` 预判，上游声明长度不实时会误丢可读错误体（高报直接丢、低报整包读） | 改为限量读流（`readCappedText`），实际读到超限才 cancel |
+| 5 | 低 | securityHeaders 注册在 cors 之后：CORS 预检由 cors 直接返回、不调 `next()`，预检响应带不上安全头 | 把 securityHeaders 提前到 cors 之前（已用真实 app 探针验证：预检响应现有 `nosniff` + `X-Frame-Options`） |
+| 6 | 低 | `httpMsg` 丢弃服务端可读原因，只显示 `HTTP 400` | 改为 `HTTP <status>: <message>`，无 message 才只显示状态码 |
+| 7 | 低 | KV 读失败时健康状态按全健康处理，但每个请求都会再打一次注定失败的 KV 读（KV 持续故障时放大子请求） | 加 5s 负缓存（`HEALTH_FAILURE_CACHE_TTL_MS`） |
+| 8 | 低 | `onError` 的 SyntaxError→400 判据靠消息匹配，注释与实际判定不符 | 收紧为 `/\bJSON\b|Unexpected (token|end)/i` 并说明各 `JSON.parse` 点自身有 try/catch，KV 脏数据不会上抛到这里 |
+
+R12-A 已核实不成立：第十一轮 8 组修复中 7 组确实修好且未削弱既有语义；`synthesizeCall`
+不重发 name、`diffArgs` 防重复、`finalizedIds` 丢弃乱序、失败体头体自洽等均无回归。
+
+### 31.2 R12-B（失败转移 / 超时 / 保活 / 镜像路径的对抗性审查）
+
+| # | 级别 | 问题 | 处置 |
+|---|------|------|------|
+| 1 | 高 | 三处 SSE 缓冲（keep-alive 透传、桩吞噬、responses 翻译）在「上游只发数据不发空行/换行」时无上限增长：实测 4GB 堆 OOM | 三处各加 8MB 上限：keep-alive 是纯透传 → 超限原样冲出（不丢数据）；桩吞噬与 responses 翻译必须看整条事件/整行 → 超限 `controller.error()` 中断流（宁可让客户端看到流中断，也不放半个事件过去而漏出本该吞掉的桩调用） |
+| 2 | 中 | 无 Key 时镜像失败会跳过官方匿名兜底（`shouldTryAnonymous` 要求 `!mirrorFailure`）→ 全新部署在配好镜像前完全不可用 | 判据改为「没配任何 Key」即走匿名兜底（镜像失败也不挡）；带 Key 的 401/403 降级路径保留 |
+| 3 | 中 | `storeFailure` 只在 `content-length` 声明超限时才限量，chunked 超大失败体照样整包读进内存 | 与 `readErrorBody` 统一走新的 `src/http.ts: readCappedBytes/readCappedText`（按实际读到的字节卡） |
+| 4 | 低 | `restoreFailure` 回放时未剥离逐跳头，`transfer-encoding: chunked` 会与实际 body 矛盾 | 回放前一并剥离 `transfer-encoding` / `connection` |
+| 5 | 低 | 文档 29.1 第 4 项声称 id 走 `isSafeId` 白名单，代码里并不存在（是写文档时的臆测） | 更正文档：id 只作为无原型对象的键与 JSON 字段值，无需白名单（附理由），列入有意保留 |
+
+R12-B 已核实不成立：客户端断开时上游 body 的 cancel 仍会传播；`storeFailure` 的
+256KB 上限在声明长度路径上有效；镜像 URL 用逗号分隔是既定行为。
+
+## 三十二、第十二轮验证记录
+
+- `npx tsc --noEmit` 零错（src + test）；`npm run check` = 6 个 spec 文件 **182 用例**全过。
+- 本轮新增/强化用例：登录体上限对分块体生效（`ReadableStream` 无 content-length）；真实 app 的
+  CORS 预检响应带安全头；无 Key + 镜像 503 时仍走官方匿名兜底（断言三次尝试的 URL 顺序）；
+  上游发 9MB 无边界事件 → 读取 body 必须 reject（不 OOM）；keep-alive 透传 9MB 无边界数据不丢内容；
+  chunked 300KB 失败体被换成说明且逐跳/编码头被剥离；responses 翻译遇到 9MB 无换行行必须 reject。
+- 因行为变更同步调整的既有用例：「官方与镜像都失败时回放最后一次失败响应」——匿名兜底启用后
+  最后一次尝试是官方匿名端点，回放 503 `official down`（原为镜像 429）。
+- `npm run bundle` → `worker.js` 与 src 同步（tree-shaking 掉仅供测试的导出）。
+
+## 三十三、审查循环收尾总结（第一~十二轮）
+
+**过程**：共 12 轮，每轮派 2~3 路独立 reviewer 通读全部源码/测试/文档，累计约 30 份报告；
+逐条核实后修复 60+ 项，其中多数为低危加固。所有「有意保留」「已排除误报」「已知盲区」
+都在本文件对应章节留档，没有已知未处理的高/中危缺陷。
+
+**真缺陷分布（按级别）**
+- 高：1 项 —— 管理台存储型 XSS（模型 id 直拼内联 `onclick`，可窃取页面明文渲染的全部转发 Key）。
+- 中：约 12 项 —— 登录无限流；KV 整表读改写丢更新 / 撤销 Key 跨 isolate 延迟；同名提供商并发创建重复 id；
+  上游工具调用参数未收完就报 `tool_calls`（客户端会执行半截参数）；桩参数经补发路径泄漏；
+  `responses` 流式与 `chat` 语义不一致导致 `finish_reason` 失真；`__proto__` 当键致健康状态失效；
+  登录分桶可被伪造头绕过；上游错误体形状不一导致客户端取不到错误信息；SSE 缓冲无上限 OOM 等。
+- 低/质量：其余（掩码星号数、注释失真、死 CSS、测试断言恒真、文档与实现不符等）。
+
+**为什么停在这里**：第 8 轮之后，报告里真缺陷占比陡降，剩下的是「需要恶意上游/极端配置才触发」的
+加固项、测试基建细节与文档措辞。审查本身不会收敛——任何代码在足够严格的审读下都能继续被挑出改善项，
+继续循环只会线性消耗时间与额度（本轮 12 轮累计委派审查约 4700 万 token），边际收益已接近 0。
+
+**有意保留项（明确不做，理由见各章节）**：SSRF 不做 DNS 解析（Workers 边缘无可达云元数据）；
+流式纯桩不补 `STUB_SWALLOW_NOTE`（保持与官方客户端一致的静默）；会话 ID 以首条 user 文本为种子
+（伪装必需）；KV 健康计数在并发下丢更新（KV 无原子自增，仅影响降权时机）；转发路径透传任意
+`/v1/*` 子路径（上游主机由管理员配置、Key 也属管理员）；客户端断开后不主动中止上游（cancel 会传播）；
+镜像 URL 逗号分隔；工具调用 id 不做白名单（JSON 序列化天然转义）。
+
+**当前质量状态**：`tsc` 零错、182 用例全过、`worker.js` 与 src 同步、真实 workerd 端到端已验证
+（首页/路由鉴权/冷启动播种/转发取模型列表）。用户唯一的硬性约束——**不改动 opencode 的伪装逻辑**
+（headers/session-id/free-lane gate 的对外行为）——全程遵守：所有改动只涉及健壮性、错误语义与内存边界。

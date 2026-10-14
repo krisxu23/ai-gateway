@@ -1,5 +1,6 @@
 import { Context } from 'hono'
 import { getProvider, getProviders } from './storage'
+import { readCappedText } from './http'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
@@ -19,6 +20,8 @@ const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerI
 // 数百到上千个请求。健康数据读多写少，缓存 60s 可消除每请求一次的 KV 读；
 // 任何写操作都会同步刷新缓存，保证同一 isolate 内的写后读一致。
 const HEALTH_CACHE_TTL_MS = 60 * 1000
+/** KV 读失败时的负缓存时长：KV 故障期间不必每个请求都重试一次注定失败的读 */
+const HEALTH_FAILURE_CACHE_TTL_MS = 5000
 const healthMemCache = new Map<string, { value: HealthMap; expiresAt: number }>()
 
 function healthCacheGet(key: string): HealthMap | undefined {
@@ -36,8 +39,8 @@ export function clearHealthCache(): void {
   healthMemCache.clear()
 }
 
-function healthCacheSet(key: string, value: HealthMap): void {
-  healthMemCache.set(key, { value, expiresAt: Date.now() + HEALTH_CACHE_TTL_MS })
+function healthCacheSet(key: string, value: HealthMap, ttlMs = HEALTH_CACHE_TTL_MS): void {
+  healthMemCache.set(key, { value, expiresAt: Date.now() + ttlMs })
 }
 
 // 上游响应头超时（毫秒）。只约束“等待响应头”阶段：headers 到手后立即取消
@@ -90,6 +93,8 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   } catch (error) {
     // 旁路数据：KV 抖动不该把本可成功的转发变成 500（写侧 persistHealth 同样兜底）
     console.warn(`[proxy] key 健康状态读取失败，按全健康处理: ${(error as Error).message}`)
+    // 负缓存：短 TTL 内不再重试，避免 KV 持续故障时每请求多打一次子请求
+    healthCacheSet(cacheKey, {}, HEALTH_FAILURE_CACHE_TTL_MS)
     return {}
   }
   let parsed: HealthMap = {}
@@ -144,17 +149,17 @@ async function persistHealth(env: Env, providerId: string, health: HealthMap): P
 /** Response 构造器禁止 101/204/205/304 带 body：越界状态码一律回落 502 */
 const clampErrorStatus = (status: number): number => (status >= 400 && status <= 599 ? status : 502)
 
-/** 上游错误体只用于取 500 字片段：声明长度超过此值时直接丢弃，避免把几十 MB 的错误页
+/** 上游错误体只用于取 500 字片段：读流限到此字节数，避免把几十 MB 的错误页
  *  读进内存（换 Key 重试时每个 key 各缓冲一次，会顶到 Worker 的 128MB 上限） */
 const MAX_ERROR_BODY_BYTES = 64 * 1024
 
 async function readErrorBody(response: Response): Promise<{ raw: string; json: Record<string, unknown> | null }> {
-  const declared = Number(response.headers.get('content-length') ?? '')
-  if (Number.isFinite(declared) && declared > MAX_ERROR_BODY_BYTES) {
-    await response.body?.cancel().catch(() => {})
+  // 不拿 content-length 预判：上游声明长度与实际体不一致（高报/低报）时会误丢
+  // 可读错误体，改为限量读流，超限才取消
+  const raw = await readCappedText(response, MAX_ERROR_BODY_BYTES)
+  if (raw === null) {
     return { raw: `上游错误响应体过大（>${MAX_ERROR_BODY_BYTES / 1024}KB），已忽略`, json: null }
   }
-  const raw = await response.text().catch(() => '')
   try {
     const parsed: unknown = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -475,13 +480,25 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         // 否则其 body 悬挂到请求结束
         await dropLastError()
         const { raw, json } = await readErrorBody(response)
-        // `{}` 这类没有任何字段的合法 JSON 会让 OpenAI SDK 报 "unknown error"：
-        // 这时不能回落到原文（原文就是那个 `{}`），直接用状态码；非 JSON 的错误页
-        // 仍保留原文（HTML 里常有可诊断信息）
-        const usable = json !== null && Object.keys(json).length > 0
-        const fallback = json === null && raw.trim() ? raw.substring(0, 500) : `上游返回 HTTP ${response.status}`
+        // 对外契约固定为 {error:{message}}（见 docs/API.md）：上游已是该形状就原样
+        // 透传；其它形状（如 {"detail":"..."}）包一层并把原体放进 upstream，
+        // 否则客户端按 body.error.message 取值会拿到 undefined
+        const errField = json?.error
+        if (errField && typeof errField === 'object'
+          && typeof (errField as Record<string, unknown>).message === 'string') {
+          return c.json(json, clampErrorStatus(response.status) as Parameters<typeof c.json>[1])
+        }
+        // `{}` 这类没有任何字段的合法 JSON 不能让文案回落到原文（原文就是那个
+        // `{}`），用状态码兜底；非 JSON 的错误页仍保留原文（常有可诊断信息）
+        const rawText = raw.trim()
+        const message = json === null
+          ? (rawText ? raw.substring(0, 500) : `上游返回 HTTP ${response.status}`)
+          : (typeof json.message === 'string' ? json.message
+            : typeof json.detail === 'string' ? json.detail
+            : typeof errField === 'string' ? errField
+            : `上游返回 HTTP ${response.status}`)
         return c.json(
-          usable ? json : { error: { message: fallback } },
+          { error: { message }, ...(json ? { upstream: json } : {}) },
           clampErrorStatus(response.status) as Parameters<typeof c.json>[1]
         )
       } catch (err) {

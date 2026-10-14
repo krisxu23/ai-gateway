@@ -9,6 +9,7 @@ import {
   generateOpenCodeId,
   resolveSessionId,
   collapseChatSseToJson,
+  createKeepAliveStream,
 } from '../src/opencode'
 import { createResponsesToChatStream, STUB_SWALLOW_NOTE } from '../src/opencode-responses'
 
@@ -163,10 +164,10 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       random: () => 0,
       fetcher: fetcher as typeof fetch,
     })
-    // 官方线路先失败、镜像随后失败：回放的是最后一次（镜像）的失败响应，
-    // 状态码与正文都必须原样保留（不能落到 502 丢真）
-    expect(res.status).toBe(429)
-    expect(await res.text()).toContain('mirror down')
+    // 官方线路先失败、镜像随后失败、无 Key 时官方匿名兜底最后失败：回放的是最后
+    // 一次尝试的失败响应，状态码与正文都必须原样保留（不能落到 502 丢真）
+    expect(res.status).toBe(503)
+    expect(await res.text()).toContain('official down')
   })
 
   it('失败响应体过大时只回简短说明，不整包读进内存', async () => {
@@ -595,5 +596,84 @@ describe('generateOpenCodeId & resolveSessionId', () => {
     const ses2 = resolveSessionId(undefined, { messages: [{ role: 'user', content: 'hello conversation' }, { role: 'assistant', content: 'hi' }] })
     expect(ses1).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     expect(ses1).toBe(ses2)
+  })
+})
+
+describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
+  const requestOptions = (over: Record<string, unknown>) => ({
+    baseUrl: 'https://opencode.example.com/zen/v1',
+    apiKeys: [] as Array<{ key: string; enabled: boolean }>,
+    method: 'POST',
+    subPath: 'chat/completions',
+    body: JSON.stringify({ model: 'mimo-free', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    mirrorUrls: [] as string[],
+    ...over,
+  })
+
+  it('无 Key 且镜像失败时仍走官方匿名兜底（Bearer public）', async () => {
+    const seen: string[] = []
+    const fetcher = async (url: string | URL) => {
+      seen.push(String(url))
+      if (String(url).includes('mirror.example.com')) {
+        return new Response('mirror down', { status: 503, headers: { 'Content-Type': 'text/plain' } })
+      }
+      return sseResponse([chunk('hi'), 'data: [DONE]\n\n'])
+    }
+    const res = await proxyOpenCodeRequest(requestOptions({
+      mirrorUrls: ['https://mirror.example.com/zen/v1'],
+      fetcher: fetcher as typeof fetch,
+    }) as never)
+    expect(res.ok).toBe(true)
+    // 镜像是第三方出口，它失败不该把官方匿名额度一起挡掉
+    expect(seen).toEqual([
+      'https://mirror.example.com/zen/v1/chat/completions',
+      'https://opencode.example.com/zen/v1/chat/completions',
+    ])
+  })
+
+  it('上游发超长且无事件边界的数据时中断流（不把缓冲堆到 OOM）', async () => {
+    // 只有开头、永远没有空行边界：旧实现会把整段留在 buf 里直到 isolate 被打爆
+    const huge = `data: {"choices":[{"delta":{"content":"${'x'.repeat(9 * 1024 * 1024)}`
+    const fetcher = async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(huge))
+            c.close()
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    const res = await proxyOpenCodeRequest(requestOptions({ fetcher: fetcher as typeof fetch }) as never)
+    expect(res.ok).toBe(true)
+    await expect(res.text()).rejects.toThrow()
+  })
+
+  it('chunked 超大失败体（无 content-length）换成说明，且剥掉逐跳/编码头', async () => {
+    const fetcher = async () =>
+      new Response('y'.repeat(300 * 1024), {
+        status: 500,
+        headers: { 'Content-Type': 'text/plain', 'content-encoding': 'gzip', 'transfer-encoding': 'chunked' },
+      })
+    const res = await proxyOpenCodeRequest(requestOptions({
+      apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    }) as never)
+    expect(res.status).toBe(500)
+    expect(res.headers.get('transfer-encoding')).toBeNull()
+    expect(res.headers.get('content-encoding')).toBeNull()
+    expect(await res.text()).toContain('过大')
+  })
+
+  it('keep-alive 透传超长无边界数据时不丢内容', async () => {
+    const payload = 'z'.repeat(9 * 1024 * 1024)
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(payload))
+        c.close()
+      },
+    }).pipeThrough(createKeepAliveStream())
+    const out = await new Response(stream).text()
+    expect(out.length).toBe(payload.length)
   })
 })

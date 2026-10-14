@@ -43,6 +43,10 @@ const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh']
  */
 export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn\'t have.)'
 
+/** 单条 SSE 行缓冲上限：上游不发换行时，缓冲会无上限增长到 OOM。
+ *  这里按行（而非事件）卡，因为本转换是按行解析的。 */
+const MAX_SSE_LINE_CHARS = 8 * 1024 * 1024
+
 /** 免费通道的桩工具名：gate 注入与吞噬判定共用同一定义，避免两处分叉。 */
 export const STUB_TOOL_NAMES = ['bash', 'read'] as const
 
@@ -390,8 +394,9 @@ export function createResponsesToChatStream(
     switch (type) {
       case 'response.output_text.delta': {
         const delta = typeof ev.delta === 'string' ? ev.delta : ''
-        // done 已把同一段全文下发过：上游重放同一段，丢弃以免重复
-        if (delta && delta === doneText) break
+        // done 把整段全文下发过之后，上游再发的任何增量都是重放（可能被拆成多片，
+        // 单片比对拦不住）：此时一律丢弃，避免正文重复
+        if (delta && doneText && emittedText === doneText) break
         if (delta) {
           sawText = true
           emittedText += delta
@@ -402,10 +407,12 @@ export function createResponsesToChatStream(
       case 'response.output_text.done': {
         const text = typeof ev.text === 'string' ? ev.text : ''
         if (!text) break
-        doneText = text
         // done 里的正文可能比已下发的增量更全（上游只在终态补全文）：只补差量，
         // 既不重复也不把尾部丢掉；空的 done 不能当成“正文已定稿”，否则后续正文全丢
         if (!text.startsWith(emittedText)) break
+        // 只有前缀自洽的 done 才配当作“重放基线”：更短/不同前缀的 done 会把它改小，
+        // 使后续重放增量重新匹配上（见上面的丢弃判据）
+        doneText = text
         const rest = text.slice(emittedText.length)
         if (!rest) break
         sawText = true
@@ -629,6 +636,11 @@ export function createResponsesToChatStream(
         buf = buf.slice(nl + 1)
         handleLine(line, controller)
         if (finished) return
+      }
+      // 解析必须看到整行：没有换行的长流会一直堆内存直到 OOM。宁可让客户端
+      // 看到流中断（与上游失败等价），也不能放半行进去——那会误判正文/工具。
+      if (buf.length > MAX_SSE_LINE_CHARS) {
+        controller.error(new Error('上游 SSE 行超出缓冲上限'))
       }
     },
     flush(controller) {
