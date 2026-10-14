@@ -4,7 +4,9 @@ import { describe, it, expect } from 'vitest'
 import { Hono } from 'hono'
 import { handleLogin } from '../src/auth'
 import { handleCreateProvider, handleCreateProxyKey } from '../src/admin'
+import { handleProxy } from '../src/proxy'
 import { addProxyKey, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
+import { modelRowHTML } from '../src/pages'
 import type { Env, ProxyKey } from '../src/types'
 
 function makeEnv(): Env {
@@ -69,6 +71,18 @@ describe('管理台登录限流', () => {
     expect(ok.headers.get('set-cookie')).toContain('session_id=')
     // 计数已清零：再来一次失败仍是 401 而不是 429
     expect((await attempt(env, 'wrong', '10.0.0.3')).status).toBe(401)
+  }, 30000)
+
+  it('body 为字面量 null / 字段类型不对时返回 400 而不是 500', async () => {
+    const env = makeEnv()
+    const nullBody = await app.request('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'null',
+    }, env)
+    expect(nullBody.status).toBe(400)
+    const badType = await app.request('/admin/login', jsonInit({ username: 1, password: null }), env)
+    expect(badType.status).toBe(400)
   }, 30000)
 })
 
@@ -144,5 +158,67 @@ describe('转发 Key 列表写入', () => {
     const env = makeEnv()
     await addProxyKey(env, { ...proxyKey('d1', 'sk_cf_disabled'), enabled: false })
     expect(await validateProxyKey(env, 'sk_cf_disabled')).toBe(false)
+  })
+})
+
+describe('提供商列表条目校验', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.post('/admin/api/providers', handleCreateProvider)
+
+  it('apiKeys 里的 null / 非对象条目被丢弃，不会让管理台整页 500', async () => {
+    const env = makeEnv()
+    const res = await app.request('/admin/api/providers', jsonInit({
+      id: 'p3',
+      name: 'P3',
+      baseUrl: 'https://api.example.com/v1',
+      apiKeys: [null, 'sk-good', 42],
+      models: ['ok-model'],
+    }), env)
+    expect(res.status).toBe(201)
+    // 按 id 找：storage 的模块级缓存会跨 makeEnv() 泄漏（生产只有一个 namespace，属测试环境特性）
+    const provider = (await getProviders(env)).find((p) => p.id === 'p3')!
+    expect(provider.apiKeys).toEqual([{ key: 'sk-good', enabled: true }])
+    expect(provider.models).toEqual([{ id: 'ok-model', enabled: true }])
+  })
+
+  it('models 里的 null 条目按非法模型 ID 拒绝（400）', async () => {
+    const res = await app.request('/admin/api/providers', jsonInit({
+      id: 'p4',
+      name: 'P4',
+      baseUrl: 'https://api.example.com/v1',
+      models: [null, 'ok-model'],
+    }), makeEnv())
+    expect(res.status).toBe(400)
+  })
+})
+
+describe('转发请求体校验', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.all('/v1/*', handleProxy)
+
+  const post = (env: Env, body: string) =>
+    app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    }, env)
+
+  it('body 为字面量 null 时返回 400', async () => {
+    expect((await post(makeEnv(), 'null')).status).toBe(400)
+  })
+
+  it('model 非字符串时返回 400', async () => {
+    expect((await post(makeEnv(), JSON.stringify({ model: 123 }))).status).toBe(400)
+  })
+})
+
+// 回归用例：模型 ID 曾直接拼进 onclick 的 JS 字符串，转义挡不住（HTML 实体会在 JS 解析前被解码）。
+describe('管理台模型行渲染', () => {
+  it('恶意模型 ID 只出现在转义后的属性里，且 testMdl 从 dataset 取值', () => {
+    const evil = 'a" onmouseover="alert(1)'
+    const html = modelRowHTML('p1', { id: evil, enabled: true }, 0)
+    expect(html).not.toContain(evil)
+    expect(html.match(/data-mid="([^"]*)"/)?.[1]).toBe('a&quot; onmouseover=&quot;alert(1)')
+    expect(html).toContain(`onclick="testMdl('p1',this.dataset.mid)"`)
   })
 })

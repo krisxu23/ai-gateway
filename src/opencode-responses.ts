@@ -243,6 +243,9 @@ export function responsesToChatBody(
   const message: Rec = { role: 'assistant' }
   if (finalToolCalls.length > 0) {
     message.tool_calls = finalToolCalls
+    // 正文与工具调用可以并存（模型先说一句再调工具）：与流式路径保持一致，
+    // 否则非流式客户端会丢掉前导文本
+    if (text) message.content = text
   } else if (swallowedAny && !text) {
     message.content = STUB_SWALLOW_NOTE
   } else {
@@ -338,7 +341,10 @@ export function createResponsesToChatStream(
       case 'response.function_call_arguments.delta': {
         const itemID = typeof ev.item_id === 'string' ? ev.item_id : ''
         if (swallowedIds.has(itemID)) break
-        const idx = toolIdx[itemID] ?? 0
+        // 没见过 output_item.added 的 item_id 不能默认落到 index 0：参数会拼到
+        // 错误的工具调用上（宁可丢弃也不静默串味）
+        const idx = toolIdx[itemID] as number | undefined
+        if (idx === undefined) break
         if (typeof ev.delta === 'string' && ev.delta) {
           controller.enqueue(encoder.encode(sseChunk(model, chunkId, {
             tool_calls: [{ index: idx, function: { arguments: ev.delta } }],
@@ -349,13 +355,14 @@ export function createResponsesToChatStream(
       case 'response.completed':
       case 'response.incomplete': {
         // 与非流式路径(responsesToChatBody)对齐: 本轮发过 function_call 时以
-        // tool_calls 结束, 客户端才能识别为“需要执行工具”; 但桩全被吞光时仍为
+        // tool_calls 结束, 客户端才能识别为"需要执行工具"; 但桩全被吞光时仍为
         // stop。nextIdx 只计真实下发的工具调用(桩不递增), 与被吞数量无关。
-        // incomplete 始终为 length。
         const hasToolCalls = nextIdx > 0
-        const finish = type === 'response.incomplete'
-          ? 'length'
-          : hasToolCalls ? 'tool_calls' : 'stop'
+        // 已下发工具调用时优先 tool_calls（与非流式路径一致）：agent 客户端只在
+        // finish_reason=tool_calls 时执行工具，报 length 会让调用被丢弃
+        const finish = hasToolCalls
+          ? 'tool_calls'
+          : type === 'response.incomplete' ? 'length' : 'stop'
         const resp = asRecord(ev.response)
         const usage = asRecord(resp?.usage)
         const usageOut = usage

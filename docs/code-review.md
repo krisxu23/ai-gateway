@@ -261,3 +261,57 @@ responsesToChatBody(body as unknown as Parameters<...>[0], 'muse', true)
 | `npm run bundle` | 生成 `worker.js`（156679 B，minify + `--charset=utf8`），含本轮全部修复 |
 | `npm ls --depth=0` | 依赖树干净：`hono@4.12.27`、`esbuild@0.28.1`、`vitest@2.1.9`、`typescript@6.0.3`、`wrangler@4.107.0`、`@cloudflare/workers-types@4.20260702.1` |
 | 未改动项确认 | OpenCode 伪装链路（请求头伪造、Free-lane gate、桩吞噬、镜像故障转移、session/msg ID 生成）逻辑未做任何行为性修改，仅补健壮性（稀疏数组、SSE 空行、结束语义）与去重 |
+
+## 十、第三轮修复记录（两路独立审查复盘）
+
+第三轮改用「两路独立 reviewer 并行审查」：R1 只看 `src/opencode.ts` + `src/opencode-responses.ts`（伪装与翻译链路），R2 只看 `src/index.ts`/`proxy.ts`/`storage.ts`/`auth.ts`/`admin.ts`/`pages.ts`/`shared.js.ts`。每条都经主 agent 回读源码核实后才处置，下表同时记录「不修」的理由（避免下一轮重复提出）。
+
+### 10.1 R2（核心代理 / 管理台 / 前端）
+
+| 编号 | 问题 | 处置 | 验证 |
+|---|---|---|---|
+| **R2-H1**（高） | `normalizeArray` 对非字符串条目原样放行，`apiKeys:[null]` 存入后管理台渲染读 `k.key`/`k.enabled` 抛 `TypeError` → **管理台整页 500，管理员被锁在界面之外无法自救** | 已修：`normalizeArray` 丢弃所有非对象条目；`proxy.ts`/`admin.ts` 读 key 改 `k?.enabled`；管理台渲染改 `p.apiKeys.filter(Boolean)` / `p.models.filter(Boolean)` | `test/admin-api.spec.ts`「提供商列表条目校验」2 用例（`[null,'sk-good',42]` → 只留字符串；`models:[null]` → 400） |
+| **R2-M1**（中） | 上游 4xx/5xx 错误体被 `response.json().catch(async () => ({...await response.text()}))` 二次读取，抛 `Body is unusable`，把上游错误改写成 500 | 已修：改成先 `text()` 读一次再 `try JSON.parse`，解析失败时截断 500 字符放入 `error.message` 原样透传状态码 | 人工核对 + 现有转发用例 |
+| **R2-M2**（中） | `readHealth` 返回缓存对象引用（调用方原地改），且降权路径只写 `demotedAt` 未置 `healthUpdated`，`demotedAt` 永不落 KV | 已修：新增 `cloneHealth()`（逐条浅拷贝）供读/写缓存使用；降权分支显式 `healthData[key] = {...h, demotedAt: now}` + `healthUpdated = true` | 代码审查 |
+| **R2-M3**（中） | `writeHealth` 未容错，KV 抖动会把「已经成功拿到上游响应」的请求变成 500 | 已修：新增 `persistHealth()`（`try/catch` + `console.warn`），健康状态写失败绝不影响转发结果 | 代码审查 |
+| **R2-M4**（中） | 健康状态「读-改-写」未串行化，并发降权可能少计失败次数 | **不修**：只影响降权计数精度，不影响转发正确性；精确一致需 Durable Object，已在代码内加 `shortcut:` 注释说明 | — |
+| **R2-M5**（中） | 管理台删除中间行后新增行复用 DOM 索引，导致保存到错误的 Key/模型 | 已在第二轮修复（`nextRowIdx` 取最大索引 + 1） | 第二轮用例 |
+| **R2-M6**（中） | `body` 为字面量 `null`、`model` 为数字时抛 `TypeError` → 500 | 已修：`/v1` 增加 `!body \|\| typeof body !== 'object'` 与 `typeof model !== 'string'` → 400；`/admin/login` 改 `typeof body?.username === 'string'` 判定 | `test/admin-api.spec.ts`「转发请求体校验」2 用例 + 登录 `null` body 用例 |
+| **R2-L1**（低） | `testModelConnection` 同类错误体二次读取 | 已修（同 R2-M1 手法） | 代码审查 |
+| **R2-L2**（低） | 管理台 Key 状态刷新的选择器 `.fc .bd` 在模板里不存在（实际是 `span.bd`） | 已修：改 `ki.querySelector('span.bd')` | 代码审查 |
+| **R2-L3**（低） | 点遮罩关闭弹窗时不落 `cM`/`pM` 的 Promise，`await` 永久悬挂 | 已修：新增 `closeModal()`，关闭前把 resolve 函数取出来以 `null` 落地 | 代码审查 |
+| **R2-L6**（低） | 管理台响应缺少安全头 | 已修：新增 `securityHeaders` 中间件，`/admin/*` 与 `/` 输出 `X-Frame-Options: DENY` + `X-Content-Type-Options: nosniff`；**CSP 暂不启用**（页面有大量内联脚本，需先做 nonce 化，否则会把管理台打挂） | 代码审查 |
+| **R2-L7**（低） | 未填写 API Key 时前端拿字符串 `'dummy'` 真发请求探测（必然 401，误导用户以为模型 ID 错） | 已修：非 opencode 提供商且未填 Key 时直接 `toast('请先填写 API Key')` 返回，不再伪造探测 | 代码审查 |
+| **R2-L4**（低） | 转发 Key 用明文 `===` 比较 | **不修**：理论时序侧信道，跨公网不可利用；且让 storage 依赖 auth 会引入循环依赖，`crypto.subtle.timingSafeEqual` 在非 CF 运行时也不可用 | — |
+| **R2-L5**（低） | `p.id` 拼进 `onclick` | **不修**：`p.id` 写入侧有 `^[A-Za-z0-9._-]+$` 白名单，`k.id` 是 `crypto.randomUUID()`，两者都不含引号；不为不可利用路径重构 15 处模板 | — |
+
+### 10.2 R1（OpenCode 伪装与翻译链路）
+
+| 编号 | 问题 | 处置 | 验证 |
+|---|---|---|---|
+| **R1-M1**（中） | 非流式路径有 `tool_calls` 时把助手正文整段丢掉（客户端看不到模型说的话） | 已修：`if (text) message.content = text` 与 `tool_calls` 并存 | 新用例「正文与工具调用并存时两者都保留」 |
+| **R1-M2**（中） | keepalive 包装流与 responses→chat 翻译流原样继承上游 `content-length`/`content-encoding`，与已被改写/解码的 body 不符 | 已修：两处改为剥离这两个头的新 `Headers` | 代码审查 + 现有流式用例 |
+| **R1-M5**（中） | `response.incomplete` 恒报 `finish_reason: 'length'`，把已下发的 `tool_calls` 说成截断，agent 客户端会丢弃工具调用 | 已修：`hasToolCalls ? 'tool_calls' : type === 'response.incomplete' ? 'length' : 'stop'`（流式与非流式一致） | 新用例「已发出工具调用后 response.incomplete 记为 tool_calls 而非 length」+ 现有非流式用例 |
+| **R1-L2**（低） | 未见过 `output_item.added` 的未知 `item_id` 的参数增量被回退到 index 0，污染第一个工具调用的参数 | 已修：`toolIdx[itemID]` 为 `undefined` 时直接丢弃该增量 | 新用例「未知 item_id 的参数增量被丢弃，不会污染 index 0」 |
+| **R1-L6**（低） | `resolveOpenCodeUrls` 未按空白/逗号/分号切分镜像列表（与注释不符） | 已修：`raw.split(/[\s,;]+/)` | 代码审查 |
+| **R1-L7**（低） | responses 非 SSE 分支用 `response.json()`，上游返回 HTML 200 时抛错 → 500 | 已修：改 `await response.text()` + `try JSON.parse`，解析失败原样透传状态码与正文 | 代码审查 |
+| **R1-M3**（中） | body 无空闲/总超时，keepalive 心跳让上游挂死的流永不超时 | **不修**：长思考保活是针对免费通道的刻意设计；客户端断开已能中止上游（见 `clientSignal`），再加 body 超时会误杀长回答 | — |
+| **R1-M4**（中） | 只认 `response.function_call_arguments.delta`，忽略 `output_item.done` 里的完整参数 | **不修**：实测 Zen 端点发 delta；补 `output_item.done` 属推测性上游差异，可能造成参数重复拼接 | — |
+| **R1-M6/M7**（中） | 请求翻译丢弃 `stop`/`response_format`/`n` 等字段、不支持 legacy `role:'function'` | **不修**：最小字段集是免费通道采纳 shape 的一部分，擅自回填字段有触发 `FreeTierError` 的风险（用户硬性要求不动伪装） | — |
+| **R1-M8**（中） | 上游未给 `call_id` 时回退空串 | **不修**：上游没给 id 时合成一个 `call_N` 并不能让上游上下文对得上（客户端回传的 `tool_call_id` 上游不认识），属改响应形状但无实证收益 | — |
+| **R1-L1**（低） | 桩吞噬在「参数增量先于函数名」时会泄漏 | **不修**：真修法需要按 index 缓存参数再判定，而上游是 name-first 顺序 | — |
+| **R1-L3**（低） | 匿名兜底通道不含 429 | **不修**：429 是限流而非鉴权失败，换匿名通道重试收益不明 | — |
+| **R1-L4**（低） | `randomBase62` 取模偏置 | **不修**：ID 只需要唯一性，不需要均匀分布 | — |
+| **R1-L5**（低） | 图像内容被丢弃；图片在首条消息时会话 ID 不稳定 | **不修**：涉及伪装核心的会话派生逻辑，按用户硬性约束不动 | — |
+
+## 十一、第三轮验证记录（修复后）
+
+| 命令 | 结果 |
+|---|---|
+| `npm run check`（`tsc --noEmit && vitest run`） | 类型检查零错误（`src/` + `test/`）；**4 文件 / 67 用例全部通过**（opencode 15、opencode-responses 30、admin-ssrf 6、admin-api 16） |
+| `npm run bundle` | 生成 `worker.js`（158615 B，minify + `--charset=utf8`） |
+| 伪装改动自查 | 第三轮对 OpenCode 通道的改动仅限：响应头剥离、`finish_reason` 语义、未知 `item_id` 丢弃、镜像 URL 切分、非 SSE 兜底解析、客户端断开中止上游。**请求侧伪装（伪造 headers、`ses_`/`msg_` ID 生成、free-lane gate、桩注入、镜像故障转移、UA 与 body shape）零改动** |
+
+### 测试环境需知（避免误判为缺陷）
+
+`src/storage.ts` 的内存缓存是**模块级、按 KV key 名索引**的（生产环境一个 isolate 只对应一个 KV namespace，语义正确）。测试里多个 `makeEnv()` 共用该缓存，会出现跨用例「看到别的 env 的数据」的现象；因此用例应**按 id 查找**而不是取 `list[0]`（`test/admin-api.spec.ts` 中已注明）。

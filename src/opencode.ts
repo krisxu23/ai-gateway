@@ -35,6 +35,8 @@ interface OpenCodeRequestOptions {
    * 符合官方格式则原样复用, 否则按会话内容确定性派生。
    */
   clientSessionId?: string
+  /** 客户端断开信号：透传到上游 fetch（含镜像与匿名兜底），客户端走了就不再消耗额度 */
+  clientSignal?: AbortSignal
 }
 
 interface StoredFailure {
@@ -65,8 +67,8 @@ export function filterOpenCodeModels<T extends { id?: unknown }>(models: T[]): T
 
 export function resolveOpenCodeUrls(env: Env): string[] {
   const raw = env.OPENCODE_MIRRORS_URL || ''
-  // 兼容换行符、逗号、空格分隔；过滤空白；全局去重
-  const parts = raw.split('\n').flatMap(s => s.split(',')).map(s => s.trim()).filter(Boolean)
+  // 兼容换行符、逗号、分号、空格分隔；过滤空白；全局去重
+  const parts = raw.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean)
   return [...new Set(parts)]
 }
 
@@ -617,6 +619,10 @@ async function requestUpstream(
   // 消费不再受硬顶限制——长回答不会在流中途被掐断（客户端侧的空闲
   // 超时/取消自然兜底）。
   const controller = new AbortController()
+  // 客户端断开时立即掉上游请求（镜像、匿名兜底都走这里，故只此一处）
+  const onClientAbort = () => controller.abort(options.clientSignal?.reason)
+  if (options.clientSignal?.aborted) controller.abort(options.clientSignal.reason)
+  else options.clientSignal?.addEventListener('abort', onClientAbort)
   const timer = setTimeout(
     () => controller.abort(new Error(`OpenCode 上游 ${OPENCODE_TIMEOUT_MS / 1000}s 内未返回响应头`)),
     OPENCODE_TIMEOUT_MS
@@ -633,16 +639,22 @@ async function requestUpstream(
     })
   } finally {
     clearTimeout(timer)
+    options.clientSignal?.removeEventListener('abort', onClientAbort)
   }
   // 等待响应头期间，上游可能迟迟不发第一个 token（思考/排队）。边发心跳边等待，
   // 让下游连接保持活跃，避免客户端或中间层因“长时间静默”判定超时断开。
   if (response.ok && response.body) {
     const contentType = response.headers.get('content-type') || ''
     if (contentType.includes('text/event-stream')) {
+      // body 被 pipeThrough 改写：上游的 content-length/content-encoding 已不匹配
+      // （镜像可能把 SSE 缓冲后返回），必须剥离，否则客户端按旧长度截断或重复解压
+      const keepAliveHeaders = new Headers(response.headers)
+      keepAliveHeaders.delete('content-encoding')
+      keepAliveHeaders.delete('content-length')
       return new Response(response.body.pipeThrough(createKeepAliveStream()), {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers,
+        headers: keepAliveHeaders,
       })
     }
   }
@@ -752,17 +764,33 @@ async function proxyOpenCodeResponses(
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('text/event-stream') && response.body) {
+    // 同上：翻译后的 body 长度/编码都与上游响应头不符
+    const translatedHeaders = new Headers(response.headers)
+    translatedHeaders.delete('content-encoding')
+    translatedHeaders.delete('content-length')
     const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(model, stubOnly, back, injectedStubs)), {
       status: response.status,
       statusText: response.statusText,
-      headers: response.headers,
+      headers: translatedHeaders,
     })
     // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
     if (clientWantsStream) return translated
     return collapseChatSseToJson(translated, model, stubOnly, back, injectedStubs)
   }
-  const data = await response.json() as Record<string, unknown>
-  return new Response(JSON.stringify(responsesToChatBody(data, stubOnly, back, injectedStubs)), {
+  // 上游可能返回 HTML/纯文本（镜像错误页）：JSON 解析失败时原样透传状态与正文，
+  // 否则异常会冒泡成网关 500 并丢掉上游真实错误
+  const raw = await response.text()
+  let translatedBody: string
+  try {
+    translatedBody = JSON.stringify(responsesToChatBody(JSON.parse(raw) as Record<string, unknown>, stubOnly, back, injectedStubs))
+  } catch {
+    return new Response(raw, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: { 'Content-Type': response.headers.get('content-type') || 'text/plain; charset=utf-8' },
+    })
+  }
+  return new Response(translatedBody, {
     status: response.status,
     statusText: response.statusText,
     headers: { 'Content-Type': 'application/json' },

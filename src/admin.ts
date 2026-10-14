@@ -98,7 +98,11 @@ function normalizeArray<T>(
   mapFn: (val: string) => T
 ): T[] {
   if (!Array.isArray(items)) return []
-  return items.map((item) => (typeof item === 'string' ? mapFn(item) : (item as T)))
+  // 非字符串条目必须是对象：null/数字等直接丢弃，否则下游读 k.enabled / k.key 会抛
+  // TypeError，管理台整页 500（管理员无法通过界面自救）
+  return items
+    .map((item) => (typeof item === 'string' ? mapFn(item) : item))
+    .filter((item): item is T => typeof item === 'object' && item !== null)
 }
 
 // 模型 ID 会渲染进管理台 HTML 属性，且可来自上游 /models 接口，属于不可信输入：
@@ -256,7 +260,7 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   const ssrfError = checkSafeUpstreamUrl(provider.baseUrl)
   if (ssrfError) return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
 
-  const enabledKeys = provider.apiKeys.filter((k) => k.enabled)
+  const enabledKeys = provider.apiKeys.filter((k) => k?.enabled)
   if (!isOpenCodeProvider(provider.id) && enabledKeys.length === 0) {
     return c.json<ApiResponse>({ success: false, message: '该提供商未配置可用的 API Key' }, 400)
   }

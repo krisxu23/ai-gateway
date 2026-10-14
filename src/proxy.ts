@@ -63,12 +63,17 @@ async function fetchWithHeaderTimeout(
   }
 }
 
+/** 逐条浅拷贝：KeyHealth 本身可变（failures 自增、demotedAt 补写） */
+function cloneHealth(health: HealthMap): HealthMap {
+  return Object.fromEntries(Object.entries(health).map(([key, value]) => [key, { ...value }]))
+}
+
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   const cacheKey = HEALTH_KEY(providerId)
-  // 返回副本：调用方会原地修改（recordKeyFailure / delete），若 KV 写入失败，
-  // 内存缓存不应被未落盘的状态污染
+  // 返回逐条副本：调用方会原地修改（recordKeyFailure / delete）。只复制顶层对象
+  // 会让嵌套的 KeyHealth 与缓存共享引用，KV 写入失败时内存缓存被未落盘的状态污染。
   const cached = healthCacheGet(cacheKey)
-  if (cached) return { ...cached }
+  if (cached) return cloneHealth(cached)
   const raw = await env.KV.get(cacheKey)
   let parsed: HealthMap = {}
   if (raw) {
@@ -81,7 +86,7 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
     }
   }
   healthCacheSet(cacheKey, parsed)
-  return { ...parsed }
+  return cloneHealth(parsed)
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
@@ -90,13 +95,24 @@ async function writeHealth(env: Env, providerId: string, health: HealthMap): Pro
   for (const [k, v] of Object.entries(health)) {
     if (v.failures > 0) filtered[k] = v
   }
-  // 同步刷新内存缓存（含空对象，覆盖过期旧值），再落 KV。
-  healthCacheSet(HEALTH_KEY(providerId), filtered)
+  // 同步刷新内存缓存（含空对象，覆盖过期旧值），再落 KV。缓存持有自己的副本，
+  // 避免调用方后续原地修改时污染缓存。
+  healthCacheSet(HEALTH_KEY(providerId), cloneHealth(filtered))
   if (Object.keys(filtered).length > 0) {
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
   } else {
     // 全部健康，删除 KV 条目
     await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
+  }
+}
+
+// 健康状态是尽力而为的旁路数据：KV 抖动不能把已成功的模型响应变成 500。
+// shortcut: 同 isolate 并发写仍是整表读改写（可能丢计数），跨 isolate 精确一致需 Durable Object
+async function persistHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
+  try {
+    await writeHealth(env, providerId, health)
+  } catch (error) {
+    console.warn(`[proxy] key 健康状态写入失败: ${(error as Error).message}`)
   }
 }
 
@@ -165,12 +181,15 @@ export async function testModelConnection(
       return { success: true, message: '连接成功', statusCode: response.status }
     }
 
-    let errorBody = ''
+    // 先取 text 再尝试 JSON.parse：response.json() 失败时 body 已被消费，
+    // 再调 text() 会抛 "Body is unusable"，把上游错误变成误导读数
+    const rawError = await response.text()
+    let errorBody = rawError
     try {
-      const errorData = (await response.json()) as { error?: { message?: string } }
-      errorBody = errorData?.error?.message || JSON.stringify(errorData)
+      const errorData = JSON.parse(rawError) as { error?: { message?: string } }
+      errorBody = errorData?.error?.message || rawError
     } catch {
-      errorBody = await response.text()
+      // 非 JSON 错误体（HTML/纯文本）：原样使用
     }
 
     return {
@@ -207,9 +226,13 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         error: { message: '请求体必须是合法的 JSON', type: 'invalid_request_error' },
       }, 400)
     }
+    if (!body || typeof body !== 'object') {
+      return c.json({ error: { message: '请求体必须是 JSON 对象', type: 'invalid_request_error' } }, 400)
+    }
     const model = body.model
 
-    if (!model) {
+    // model 非字符串（123/null）时 parseModelId 内 indexOf 会抛 TypeError → 500
+    if (!model || typeof model !== 'string') {
       return c.json({ error: { message: '缺少 model 参数', type: 'invalid_request_error' } }, 400)
     }
 
@@ -250,7 +273,8 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }, 403)
     }
 
-    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
+    // k?.enabled: 兼容历史上已写入 KV 的脏数据（写入侧已由 normalizeArray 拦截）
+    const enabledKeys = provider.apiKeys.filter((k) => k?.enabled)
     const forwardBody = { ...body, model: modelId }
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\/?/, '') || 'chat/completions'
@@ -268,6 +292,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         body: JSON.stringify(forwardBody),
         mirrorUrls: resolveOpenCodeUrls(c.env),
         clientSessionId,
+        clientSignal: c.req.raw.signal,
       })
       return new Response(response.body, {
         status: response.status,
@@ -287,6 +312,8 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 
     // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
     const healthData = await readHealth(c.env, providerId)
+    // 健康排序阶段补写 demotedAt 时也要标记，故提前声明
+    let healthUpdated = false
     const healthy: number[] = []
     const unhealthy: number[] = []
     const probation: number[] = []
@@ -301,8 +328,13 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         if (!h) {
           healthy.push(i)
         } else if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          h.demotedAt = h.demotedAt || now
-          ;(now - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS ? probation : demoted).push(i)
+          // 旧 KV 数据可能缺 demotedAt：补写副本并标记 healthUpdated，否则冷却起点
+          // 每次重置，降权 key 会一直停在 demoted（只靠 keyOrder 兜底偶尔试用）
+          if (!h.demotedAt) {
+            healthData[key.key] = { ...h, demotedAt: now }
+            healthUpdated = true
+          }
+          ;(now - (h.demotedAt || now) >= KEY_HEALTH_COOLDOWN_MS ? probation : demoted).push(i)
         } else if (h.lastFailed) {
           unhealthy.push(i)
         } else {
@@ -330,7 +362,6 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     let lastError: Response | null = null
-    let healthUpdated = false
     let failuresSeen = false
     let clientAborted = false
     // 丢弃上一个失败响应：body 未消费会一直占着子请求（只有最后一次的 body
@@ -355,7 +386,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
             healthUpdated = true
           }
           if (healthUpdated || failuresSeen) {
-            await writeHealth(c.env, providerId, healthData)
+            await persistHealth(c.env, providerId, healthData)
           }
 
           // 只透传 Content-Type 与 Cache-Control：上游的 x-ratelimit-* 等头部对
@@ -387,7 +418,14 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         }
 
         // 其他错误（400/404 等）直接返回
-        const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+        // 同上：先读 text 再解析，避免二次读取抛错把上游 4xx 改写成网关 500
+        const rawError = await response.text()
+        let errorData: Record<string, unknown>
+        try {
+          errorData = JSON.parse(rawError) as Record<string, unknown>
+        } catch {
+          errorData = { error: { message: rawError.substring(0, 500) } }
+        }
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
         // 客户端主动断开：不再尝试其它 key，也不把这次中断算作 key 失败
@@ -407,7 +445,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     // 写回健康状态。失败时无论是否达到阈值都补写一次 KV，保证跨 isolate 可见
-    if (healthUpdated || failuresSeen) await writeHealth(c.env, providerId, healthData)
+    if (healthUpdated || failuresSeen) await persistHealth(c.env, providerId, healthData)
 
     // 客户端已断开：响应无人接收，但给出明确语义而不是"没有可用 Key"
     if (clientAborted) {

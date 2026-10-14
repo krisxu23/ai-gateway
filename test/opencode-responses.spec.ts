@@ -155,6 +155,20 @@ describe('responsesToChatBody', () => {
     ])
   })
 
+  // 回归：有 tool_calls 时曾把助手正文整段丢掉，客户端拿不到模型说的话
+  it('正文与工具调用并存时两者都保留', () => {
+    const chat = responsesToChatBody({
+      model: 'muse',
+      output: [
+        { type: 'message', content: [{ type: 'output_text', text: '先执行一下' }] },
+        { type: 'function_call', call_id: 'c1', name: 'bash', arguments: '{}' },
+      ],
+    })
+    const msg = (chat.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>
+    expect(msg.content).toBe('先执行一下')
+    expect((msg.tool_calls as unknown[]).length).toBe(1)
+  })
+
   it('桩调用被吞噬并给出提示句', () => {
     const chat = responsesToChatBody({
       model: 'muse',
@@ -223,6 +237,29 @@ describe('createResponsesToChatStream', () => {
     expect(out).toContain('"name":"bash"')
     expect(out).toContain('"arguments":"{}"')
     expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归：incomplete 曾无条件记为 length，已发出的 tool_calls 被说成截断
+  it('已发出工具调用后 response.incomplete 记为 tool_calls 而非 length', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
+      'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  // 回归：未知 item_id 的参数增量曾回退到 index 0，污染第一个工具调用的参数
+  it('未知 item_id 的参数增量被丢弃，不会污染 index 0', async () => {
+    const upstream = sseChunks([
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.function_call_arguments.delta","item_id":"ghost","delta":"LEAKED"}\n\n',
+      'data: {"type":"response.completed","response":{}}\n\n',
+    ])
+    const out = await readAll(upstream.pipeThrough(createResponsesToChatStream('muse')))
+    expect(out).toContain('"name":"bash"')
+    expect(out).not.toContain('LEAKED')
   })
 
   it('桩调用流式被吞', async () => {

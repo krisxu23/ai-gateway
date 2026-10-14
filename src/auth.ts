@@ -75,7 +75,10 @@ export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: N
 
 /** 管理员登录 */
 export async function handleLogin(c: Context<{ Bindings: Env }>) {
-  const { username, password } = await c.req.json()
+  // body 为字面量 null 时解构会抛 TypeError（被 onError 判成 500）；非字符串值按空串处理
+  const body = await c.req.json<Record<string, unknown> | null>()
+  const username = typeof body?.username === 'string' ? body.username : ''
+  const password = typeof body?.password === 'string' ? body.password : ''
   const { ADMIN_USERNAME: adminUser, ADMIN_PASSWORD: adminPass } = c.env
 
   if (!adminUser || !adminPass) {

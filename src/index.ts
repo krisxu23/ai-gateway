@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { cors } from 'hono/cors'
 import { getCookie } from 'hono/cookie'
 import type { Env } from './types'
@@ -27,6 +27,16 @@ const app = new Hono<{ Bindings: Env }>()
 // 只给 /v1/* 开 CORS：管理台接口不需要跨域，收敛通配头减少暴露面
 // （admin Cookie 已是 httpOnly + SameSite=Lax，此处为纵深防御）。
 app.use('/v1/*', cors())
+
+// 管理台/首页补基础安全响应头：内联脚本较多，CSP 需先做 nonce 化改造，暂不启用；
+// 先挡掉 iframe 嵌套（点击劫持）与 MIME 嗅探。必须注册在 handler 之前才会执行。
+const securityHeaders = async (c: Context<{ Bindings: Env }>, next: () => Promise<void>) => {
+  await next()
+  c.header('X-Frame-Options', 'DENY')
+  c.header('X-Content-Type-Options', 'nosniff')
+}
+app.use('/admin/*', securityHeaders)
+app.use('/', securityHeaders)
 // 生产环境不启用 hono/logger: 每请求 console 输出有开销, 且 Workers 自带
 // tail 日志足够排查问题。
 
