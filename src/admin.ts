@@ -44,6 +44,16 @@ function isPrivateIPv4(host: string): boolean {
   return false
 }
 
+/** 把 ::ffff:7f00:1 这类两段十六进制还原成点分十进制；无法还原时返回 null */
+function hexPairToIPv4(rest: string): string | null {
+  const parts = rest.split(':')
+  if (parts.length !== 2) return null
+  const p1 = parseInt(parts[0], 16)
+  const p2 = parseInt(parts[1], 16)
+  if (Number.isNaN(p1) || Number.isNaN(p2)) return null
+  return `${(p1 >> 8) & 0xff}.${p1 & 0xff}.${(p2 >> 8) & 0xff}.${p2 & 0xff}`
+}
+
 function isPrivateIPv6(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, '').toLowerCase()
   // 域名不含 ':'（WHATWG URL 对 IPv6 字面量才会给出带冒号的 hostname），
@@ -59,37 +69,16 @@ function isPrivateIPv6(host: string): boolean {
   if (h.startsWith('::ffff:') || h.startsWith('0:0:0:0:0:ffff:')) {
     const rest = h.replace(/^(0:0:0:0:0:ffff:|::ffff:)/, '')
     if (isPrivateIPv4(rest)) return true
-    const parts = rest.split(':')
-    if (parts.length === 2) {
-      const p1 = parseInt(parts[0], 16)
-      const p2 = parseInt(parts[1], 16)
-      if (!Number.isNaN(p1) && !Number.isNaN(p2)) {
-        const a = (p1 >> 8) & 0xff
-        const b = p1 & 0xff
-        const c = (p2 >> 8) & 0xff
-        const d = p2 & 0xff
-        return isPrivateIPv4(`${a}.${b}.${c}.${d}`)
-      }
-    }
-    return true // 无法安全还原的映射地址统一拦截
+    const mapped = hexPairToIPv4(rest)
+    return mapped === null ? true : isPrivateIPv4(mapped) // 无法安全还原的映射地址统一拦截
   }
   // IPv4-compatible IPv6: ::w.x.y.z（WHATWG URL 规范化成 ::7f00:1 这类形态）。
   // 不属于 ::ffff: 映射段，前缀判定漏掉，但同样能指向回环/内网
   if (h.startsWith('::')) {
     const rest = h.slice(2)
     if (rest.includes('.')) return isPrivateIPv4(rest)
-    const parts = rest.split(':')
-    if (parts.length === 2) {
-      const p1 = parseInt(parts[0], 16)
-      const p2 = parseInt(parts[1], 16)
-      if (!Number.isNaN(p1) && !Number.isNaN(p2)) {
-        const a = (p1 >> 8) & 0xff
-        const b = p1 & 0xff
-        const c = (p2 >> 8) & 0xff
-        const d = p2 & 0xff
-        return isPrivateIPv4(`${a}.${b}.${c}.${d}`)
-      }
-    }
+    const mapped = hexPairToIPv4(rest)
+    if (mapped !== null) return isPrivateIPv4(mapped)
   }
   return false
 }

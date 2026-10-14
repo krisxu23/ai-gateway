@@ -480,7 +480,7 @@ function createStubSwallowingChatStream(
   const normalIndexes = new Set<number>()
 
   /** 处理单个 SSE data 载荷: 返回重序列化后的 data, 或 null 表示丢弃整事件。 */
-  const handleData = (data: string): string | null => {
+  const handleData = (data: string, controller: TransformStreamDefaultController<Uint8Array>): string | null => {
     let evt: Record<string, unknown>
     try {
       evt = JSON.parse(data) as Record<string, unknown>
@@ -547,6 +547,10 @@ function createStubSwallowingChatStream(
         && [...seenIndexes].every((i) => stubIndexes.has(i))) {
         choice.finish_reason = 'stop'
       }
+      // finish_reason 一到就补发缓存里 name 始终未到的调用：必须早于这一行的输出，
+      // 更不能晚于 [DONE]（客户端读到 [DONE] 就停止解析）。这里按已解析的字段判断，
+      // 不用文本匹配——正文里出现 "finish_reason" 字样不该触发补发。
+      if (choice.finish_reason) flushPendingCalls(controller)
       // delta 被掏空、又无 finish_reason/usage: 整事件无信息量, 丢弃。
       const deltaKeys = delta && typeof delta === 'object' ? Object.keys(delta) : []
       if (deltaKeys.length === 0 && !choice.finish_reason && (evt as Record<string, unknown>).usage === undefined) {
@@ -569,7 +573,7 @@ function createStubSwallowingChatStream(
       return
     }
     if (!data) return
-    const out = handleData(data)
+    const out = handleData(data, controller)
     if (out !== null) controller.enqueue(encoder.encode(`data: ${out}\n\n`))
   }
 
@@ -581,9 +585,6 @@ function createStubSwallowingChatStream(
       if (block.trim()) controller.enqueue(encoder.encode(`${block}\n\n`))
       return
     }
-    // finish_reason 一到就补发缓存里 name 始终未到的调用：必须早于这一块的
-    // finish_reason 行，更不能晚于 [DONE]（客户端读到 [DONE] 就停止解析）
-    if (block.includes('"finish_reason"')) flushPendingCalls(controller)
     for (const line of block.split('\n')) emitLine(controller, line)
   }
 
