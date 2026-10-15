@@ -1,7 +1,11 @@
 name = "ai-gateway"
 main = "src/index.ts"
 compatibility_date = "2025-07-01"
-compatibility_flags = ["nodejs_compat"]
+# 源码只用 Workers 原生运行时（fetch / crypto.subtle / crypto.randomUUID /
+# TextEncoder / TransformStream），没有任何 node: 模块或 Node 全局。
+# nodejs_compat 会额外注入 Node 兼容层（node:* 模块 + AsyncLocalStorage 等），
+# 白白增大 isolate 启动开销，故显式不启用。
+# 若将来需要 node:* 模块，再把它加回来即可。
 keep_vars = true
 
 # KV namespace — wrangler will auto-resolve by name

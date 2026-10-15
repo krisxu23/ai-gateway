@@ -2,7 +2,7 @@ import { Context } from 'hono'
 import { getProviders, getProxyKeys } from './storage'
 import { SITE_CONFIG, OPENCODE_DEFAULT_URL } from './config'
 import type { Env, Model } from './types'
-import { CSS_CONTENT } from './pages.css'
+import { CSS_HREF } from './pages.css'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
 
 // 前端页面模板：仅重构视觉与交互，保持后端路由、KV 结构和 API 契约不变。
@@ -24,7 +24,7 @@ const H = (title: string) => `
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap" rel="stylesheet">
   <link rel="stylesheet" href="${SITE_CONFIG.faCdn}">
-  <style>${CSS_CONTENT}</style>
+  <link rel="stylesheet" href="${CSS_HREF}">
 </head>`
 
 // ===== 首页 =====

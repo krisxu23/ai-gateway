@@ -677,3 +677,106 @@ describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
     expect(out.length).toBe(payload.length)
   })
 })
+
+// 非流式折叠曾用 response.text() 把整条 SSE 流读进内存，再 split('\n\n') 展开成
+// 数百万个子串：上游被强制 stream:true，一个几十分钟的长回答很容易堆到几十 MB，
+// 单请求就能把 128MB 的 isolate 打爆。改为流式按块消费。
+describe('collapseChatSseToJson: 折叠路径的内存边界', () => {
+  it('超长单块 SSE 不会被当作"响应过大"拒绝，且内容完整', async () => {
+    // 8MB 一次性给出：无边界超限只发生在"读到边界前单块就超限"的场景，
+    // 合法的大块（上游一次性 flush 整个回答）必须照常折叠。
+    const events: string[] = []
+    for (let i = 0; i < 8000; i++) events.push(chunk('x'.repeat(999)))
+    events.push('data: [DONE]\n\n')
+    const res = await collapseChatSseToJson(sseResponse(events), 'm', false)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { choices: Array<{ message: { content: string } }> }
+    expect(body.choices[0].message.content.length).toBe(8000 * 999)
+  })
+
+  it('单块超过上限时按"响应过大"拒绝，而不是把整段读进内存', async () => {
+    const huge = 'data: ' + 'y'.repeat(9 * 1024 * 1024) + '\n\n'
+    const res = await collapseChatSseToJson(sseResponse([huge]), 'm', false)
+    expect(res.status).toBe(413)
+    expect(await res.text()).toContain('过大')
+  })
+})
+
+// 折叠路径改为流式字节扫描后，边界识别与跨块拼接是手写逻辑，必须单独验证：
+// 漏掉边界会丢事件，错位会把一个事件劈成两半导致 JSON 解析失败。
+describe('collapseChatSseToJson: 流式字节边界', () => {
+  const contentOf = async (res: Response) =>
+    (await res.json() as { choices: Array<{ message: { content: string | null } }> }).choices[0].message.content
+
+  /** 把整段字节按固定大小切开喂入，模拟上游的分块节奏 */
+  function chunkedResponse(text: string, chunkSize: number): Response {
+    const bytes = new TextEncoder().encode(text)
+    let off = 0
+    return new Response(new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (off >= bytes.byteLength) { c.close(); return }
+        const end = Math.min(off + chunkSize, bytes.byteLength)
+        c.enqueue(bytes.subarray(off, end))
+        off = end
+      },
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  it('CRLF 分隔的事件同样被正确折叠', async () => {
+    const text =
+      'data: {"choices":[{"index":0,"delta":{"content":"A"}}]}\r\n\r\n' +
+      'data: {"choices":[{"index":0,"delta":{"content":"B"}}]}\r\n\r\n' +
+      'data: [DONE]\r\n\r\n'
+    expect(await contentOf(await collapseChatSseToJson(chunkedResponse(text, 1024), 'm', false))).toBe('AB')
+  })
+
+  it('边界恰好被拆到两个读块之间也不丢事件', async () => {
+    const text =
+      'data: {"choices":[{"index":0,"delta":{"content":"AB"}}]}\n\n' +
+      'data: {"choices":[{"index":0,"delta":{"content":"CD"}}]}\n\n' +
+      'data: [DONE]\n\n'
+    // 逐个字节喂入：任何跨块的 \n\n 与 UTF-8 序列都会被切碎
+    expect(await contentOf(await collapseChatSseToJson(chunkedResponse(text, 1), 'm', false))).toBe('ABCD')
+    // 多字节字符（3 字节 UTF-8）跨块时不能被解码成乱码
+    const cn = 'data: {"choices":[{"index":0,"delta":{"content":"中文"}}]}\n\n' + 'data: [DONE]\n\n'
+    expect(await contentOf(await collapseChatSseToJson(chunkedResponse(cn, 1), 'm', false))).toBe('中文')
+  })
+
+  it('末段没有空行结尾时仍被消费', async () => {
+    const text = 'data: {"choices":[{"index":0,"delta":{"content":"尾巴"}}]}'
+    expect(await contentOf(await collapseChatSseToJson(chunkedResponse(text, 8), 'm', false))).toBe('尾巴')
+  })
+
+  it('同一 index 的 tool_call 参数跨事件、跨读块都能拼齐', async () => {
+    const evt = (args: string) =>
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: args } }] } }] })}\n\n`
+    const text = evt('{"a":') + evt('1}') + 'data: [DONE]\n\n'
+    const res = await collapseChatSseToJson(chunkedResponse(text, 3), 'm', false)
+    const body = await res.json() as {
+      choices: Array<{ message: { tool_calls: Array<{ function: { arguments: string } }> } }>
+    }
+    expect(body.choices[0].message.tool_calls[0].function.arguments).toBe('{"a":1}')
+  })
+})
+
+// 单块超过上限只是两种超限场景之一；另一种是上游持续追加、迟迟不发空行，
+// 事件被拆到很多个读块里慢慢堆过上限。这条路径以前没有用例覆盖。
+describe('collapseChatSseToJson: 无边界长流的上限', () => {
+  it('连续追加但始终不发空行时，累计超过上限即拒绝，不无限堆内存', async () => {
+    const piece = new TextEncoder().encode('x'.repeat(1024 * 1024))
+    let sent = 0
+    const res = await collapseChatSseToJson(
+      new Response(new ReadableStream<Uint8Array>({
+        pull(c) {
+          if (sent >= 20) { c.close(); return }
+          sent++
+          c.enqueue(piece)   // 没有任何 \n\n，永远不会形成事件边界
+        },
+      }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+      'm',
+      false
+    )
+    expect(res.status).toBe(413)
+    expect(await res.text()).toContain('过大')
+  })
+})

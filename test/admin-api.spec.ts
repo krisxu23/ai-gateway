@@ -2,7 +2,7 @@
 // 覆盖：登录限流、转发 Key 过期时间、模型 ID 校验、列表并发写、吊销与脏数据容错。
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { Hono } from 'hono'
-import { clearLoginFailures, handleLogin } from '../src/auth'
+import { clearLoginFailures, handleLogin, setLoginFailDelayMs } from '../src/auth'
 import { handleCreateProvider, handleCreateProxyKey, handleTestKeyNew, handleTestModelNew, handleUpdateProvider, handleUpdateProxyKey } from '../src/admin'
 import { handleProxy } from '../src/proxy'
 import { addProxyKey, clearListCache, deleteProxyKey, getProxyKeys, getProviders, validateProxyKey } from '../src/storage'
@@ -42,6 +42,8 @@ function proxyKey(id: string, key: string): ProxyKey {
 beforeEach(() => {
   clearListCache()
   clearLoginFailures()
+  // 恢复生产延迟：下面各用例按需临时调低，不能在用例之间泄漏
+  setLoginFailDelayMs()
 })
 
 describe('storage 脏数据容错', () => {
@@ -160,6 +162,10 @@ describe('管理台登录限流', () => {
   const attempt = (env: Env, password: string, ip: string) =>
     app.request('/admin/login', jsonInit({ username: 'admin', password }, { 'CF-Connecting-IP': ip }), env)
 
+  // 失败延迟是本组用例之外唯一的耗时来源：调低它只影响「等多久」，不影响限流判定。
+  // 延迟本身是抗爆破措施，不能被静默删掉，故下面另起一组把它钉住。
+  beforeEach(() => setLoginFailDelayMs(1))
+
   it('同一来源连续失败 5 次后锁定，锁定期内即使密码正确也拒绝', async () => {
     const env = makeEnv()
     for (let i = 0; i < 5; i++) {
@@ -193,6 +199,23 @@ describe('管理台登录限流', () => {
     expect(nullBody.status).toBe(400)
     const badType = await app.request('/admin/login', jsonInit({ username: 1, password: null }), env)
     expect(badType.status).toBe(400)
+  }, 30000)
+})
+
+// 独立成组：不能放进上面的 describe，那里为了提速把延迟调成了 1ms，
+// 会把这里要验证的生产延迟一起覆盖掉（写在一起时该用例即便把 400 改成 0 也照样通过）。
+describe('登录失败延迟（抗爆破）', () => {
+  const app = new Hono<{ Bindings: Env }>()
+  app.post('/admin/login', handleLogin)
+
+  it('失败响应至少要等 400ms 才返回', async () => {
+    const env = makeEnv()
+    const started = Date.now()
+    const res = await app.request('/admin/login', jsonInit({ username: 'admin', password: 'wrong' }), env)
+    const elapsed = Date.now() - started
+    expect(res.status).toBe(401)
+    // 用真实的 400ms 上限验证：若实现里把延迟去掉，这条会立刻失败
+    expect(elapsed).toBeGreaterThanOrEqual(390)
   }, 30000)
 })
 

@@ -10,7 +10,7 @@ import {
   updateProxyKey,
   deleteProxyKey,
 } from './storage'
-import { testModelConnection } from './proxy'
+import { buildAuthHeaders, testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import type {
@@ -157,7 +157,7 @@ function hasKeylessApiKey(items: unknown): boolean {
 const MODEL_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/
 
 /** 返回第一个非法模型 ID，全部合法时返回 null */
-export function findInvalidModelId(items: unknown): string | null {
+function findInvalidModelId(items: unknown): string | null {
   if (!Array.isArray(items)) return null
   for (const item of items) {
     const raw = typeof item === 'string' ? item : (item as { id?: unknown } | null)?.id
@@ -401,12 +401,6 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
 // SSRF 防护: 连通性测试接口接受管理员在表单里填写的任意 url，Worker 又部署在
 // 公网 (可访问内网/云元数据端点)。必须在 fetch 前校验目标地址，仅放行 https
 // 公网主机，拒绝回环/私有/链路本地地址及非 https 协议。
-function buildAuthHeaders(apiKey: string, apiType?: string): Record<string, string> {
-  if (apiType === 'anthropic') {
-    return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
-  }
-  return { 'Authorization': `Bearer ${apiKey}` }
-}
 
 export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
   const { url, apiKey, apiType, providerId } = await readJsonBody<{

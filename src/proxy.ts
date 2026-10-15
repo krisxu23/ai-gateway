@@ -181,8 +181,9 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
   }
 }
 
-/** 统一构建上游认证请求头（OpenAI Bearer 或 Anthropic x-api-key） */
-function buildAuthHeaders(apiKey: string, apiType?: 'openai' | 'anthropic'): Record<string, string> {
+/** 统一构建上游认证请求头（OpenAI Bearer 或 Anthropic x-api-key）。
+ *  正式转发与连通性测试（admin.ts）共用同一实现，避免两处漂移。 */
+export function buildAuthHeaders(apiKey: string, apiType?: string): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (apiType === 'anthropic') {
     headers['x-api-key'] = apiKey
@@ -332,6 +333,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     // k?.enabled: 兼容历史上已写入 KV 的脏数据（写入侧已由 normalizeArray 拦截）
     const enabledKeys = provider.apiKeys.filter((k) => k?.enabled)
     const forwardBody = { ...body, model: modelId }
+    // 序列化只做一次：下面 OpenCode 分支与 Key 重试循环用的是同一份 body，
+    // 循环里重复 stringify 会让大 body 在每次换 Key 时多付一遍编解码成本。
+    const forwardBodyText = JSON.stringify(forwardBody)
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\/?/, '') || 'chat/completions'
 
@@ -345,7 +349,7 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         method: c.req.method,
         subPath,
         search: url.search,
-        body: JSON.stringify(forwardBody),
+        body: forwardBodyText,
         mirrorUrls: resolveOpenCodeUrls(c.env),
         clientSessionId,
         clientSignal: c.req.raw.signal,
@@ -426,13 +430,15 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       await lastError?.body?.cancel().catch(() => {})
     }
 
+    // 不变量：keyOrder 的元素全部来自上面按 enabledKeys 下标填充的
+    // healthy/unhealthy/probation/demoted，因此 keyIndex 必然落在数组范围内
     for (const keyIndex of keyOrder) {
       const apiKey = enabledKeys[keyIndex].key
       try {
         const response = await fetchWithHeaderTimeout(forwardUrl, {
           method: c.req.method,
           headers: buildAuthHeaders(apiKey, provider.apiType),
-          body: JSON.stringify(forwardBody),
+          body: forwardBodyText,
         }, c.req.raw.signal)
 
         if (response.ok) {

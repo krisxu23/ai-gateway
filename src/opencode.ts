@@ -12,7 +12,7 @@ import {
   zenModelNeedsResponses,
 } from './opencode-responses'
 
-export const OPENCODE_PROVIDER_ID = 'opencode'
+const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.18.31'
 // 响应头超时（毫秒）：镜像逐个串行尝试，单个镜像最坏等待。30000ms（30s）足够
@@ -47,7 +47,7 @@ interface StoredFailure {
   body: ArrayBuffer | Uint8Array
 }
 
-export interface OpenCodeTestResult {
+interface OpenCodeTestResult {
   success: boolean
   message: string
   statusCode?: number
@@ -344,11 +344,135 @@ function findSseBoundary(buf: string): { index: number; length: number } | null 
   return { index: crlf, length: 4 }
 }
 
+/** 折叠过程中累积的可变状态 */
+interface CollapseState {
+  content: string
+  finishReason: string
+  usage: unknown
+  toolCalls: Array<Record<string, unknown>>
+  argBufs: string[]
+  /** 越界/非整数 index 的独立槽位：直接复用 toolCalls.length 会正好撞上下一个合法
+   *  index 通常要占的槽位，把两条调用合并（参数拼接、name 被覆盖） */
+  overflowSlot: Map<string, number>
+  /** 是否已遇到 data: [DONE]，之后的事件一律忽略 */
+  done: boolean
+}
+
+/** 在字节缓冲里找下一个 SSE 事件边界（\n\n 或 \r\n\r\n）。
+ *  返回 null 表示还没读到边界。 */
+function findSseBoundaryBytes(buf: Uint8Array, from: number): { index: number; length: number } | null {
+  let lf = -1
+  let crlf = -1
+  for (let i = from; i < buf.length; i++) {
+    if (lf === -1 && buf[i] === 10 /* \n */ && buf[i + 1] === 10) lf = i
+    if (
+      crlf === -1 && buf[i] === 13 /* \r */ &&
+      buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10
+    ) crlf = i
+    if (lf !== -1 && crlf !== -1) break
+  }
+  if (lf === -1 && crlf === -1) return null
+  if (lf !== -1 && (crlf === -1 || lf < crlf)) return { index: lf, length: 2 }
+  return { index: crlf, length: 4 }
+}
+
+// 事件级解码器：只在完整事件边界上调用（未闭合的多字节序列会连同原始字节
+// 留在 pending 里），因此不需要 stream:true，也不持有跨调用状态，可以安全复用。
+const SSE_DECODER = new TextDecoder()
+const EMPTY_BYTES = new Uint8Array(0)
+
+/** 拼接两块字节缓冲（残余 + 新读入的块） */
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length)
+  out.set(a, 0)
+  out.set(b, a.length)
+  return out
+}
+
+/** 消费字节缓冲里的完整事件，就地丢弃已消费部分（避免字符串切片把整条流
+ *  留在内存里：V8 的 slice 是 rope，残余的一小段会引用整块底层字符串）。
+ *  overflow 表示遇到超出 MAX_SSE_EVENT_CHARS 的单条事件（尚未解析）。 */
+function consumeSseBytes(buf: Uint8Array, st: CollapseState): { rest: Uint8Array; overflow: boolean } {
+  let pos = 0
+  for (;;) {
+    const boundary = findSseBoundaryBytes(buf, pos)
+    if (!boundary) break
+    const end = pos + boundary.index
+    // 单条事件本身就超限：一块巨无霸事件（上游一次性 flush 整个回答）同样会
+    // 顶爆 isolate，不因为"它自带边界"就放行
+    if (boundary.index > MAX_SSE_EVENT_CHARS) return { rest: buf.subarray(pos), overflow: true }
+    applySseEvent(SSE_DECODER.decode(buf.subarray(pos, end)), st)
+    pos = end + boundary.length
+    if (st.done) return { rest: EMPTY_BYTES, overflow: false }
+  }
+  // 全部消费完时返回共享空数组：subarray(len) 仍会保活底层缓冲，等于每次多留一个读块
+  if (pos === buf.length) return { rest: EMPTY_BYTES, overflow: false }
+  // 残余必须复制：subarray 会保活整个读块，而残余通常只有几十字节——
+  // 不复制就等于每读一块就多钉住一块内存
+  return { rest: buf.slice(pos), overflow: false }
+}
+
+/** 解析单个 SSE 事件块（不含结尾空行），把增量并入状态 */
+function applySseEvent(rawEvent: string, st: CollapseState): void {
+  for (const rawLine of rawEvent.split('\n')) {
+    const line = rawLine.replace(/\r$/, '').trim()
+    if (!line.startsWith('data:')) continue
+    const data = line.slice(5).trim()
+    if (data === '[DONE]') { st.done = true; return }
+    let evt: Record<string, unknown>
+    try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
+    const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
+    if (choice) {
+      const delta = choice.delta as Record<string, unknown> | undefined
+      if (delta) {
+        if (typeof delta.content === 'string') st.content += delta.content
+        const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
+        if (Array.isArray(tc)) {
+          for (const call of tc) {
+            const rawIdx = call.index
+            // index 只用于定位: 非整数/负数/越界一律当作新的一条，否则
+            // index=1e6 的输入会被序列化成上百万个 null（响应放大）。
+            // 越界值占用独立槽位（同一越界值只占一个），避免与合法 index 撞车。
+            const rawNum = typeof rawIdx === 'number' ? rawIdx : NaN
+            let idx: number
+            if (Number.isInteger(rawNum) && rawNum >= 0 && rawNum < MAX_TOOL_INDEX) {
+              idx = rawNum
+            } else {
+              // 槽位键按类型前缀区分：非数字 index(字符串) 若不区分会全部并到同一个
+              // 'NaN' 槽里，两条本应独立的调用被拼成一条
+              const slotKey = typeof rawIdx === 'string' ? `s:${rawIdx}` : `n:${String(rawNum)}`
+              const slot = st.overflowSlot.get(slotKey)
+              idx = slot === undefined ? MAX_TOOL_INDEX + st.overflowSlot.size : slot
+              st.overflowSlot.set(slotKey, idx)
+            }
+            if (!st.toolCalls[idx]) {
+              st.toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
+              st.argBufs[idx] = ''
+            }
+            if (typeof call.id === 'string' && call.id) st.toolCalls[idx].id = call.id
+            const fn = (call.function ?? {}) as Record<string, unknown>
+            const target = st.toolCalls[idx].function as Record<string, unknown>
+            if (typeof fn.name === 'string' && fn.name) target.name = fn.name
+            if (typeof fn.arguments === 'string') st.argBufs[idx] += fn.arguments
+          }
+        }
+      }
+      if (typeof choice.finish_reason === 'string' && choice.finish_reason) st.finishReason = choice.finish_reason
+    }
+    if (evt.usage && typeof evt.usage === 'object') st.usage = evt.usage
+  }
+}
+
 /**
  * 把上游 chat completions SSE 流拼成单个非流式 chat.completion JSON。
  * 客户端要 stream:false 但上游被强制 stream:true 时用, 保证 OpenAI 契约不断。
  * swallowStubs 为 true 时(客户端原本零 tools): 启用按名过滤 bash/read 桩,
  * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
+ *
+ * 流式消费：早期实现是 response.text() 整包读入再 split('\n\n')，一个几十 MB 的
+ * 长回答会在 isolate 里同时留下原文 + 归一化副本 + 数百万个子串，直接顶到 128MB
+ * 上限。现在按块消费，只保留未闭合事件（受 MAX_SSE_EVENT_CHARS 约束）与
+ * 拼接后的正文/参数。
  */
 export async function collapseChatSseToJson(
   response: Response,
@@ -357,65 +481,62 @@ export async function collapseChatSseToJson(
   back: Record<string, string> = {},
   injectedStubs: ReadonlySet<string> = new Set()
 ): Promise<Response> {
-  const text = await response.text()
-  let content = ''
-  let finishReason = 'stop'
-  let usage: unknown
-  const toolCalls: Array<Record<string, unknown>> = []
-  const argBufs: string[] = []
-  // 越界/非整数 index 的独立槽位：直接复用 toolCalls.length 会正好撞上下一个合法
-  // index 通常要占的槽位，把两条调用合并（参数拼接、name 被覆盖）
-  const overflowSlot = new Map<string, number>()
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-  outer: for (const chunk of normalized.split('\n\n')) {
-    for (const rawLine of chunk.split('\n')) {
-      const line = rawLine.trim()
-      if (!line.startsWith('data:')) continue
-      const data = line.slice(5).trim()
-      if (data === '[DONE]') break outer
-      let evt: Record<string, unknown>
-      try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
-      const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
-      if (choice) {
-        const delta = choice.delta as Record<string, unknown> | undefined
-        if (delta) {
-          if (typeof delta.content === 'string') content += delta.content
-          const tc = delta.tool_calls as Array<Record<string, unknown>> | undefined
-          if (Array.isArray(tc)) {
-            for (const call of tc) {
-              const rawIdx = call.index
-              // index 只用于定位: 非整数/负数/越界一律当作新的一条，否则
-              // index=1e6 的输入会被序列化成上百万个 null（响应放大）。
-              // 越界值占用独立槽位（同一越界值只占一个），避免与合法 index 撞车。
-              const rawNum = typeof rawIdx === 'number' ? rawIdx : NaN
-              let idx: number
-              if (Number.isInteger(rawNum) && rawNum >= 0 && rawNum < MAX_TOOL_INDEX) {
-                idx = rawNum
-              } else {
-                // 槽位键按类型前缀区分：非数字 index(字符串) 若不区分会全部并到同一个
-                // 'NaN' 槽里，两条本应独立的调用被拼成一条
-                const slotKey = typeof rawIdx === 'string' ? `s:${rawIdx}` : `n:${String(rawNum)}`
-                const slot = overflowSlot.get(slotKey)
-                idx = slot === undefined ? MAX_TOOL_INDEX + overflowSlot.size : slot
-                overflowSlot.set(slotKey, idx)
-              }
-              if (!toolCalls[idx]) {
-                toolCalls[idx] = { id: `call_${idx}`, type: 'function', function: { name: '', arguments: '' } }
-                argBufs[idx] = ''
-              }
-              if (typeof call.id === 'string' && call.id) toolCalls[idx].id = call.id
-              const fn = (call.function ?? {}) as Record<string, unknown>
-              const target = toolCalls[idx].function as Record<string, unknown>
-              if (typeof fn.name === 'string' && fn.name) target.name = fn.name
-              if (typeof fn.arguments === 'string') argBufs[idx] += fn.arguments
-            }
-          }
+  const st: CollapseState = {
+    content: '',
+    finishReason: 'stop',
+    usage: undefined,
+    toolCalls: [],
+    argBufs: [],
+    overflowSlot: new Map(),
+    done: false,
+  }
+
+  const reader = response.body?.getReader()
+  if (reader) {
+    // 缓冲以字节为单位：解码成字符串后再 slice 会留下 rope，残余的一小段仍
+    // 引用整块底层字符串，等于把整条流钉在内存里
+    let pending: Uint8Array = new Uint8Array(0)
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        // pending 为空时（绝大多数读块都在上一轮被完整消费）直接用上游的 buffer，
+        // 省掉一次 64KB 拷贝；有残余时才拼一次
+        const { rest, overflow } = consumeSseBytes(
+          pending.length === 0 ? value : concatBytes(pending, value),
+          st
+        )
+        pending = rest
+        if (st.done) {
+          await reader.cancel().catch(() => {})
+          break
         }
-        if (typeof choice.finish_reason === 'string' && choice.finish_reason) finishReason = choice.finish_reason
+        // 超限有两种：单条事件过大，或上游一直不发空行（无边界）。整包读入时的
+        // 旧实现会照单全收，与其在内存里堆到 OOM，不如明确拒绝。
+        if (overflow || pending.length > MAX_SSE_EVENT_CHARS) {
+          await reader.cancel().catch(() => {})
+          return new Response(
+            JSON.stringify({ error: { message: `上游流式响应过大(单事件 >${MAX_SSE_EVENT_CHARS} 字符), 已拒绝` } }),
+            { status: 413, headers: { 'Content-Type': 'application/json' } }
+          )
+        }
       }
-      if (evt.usage && typeof evt.usage === 'object') usage = evt.usage
+    } catch {
+      // 流中断：已解析的部分仍有价值（与旧实现 response.text() 抛错后落 500
+      // 不同，这里保留残缺但结构合法的响应）
+    }
+    // 最后一段可能没有以空行收尾，补一个边界让它也能被解析
+    if (!st.done && pending.length > 0) {
+      const withTail = new Uint8Array(pending.length + 2)
+      withTail.set(pending, 0)
+      withTail[pending.length] = 10
+      withTail[pending.length + 1] = 10
+      consumeSseBytes(withTail, st)
     }
   }
+
+  const { toolCalls, argBufs, content, usage } = st
+  let finishReason = st.finishReason
   for (let i = 0; i < toolCalls.length; i++) {
     const call = toolCalls[i]
     // 上游跳过某个 index 时数组会留空洞，直接跳过，避免读 .function 抛错

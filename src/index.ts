@@ -1,7 +1,12 @@
-import { Hono, type Context } from 'hono'
+// tiny 版只带 LinearRouter：本服务路由数是两位数且全是前缀明确的静态/单参数路径，
+// 线性匹配足够快，省掉 SmartRouter + RegExpRouter + TrieRouter 三份路由实现。
+// 注意 hono/tiny 只导出 Hono，类型 Context 仍需从入口包取。
+import { Hono } from 'hono/tiny'
+import type { Context } from 'hono'
 import { cors } from 'hono/cors'
 import { getCookie } from 'hono/cookie'
 import type { Env } from './types'
+import { CSS_CONTENT } from './pages.css'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels } from './proxy'
 import {
@@ -55,6 +60,21 @@ app.use('*', async (c, next) => {
   }
   await seedPromise
   return next()
+})
+
+// ===== 静态资源 =====
+// 样式表从页面内联改为独立资源：首页 HTML 从 ~42KB 降到 ~5KB，浏览器可缓存、
+// 可与 HTML 并行下载。页面里引用的地址带内容指纹（?v=...），内容一变地址就变，
+// 所以带指纹的请求可以长期 immutable 缓存；不带指纹的（直接用 /assets/app.css
+// 访问）只给短缓存，避免样式更新后拿到旧文件。
+app.get('/assets/app.css', (c) => {
+  const versioned = c.req.query('v') !== undefined
+  return c.body(CSS_CONTENT, 200, {
+    'Content-Type': 'text/css; charset=utf-8',
+    'Cache-Control': versioned
+      ? 'public, max-age=31536000, immutable'
+      : 'public, max-age=300',
+  })
 })
 
 // ===== 首页 =====

@@ -257,7 +257,7 @@ export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
   return getCachedList<ProxyKey>(env, KV_KEYS.PROXY_KEYS)
 }
 
-export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
+async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
   await setCachedList(env, KV_KEYS.PROXY_KEYS, keys)
 }
 

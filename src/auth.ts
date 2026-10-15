@@ -5,7 +5,7 @@ import { SESSION_TTL } from './config'
 import type { Env } from './types'
 
 /** SHA-256 哈希 */
-export async function hashPassword(password: string): Promise<string> {
+async function hashPassword(password: string): Promise<string> {
   const encoder = new TextEncoder()
   const data = encoder.encode(password)
   const hashBuffer = await crypto.subtle.digest('SHA-256', data)
@@ -30,6 +30,14 @@ function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
 const LOGIN_MAX_FAILURES = 5
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_FAIL_DELAY_MS = 400
+// 生效值默认为生产常量；只有测试会临时调低（限流用例要连造 4~5 次失败，
+// 按真实延迟每次都要白等 400ms，四个用例合计两秒）
+let loginFailDelayMs = LOGIN_FAIL_DELAY_MS
+
+/** 仅供测试：调低登录失败延迟，传 undefined 恢复生产值 */
+export function setLoginFailDelayMs(ms?: number): void {
+  loginFailDelayMs = ms ?? LOGIN_FAIL_DELAY_MS
+}
 const loginFailures = new Map<string, { count: number; until: number }>()
 
 /** 单个来源连续失败到达阈值后锁定 15 分钟 */
@@ -153,7 +161,7 @@ export async function handleLogin(c: Context<{ Bindings: Env }>) {
   if (!userMatched || !passMatched) {
     recordLoginFailure(ip, now)
     // 固定延迟：让持续爆破无法全速进行
-    await new Promise((resolve) => setTimeout(resolve, LOGIN_FAIL_DELAY_MS))
+    await new Promise((resolve) => setTimeout(resolve, loginFailDelayMs))
     return c.json({ success: false, message: '用户名或密码错误' }, 401)
   }
 

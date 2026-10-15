@@ -1,3 +1,15 @@
+/** 样式表指纹：URL 带版本号，内容一变版本就变，浏览器永远拿到最新样式，
+ *  同时又能对旧版本长期缓存（immutable）。用长度+首尾内容做轻量指纹，
+ *  避免为了 FNV 这类哈希再引入一圈循环。 */
+function cssVersion(css: string): string {
+  let h = 2166136261
+  for (let i = 0; i < css.length; i++) {
+    h ^= css.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(36) + '-' + css.length.toString(36)
+}
+
 export const CSS_CONTENT = `
 /* 中文说明：统一首页、登录页和管理页的设计语言（现代简约工程师工作台风格）。 */
 :root {
@@ -19,11 +31,9 @@ export const CSS_CONTENT = `
   --color-success-soft: oklch(95% 0.025 158);
   --color-success-ink: oklch(34% 0.092 158);
   --color-danger: oklch(50% 0.185 25);
-  --color-danger-hover: oklch(45% 0.175 25);
   --color-danger-soft: oklch(96% 0.022 25);
   --color-danger-ink: oklch(38% 0.145 25);
   --color-graphite: oklch(22% 0.016 260);
-  --color-graphite-2: oklch(28% 0.018 260);
   --color-graphite-rule: oklch(38% 0.020 258);
   --color-graphite-ink: oklch(92% 0.010 250);
   --color-overlay: oklch(18% 0.020 258 / .48);
@@ -43,7 +53,6 @@ export const CSS_CONTENT = `
   --space-xl: 3rem;
   --space-2xl: 4rem;
   --space-3xl: 6rem;
-  --space-4xl: 8rem;
 
   --text-xs: .75rem;
   --text-sm: .875rem;
@@ -62,30 +71,6 @@ export const CSS_CONTENT = `
   --dur-fast: 160ms;
   --dur-panel: 260ms;
 
-  /* compatibility aliases for existing management scripts */
-  --c-primary: var(--color-accent);
-  --c-primary-hover: var(--color-accent-hover);
-  --c-primary-glow: var(--color-accent-soft);
-  --c-text: var(--color-ink-2);
-  --c-text-dark: var(--color-ink);
-  --c-text-secondary: var(--color-ink-2);
-  --c-text-muted: var(--color-muted);
-  --c-text-light: var(--color-muted);
-  --c-bg: var(--color-paper-2);
-  --c-bg-white: var(--color-paper);
-  --c-bg-light: var(--color-paper-2);
-  --c-bg-alt: var(--color-paper-2);
-  --c-border: var(--color-rule);
-  --c-border-dark: var(--color-rule-2);
-  --c-success: var(--color-success);
-  --c-success-bg: var(--color-success-soft);
-  --c-success-text: var(--color-success-ink);
-  --c-danger: var(--color-danger);
-  --c-danger-bg: var(--color-danger-soft);
-  --c-danger-text: var(--color-danger-ink);
-  --c-info-bg: var(--color-accent-soft);
-  --c-info-text: var(--color-focus);
-  --c-overlay: var(--color-overlay);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -141,7 +126,6 @@ html:focus-within { scroll-behavior: smooth; }
 .btn-p { border-color: var(--color-accent); background: var(--color-accent); color: var(--color-accent-ink); }
 .btn-s { border-color: var(--color-rule-2); background: var(--color-paper); color: var(--color-ink-2); }
 .btn-gh { border-color: transparent; background: transparent; color: var(--color-muted); }
-.btn-g { border-color: var(--color-success-soft); background: var(--color-success-soft); color: var(--color-success-ink); }
 .btn-d { border-color: var(--color-danger-soft); background: var(--color-danger-soft); color: var(--color-danger-ink); }
 .icon-btn, .password-toggle { width: var(--control-h-sm); height: var(--control-h-sm); flex: 0 0 var(--control-h-sm); display: inline-grid; place-items: center; border-color: transparent; background: transparent; color: var(--color-muted); }
 .icon-btn span { font-family: var(--font-body); font-size: var(--text-xs); }
@@ -171,7 +155,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .input-wrap input { padding-inline-start: var(--space-xl); padding-inline-end: var(--space-xl); }
 .password-toggle { position: absolute; inset-inline-end: 0; inset-block-start: 0; }
 .select-sm { height: var(--control-h); }
-.fr, .fr3 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 var(--space-sm); }
+.fr { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 var(--space-sm); }
 .form-group { margin: 0 0 var(--space-md); padding: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-control); }
 .form-group legend { padding-inline: var(--space-2xs); }
 .field-row { min-width: 0; flex-wrap: nowrap; }
@@ -239,7 +223,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .status-badge i, .status-dot i { width: .4375rem; height: .4375rem; border-radius: 50%; background: currentColor; }
 .status-badge--on, .bd-on, .status-dot--online { background: var(--color-success-soft); color: var(--color-success-ink); }
 .bd-off { background: var(--color-paper-3); color: var(--color-muted); }
-.bd-info, .protocol-chip { background: var(--color-accent-soft); color: var(--color-focus); }
+.protocol-chip { background: var(--color-accent-soft); color: var(--color-focus); }
 /* 删除类徽标按钮：形状同 .bd 胶囊，颜色保持危险态 */
 .bd-del { border: .0625rem solid transparent; background: var(--color-danger-soft); color: var(--color-danger-ink); font-family: inherit; cursor: pointer; transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease; }
 .bd-del:hover { background: var(--color-danger); color: var(--color-paper); }
@@ -261,10 +245,6 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .auth-context { display: flex; flex-direction: column; justify-content: center; border-block-end: .0625rem solid var(--color-rule); background: var(--color-paper-2); color: var(--color-ink-2); }
 .auth-context h1 { max-width: 11ch; font-size: clamp(2.25rem, 6vw, 4rem); }
 .auth-context > p:not(.eyebrow) { max-width: 58ch; margin-block-start: var(--space-md); color: var(--color-muted); font-size: var(--text-md); }
-.auth-facts { margin-block-start: var(--space-xl); border-block-start: .0625rem solid var(--color-rule); }
-.auth-facts > div { padding-block: var(--space-sm); display: grid; grid-template-columns: minmax(7rem, .7fr) minmax(0, 1.3fr); gap: var(--space-sm); border-block-end: .0625rem solid var(--color-rule); }
-.auth-facts dt { color: var(--color-muted); font-size: var(--text-xs); }
-.auth-facts dd { min-width: 0; color: var(--color-ink); font-size: var(--text-xs); overflow-wrap: anywhere; }
 .auth-form-wrap { display: grid; place-items: center; background: var(--color-paper); color: var(--color-ink-2); }
 .auth-form { width: min(100%, 27rem); }
 .auth-form__heading { margin-block-end: var(--space-lg); display: flex; align-items: center; gap: var(--space-sm); }
@@ -365,47 +345,22 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .fc { display: flex; align-items: center; gap: var(--space-2xs); }
 .fx1 { flex: 1; min-width: 0; }
 .fx-s0 { flex-shrink: 0; }
-.flex-col { display: flex; flex-direction: column; }
-.jc-c { justify-content: center; }
-.gap-8, .gp8 { gap: var(--space-2xs); }
-.gp3, .gp4 { gap: var(--space-3xs); }
-.gp6 { gap: var(--space-2xs); }
 .mt-1 { margin-block-start: var(--space-3xs); }
-.mt-2, .mt-8 { margin-block-start: var(--space-2xs); }
-.mt-3, .mt-6 { margin-block-start: var(--space-2xs); }
-.mb-2, .mb-10 { margin-block-end: var(--space-2xs); }
 .mb-3, .mb-4 { margin-block-end: var(--space-3xs); }
-.m-16-0 { margin-block: var(--space-sm); }
-.input-mt-6 { margin-block-start: var(--space-2xs); }
-.p-14, .p-10-12 { padding: var(--space-xs); }
-.fw { width: 100%; }
-.fw-4 { font-weight: 400; }
-.fw-6 { font-weight: 600; }
-.fw-7 { font-weight: 700; }
-.fs-xs, .fs-65, .fs-77 { font-size: var(--text-xs); }
-.fs-sm, .fs-s, .fs-88 { font-size: var(--text-sm); }
-.fs-1 { font-size: var(--text-md); }
-.fs-xxs { font-size: .625rem; }
-.w12, .w14, .w16 { width: 1rem; }
 .c-p { color: var(--color-accent); }
-.c-l, .c-muted, .mu { color: var(--color-muted); }
+.mu { color: var(--color-muted); }
 .c-s { color: var(--color-success); }
 
 /* 复制成功态需压过 .model-token i / .mdl-item i:first-child 的 muted 色（0,2,0 > 0,1,1） */
 .model-token i.c-s, .mdl-item i.c-s, .mdl-item i:first-child.c-s { color: var(--color-success); }
-.c-d { color: var(--color-danger); }
 .mu { font-size: var(--text-xs); }
 .tc { text-align: center; }
-.va-m { vertical-align: middle; }
 .ov { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cp { cursor: pointer; user-select: none; }
-.cd { padding: var(--space-3xs) var(--space-2xs); border-radius: var(--radius-control); background: var(--color-paper-2); color: var(--color-ink); font-family: var(--font-mono); font-size: var(--text-xs); }
-.copy-icon { color: var(--color-muted); font-size: var(--text-xs); }
 
 @media (hover: hover) and (pointer: fine) {
   .btn-p:hover { border-color: var(--color-accent-hover); background: var(--color-accent-hover); }
   .btn-s:hover, .btn-gh:hover, .icon-btn:hover, .password-toggle:hover { border-color: var(--color-rule-2); background: var(--color-paper-2); color: var(--color-ink); }
-  .btn-g:hover { border-color: var(--color-success); }
   .btn-d:hover { border-color: var(--color-danger); background: var(--color-danger); color: var(--color-paper); }
   input:hover, textarea:hover, select:hover { background: var(--color-paper-2); }
   .model-token:hover { border-color: var(--color-accent); color: var(--color-focus); }
@@ -428,7 +383,6 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .site-footer__inner { flex-direction: row; align-items: center; justify-content: space-between; }
   .auth-context, .auth-form-wrap { padding: var(--space-2xl); }
   .fr { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .fr3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .admin-content { padding-inline: var(--space-lg); }
   .admin-heading, .section-heading--admin { grid-template-columns: minmax(0, 1fr) auto; }
   .admin-heading__actions { justify-content: flex-end; }
@@ -492,3 +446,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
   .modal { transform: none; }
 }
 `
+
+/** 带内容指纹的样式表地址。内容改动 → 指纹改动 → 客户端立即取到新版本；
+ *  指纹不变时可长期缓存。 */
+export const CSS_HREF = `/assets/app.css?v=${cssVersion(CSS_CONTENT)}`

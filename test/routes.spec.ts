@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { Hono } from 'hono'
 import { clearHealthCache, handleModels, handleProxy } from '../src/proxy'
-import { adminAuthMiddleware, clearLoginFailures, handleLogin, handleLogout, proxyKeyAuthMiddleware } from '../src/auth'
+import { adminAuthMiddleware, clearLoginFailures, handleLogin, handleLogout, proxyKeyAuthMiddleware, setLoginFailDelayMs } from '../src/auth'
 import { handleCreateProvider, handleDeleteProvider, handleGetProxyKeys, handleStatus, handleTestKeyNew, handleUpdateProvider } from '../src/admin'
 import {
   addProxyKey,
@@ -18,6 +18,7 @@ import {
 } from '../src/storage'
 import { KV_KEYS } from '../src/config'
 import { renderHomePage, renderLoginPage } from '../src/pages'
+import { CSS_CONTENT } from '../src/pages.css'
 import type { Env, Provider } from '../src/types'
 
 interface TestEnv extends Env {
@@ -83,6 +84,12 @@ function makePageApp() {
   return app
 }
 
+/** 真实的 app 装配（src/index.ts）。静态资源这类只存在于正式路由表里的端点，
+ *  必须打真实装配，自己搭的迷你 app 覆盖不到。 */
+async function realApp() {
+  return (await import('../src/index')).default
+}
+
 function chatInit(auth = `Bearer ${VALID_KEY}`, body: unknown = { model: 'p1/m1', messages: [] }): RequestInit {
   return {
     method: 'POST',
@@ -114,6 +121,9 @@ beforeEach(() => {
   // 登录失败计数是模块级状态，跨用例必须清理（限流分桶现在 fail-closed 到 'unknown'，
   // 不清理会让前一个用例的失败次数漂到后一个用例）
   clearLoginFailures()
+  // 失败响应带 400ms 抗爆破延迟，本文件里限流用例要连造 5~6 次失败。
+  // 只调低「等多久」，限流判定本身不变；生产延迟由 admin-api.spec.ts 单独钉住。
+  setLoginFailDelayMs(1)
 })
 
 afterEach(() => {
@@ -622,6 +632,50 @@ describe('页面渲染', () => {
       const dup = ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false)))
       expect(dup, `${name} 出现重复 id`).toEqual([])
     }
+  })
+
+  // 样式表由内联改为独立资源后，页面必须真的引用到它，且该地址能被服务端命中；
+  // 否则页面会裸奔成无样式。
+  it('三个页面都引用带指纹的样式表，未被内联进 HTML', async () => {
+    const env = makeEnv()
+    await seedValidKey(env)
+    await setProviders(env, [makeProvider()])
+    const cookie = await createSession(env, 'admin', 60)
+
+    const htmls = [
+      await (await makePageApp().request('/', {}, env)).text(),
+      await (await makePageApp().request('/admin/login', {}, env)).text(),
+      await (await (await realApp()).request('/admin', { headers: { Cookie: `session_id=${cookie}` } }, env)).text(),
+    ]
+    for (const html of htmls) {
+      expect(html).toMatch(/<link rel="stylesheet" href="\/assets\/app\.css\?v=[^"]+">/)
+      // 内联样式块一旦回来，P6 的体积收益就没了
+      expect(html).not.toContain('<style>')
+    }
+  })
+
+  it('/assets/app.css 返回样式表：带指纹地址长期 immutable 缓存，裸地址只短缓存', async () => {
+    const app = await realApp()
+    const versioned = await app.request('/assets/app.css?v=abc123')
+    expect(versioned.status).toBe(200)
+    expect(versioned.headers.get('content-type')).toContain('text/css')
+    expect(versioned.headers.get('cache-control')).toContain('immutable')
+    const css = await versioned.text()
+    expect(css).toContain(':root')
+    expect(css).toContain('--color-accent')
+
+    // 不带指纹（用户直接访问该路径）不能 immutable，否则样式改了也拿不到新文件
+    const bare = await app.request('/assets/app.css')
+    expect(bare.status).toBe(200)
+    expect(bare.headers.get('cache-control')).not.toContain('immutable')
+  })
+
+  it('样式表内容指纹：CSS 不变则地址不变（可缓存），且当前地址与页面引用一致', async () => {
+    const html = await (await makePageApp().request('/', {}, makeEnv())).text()
+    const href = /href="(\/assets\/app\.css\?v=[^"]+)"/.exec(html)![1]
+    const res = await (await realApp()).request(href)
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe(CSS_CONTENT)
   })
 })
 
