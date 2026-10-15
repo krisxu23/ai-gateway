@@ -687,6 +687,34 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.0', () => {
     expect(normalizeOpenCodeBaseUrl('https://mirror.example.com/zen/v1')).toBe('https://mirror.example.com/inference/v1')
     expect(normalizeOpenCodeBaseUrl('https://other.example/v1')).toBe('https://other.example/v1')
   })
+
+  it('testOpenCodeModel 与 fetchOpenCodeModels 会自动把旧 /zen/v1 改写为 /inference/v1', async () => {
+    const { testOpenCodeModel, fetchOpenCodeModels } = await import('../src/opencode')
+    let capturedUrl = ''
+    const fetcher = async (url: string | URL | Request) => {
+      capturedUrl = String(url)
+      if (capturedUrl.endsWith('/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'mimo-v2.6-flash-free' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    }
+
+    // 测试普通 chat 模型（非 muse-*）测试连通性
+    const testResult = await testOpenCodeModel('https://opencode.ai/zen/v1', [], 'mimo-v2.6-flash-free', [], fetcher as typeof fetch)
+    expect(testResult.success).toBe(true)
+    expect(capturedUrl).toBe('https://opencode.ai/inference/v1/chat/completions')
+
+    // 测试获取模型列表
+    const modelsResult = await fetchOpenCodeModels('https://opencode.ai/zen/v1', [], [], fetcher as typeof fetch)
+    expect(modelsResult.success).toBe(true)
+    expect(capturedUrl).toBe('https://opencode.ai/inference/v1/models')
+  })
 })
 
 describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
@@ -717,7 +745,7 @@ describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
     // 镜像是第三方出口，它失败不该把官方匿名额度一起挡掉
     expect(seen).toEqual([
       'https://mirror.example.com/zen/v1/chat/completions',
-      'https://opencode.example.com/zen/v1/chat/completions',
+      'https://opencode.example.com/inference/v1/chat/completions',
     ])
   })
 

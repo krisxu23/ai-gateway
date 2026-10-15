@@ -12,7 +12,7 @@ import {
 } from './storage'
 import { buildAuthHeaders, testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
-import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
+import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL, normalizeOpenCodeBaseUrl } from './config'
 import type {
   Env,
   ApiResponse,
@@ -218,9 +218,9 @@ export async function handleGetProviders(c: Context<{ Bindings: Env }>) {
 
 export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
   const body = await readJsonBody<CreateProviderRequest>(c)
-  // opencode 未传地址时自动填充
-  if (body.id === 'opencode' && !body.baseUrl) {
-    body.baseUrl = OPENCODE_DEFAULT_URL
+  // opencode 未传地址时自动填充，传了旧地址时自动归一为新端点
+  if (body.id === 'opencode') {
+    body.baseUrl = body.baseUrl ? normalizeOpenCodeBaseUrl(body.baseUrl) : OPENCODE_DEFAULT_URL
   }
 
   // 类型一并校验：name 传数组/对象时会被原样落库，列表页渲染出 "[object Object]"
@@ -310,7 +310,8 @@ export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
     if (ssrfError) {
       return c.json<ApiResponse>({ success: false, message: `提供商 baseUrl 不安全: ${ssrfError}` }, 400)
     }
-    updates.baseUrl = body.baseUrl.replace(/\/+$/, '')
+    const cleanUrl = body.baseUrl.replace(/\/+$/, '')
+    updates.baseUrl = id === 'opencode' ? normalizeOpenCodeBaseUrl(cleanUrl) : cleanUrl
   }
   if (body.models !== undefined && !Array.isArray(body.models)) {
     return c.json<ApiResponse>({ success: false, message: 'models 必须是数组' }, 400)
@@ -385,7 +386,7 @@ export async function handleTestModel(c: Context<{ Bindings: Env }>) {
   }
 
   const result = isOpenCodeProvider(provider.id)
-    ? await testOpenCodeModel(provider.baseUrl, enabledKeys, modelId, resolveOpenCodeUrls(c.env))
+    ? await testOpenCodeModel(normalizeOpenCodeBaseUrl(provider.baseUrl), enabledKeys, modelId, resolveOpenCodeUrls(c.env))
     : await testModelConnection(provider.baseUrl, enabledKeys[0].key, modelId, provider.apiType)
 
   const modelConfig = provider.models.find((m) => m.id === modelId)
@@ -426,7 +427,8 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
         })
       }
     }
-    const result = await fetchOpenCodeModels(url, [{ key: apiKey, enabled: true }], resolveOpenCodeUrls(c.env))
+    const cleanUrl = normalizeOpenCodeBaseUrl(url)
+    const result = await fetchOpenCodeModels(cleanUrl, [{ key: apiKey, enabled: true }], resolveOpenCodeUrls(c.env))
     return c.json<ApiResponse>({
       success: true,
       data: {
@@ -476,8 +478,9 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
   if (ssrfError) return c.json<ApiResponse>({ success: false, message: ssrfError }, 400)
 
   if (providerId && isOpenCodeProvider(providerId)) {
+    const cleanUrl = normalizeOpenCodeBaseUrl(url)
     const apiKeys = apiKey ? [{ key: apiKey, enabled: true }] : []
-    const result = await testOpenCodeModel(url, apiKeys, model, resolveOpenCodeUrls(c.env))
+    const result = await testOpenCodeModel(cleanUrl, apiKeys, model, resolveOpenCodeUrls(c.env))
     return c.json<ApiResponse>({
       success: true,
       data: { success: result.success, statusCode: result.statusCode || 0, message: result.message },

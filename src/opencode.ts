@@ -1009,21 +1009,26 @@ export function createKeepAliveStream(): TransformStream<Uint8Array, Uint8Array>
 }
 
 export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Promise<Response> {
+  const normalizedBase = normalizeOpenCodeBaseUrl(options.baseUrl)
+  const normalizedOptions: OpenCodeRequestOptions = normalizedBase === options.baseUrl
+    ? options
+    : { ...options, baseUrl: normalizedBase }
+
   // zen 的 muse-*-free 家族只在上游 /responses 端点提供服务, chat/completions
   // 对它们崩成 500。这里把请求改写为 Responses 形态并把响应翻译回 chat 格式,
   // 对调用方(代理路径与连通性测试)完全透明。
-  if (options.method === 'POST' && /(?:^|\/)chat\/completions$/.test(options.subPath) && options.body) {
+  if (normalizedOptions.method === 'POST' && /(?:^|\/)chat\/completions$/.test(normalizedOptions.subPath) && normalizedOptions.body) {
     try {
-      const parsed = JSON.parse(options.body) as Record<string, unknown>
+      const parsed = JSON.parse(normalizedOptions.body) as Record<string, unknown>
       const model = typeof parsed.model === 'string' ? parsed.model : ''
       if (model && zenModelNeedsResponses(model)) {
-        return await proxyOpenCodeResponses(options, parsed, model)
+        return await proxyOpenCodeResponses(normalizedOptions, parsed, model)
       }
     } catch {
       // body 不是合法 JSON: 按原样透传, 由上游给出错误
     }
   }
-  return proxyOpenCodeUpstream(options)
+  return proxyOpenCodeUpstream(normalizedOptions)
 }
 
 async function proxyOpenCodeResponses(
@@ -1167,7 +1172,7 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   }
 
   const enabledKeys = options.apiKeys.filter((entry) => entry.enabled && entry.key)
-  const officialUrl = buildUrl(options.baseUrl, options.subPath, options.search)
+  const officialUrl = buildUrl(normalizeOpenCodeBaseUrl(options.baseUrl), options.subPath, options.search)
 
   for (const entry of enabledKeys) {
     try {
@@ -1244,7 +1249,7 @@ export async function testOpenCodeModel(
   fetcher?: typeof fetch
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
-    baseUrl,
+    baseUrl: normalizeOpenCodeBaseUrl(baseUrl),
     apiKeys,
     mirrorUrls,
     method: 'POST',
@@ -1278,7 +1283,7 @@ export async function fetchOpenCodeModels(
   fetcher?: typeof fetch
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
-    baseUrl,
+    baseUrl: normalizeOpenCodeBaseUrl(baseUrl),
     apiKeys,
     mirrorUrls,
     method: 'GET',

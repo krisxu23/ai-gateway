@@ -1,4 +1,4 @@
-import { DEFAULT_PROVIDERS, KV_KEYS, PROXY_KEY_PREFIX } from './config'
+import { DEFAULT_PROVIDERS, KV_KEYS, normalizeOpenCodeBaseUrl, PROXY_KEY_PREFIX } from './config'
 import type { Env, Provider, ProxyKey, Session } from './types'
 
 // ===== isolate 内存缓存 =====
@@ -173,7 +173,14 @@ function serialized<T>(key: string, task: () => Promise<T>): Promise<T> {
 // ===== 提供商 CRUD =====
 
 export async function getProviders(env: Env): Promise<Provider[]> {
-  return getCachedList<Provider>(env, KV_KEYS.PROVIDERS)
+  const list = await getCachedList<Provider>(env, KV_KEYS.PROVIDERS)
+  return list.map((p) => {
+    if (p.id === 'opencode' && p.baseUrl) {
+      const normalized = normalizeOpenCodeBaseUrl(p.baseUrl)
+      return normalized === p.baseUrl ? p : { ...p, baseUrl: normalized }
+    }
+    return p
+  })
 }
 
 export async function getProvider(env: Env, id: string): Promise<Provider | null> {
@@ -308,8 +315,14 @@ export async function validateProxyKey(env: Env, key: string): Promise<boolean> 
 
 export async function seedInitialData(env: Env): Promise<void> {
   const providers = await getProviders(env)
-  // opencode 已存在时必定已迁移，直接跳过省去一次 KV 读
-  if (providers.some((p) => p.id === 'opencode')) return
+  // 存量 opencode 若仍指向旧的 zen/v1 地址，自动持久化升级为 inference/v1
+  const existingOpenCode = providers.find((p) => p.id === 'opencode')
+  if (existingOpenCode && existingOpenCode.baseUrl && existingOpenCode.baseUrl.includes('/zen/v1')) {
+    await updateProvider(env, 'opencode', {
+      baseUrl: normalizeOpenCodeBaseUrl(existingOpenCode.baseUrl),
+    })
+  }
+  if (existingOpenCode) return
   const migrationCompleted = await env.KV.get(KV_KEYS.OPENCODE_MIGRATION)
   const opencode = DEFAULT_PROVIDERS.find((p) => p.id === 'opencode')
 
