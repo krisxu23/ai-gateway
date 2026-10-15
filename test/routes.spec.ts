@@ -686,7 +686,7 @@ describe('seedInitialData 初始化', () => {
 
     const providers = await getProviders(env)
     expect(providers.map((p) => p.id)).toEqual(['opencode'])
-    expect(providers[0].baseUrl).toBe('https://opencode.ai/zen/v1')
+    expect(providers[0].baseUrl).toBe('https://opencode.ai/inference/v1')
     expect(providers[0].models.length).toBeGreaterThan(0)
     expect(providers[0].enabled).toBe(true)
 

@@ -599,6 +599,96 @@ describe('generateOpenCodeId & resolveSessionId', () => {
   })
 })
 
+describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.0', () => {
+  it('isOpenCodeRealSessionId 只接受低 12 位反转计数很小的官方形态 ID', async () => {
+    const { isOpenCodeRealSessionId } = await import('../src/opencode')
+    // 自己生成的 ID 必定合法（计数 1~15）
+    for (let i = 0; i < 5; i++) expect(isOpenCodeRealSessionId(generateOpenCodeId('ses'))).toBe(true)
+    // 哈希裁剪的伪 ID（低 12 位随机）大概率不合法
+    expect(isOpenCodeRealSessionId('ses_000000000abcABCdefGHIjklMN0')).toBe(false)
+    expect(isOpenCodeRealSessionId('ses_123456789abcABCdefGHIjklMN0')).toBe(false)
+    // 格式不合法的直接拒
+    expect(isOpenCodeRealSessionId('ses_short')).toBe(false)
+    expect(isOpenCodeRealSessionId('')).toBe(false)
+  })
+
+  it('resolveSessionId 拒绝非官方形态的透传 ID（计数过大）', async () => {
+    const { isOpenCodeRealSessionId } = await import('../src/opencode')
+    const fake = 'ses_000000000abcABCdefGHIjklMN0'
+    expect(isOpenCodeRealSessionId(fake)).toBe(false)
+    const derived = resolveSessionId(fake, { messages: [{ role: 'user', content: 'conv' }] })
+    expect(derived).not.toBe(fake)
+    expect(isOpenCodeRealSessionId(derived)).toBe(true)
+  })
+
+  it('gate 注入五个核心工具且参数形状非空（空 properties 会被上游拒）', async () => {
+    const { STUB_TOOL_NAMES, stubToolParameters } = await import('../src/opencode-responses')
+    expect([...STUB_TOOL_NAMES]).toEqual(['bash', 'edit', 'glob', 'grep', 'read'])
+    for (const name of STUB_TOOL_NAMES) {
+      const params = stubToolParameters(name) as Record<string, unknown>
+      expect(params.additionalProperties).toBe(false)
+      const properties = params.properties as Record<string, unknown>
+      expect(Object.keys(properties).length).toBeGreaterThan(0)
+    }
+    expect((stubToolParameters('bash') as Record<string, unknown>).properties).toHaveProperty('command')
+    expect((stubToolParameters('read') as Record<string, unknown>).properties).toHaveProperty('filePath')
+  })
+
+  it('chat 请求带 stream_options.include_usage，头集合与 OpenCode 1.19.0 一致且不含多余会话头', async () => {
+    const seen: Array<{ headers: Headers; body: Record<string, unknown> }> = []
+    const fetcher = async (_url: string | URL | Request, init?: RequestInit) => {
+      seen.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) })
+      return new Response('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    }
+    const res = await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      mirrorUrls: [],
+      body: JSON.stringify({ model: 'mimo-v2.6-flash-free', messages: [{ role: 'user', content: 'hi' }] }),
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(200)
+    await res.text()
+    expect(seen).toHaveLength(1)
+    const h = seen[0].headers
+    // 旧 /zen/v1 baseUrl 请求前改写为新端点
+    expect(seen).toHaveLength(1)
+    expect(h.get('user-agent')).toBe('opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14')
+    expect(h.get('accept')).toBe('*/*')
+    expect(h.get('authorization')).toBe('Bearer public')
+    expect(h.get('x-opencode-client')).toBe('cli')
+    expect(h.get('x-opencode-project')).toBe('global')
+    expect(h.get('x-opencode-session-id')).toBe(h.get('x-opencode-session'))
+    expect(h.get('x-session-affinity')).toBeNull()
+    expect(h.get('x-session-id')).toBeNull()
+    // 旧端点 baseUrl 已改写为 inference/v1
+    expect(h.get('x-opencode-request')).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    const body = seen[0].body
+    expect(body.stream_options).toMatchObject({ include_usage: true })
+    expect(body.stream).toBe(true)
+    const tools = body.tools as Array<{ function: { name: string; parameters: Record<string, unknown> } }>
+    expect(tools.map((t) => t.function.name)).toEqual(['bash', 'edit', 'glob', 'grep', 'read'])
+    for (const t of tools) {
+      expect(Object.keys(t.function.parameters.properties as object).length).toBeGreaterThan(0)
+      expect(t.function.parameters.additionalProperties).toBe(false)
+    }
+  })
+
+  it('normalizeOpenCodeBaseUrl 把旧 /zen/v1 改写为 /inference/v1', async () => {
+    const { normalizeOpenCodeBaseUrl } = await import('../src/config')
+    expect(normalizeOpenCodeBaseUrl('https://opencode.ai/zen/v1')).toBe('https://opencode.ai/inference/v1')
+    expect(normalizeOpenCodeBaseUrl('https://opencode.ai/zen/v1/')).toBe('https://opencode.ai/inference/v1')
+    expect(normalizeOpenCodeBaseUrl('https://opencode.ai/inference/v1')).toBe('https://opencode.ai/inference/v1')
+    expect(normalizeOpenCodeBaseUrl('https://mirror.example.com/zen/v1')).toBe('https://mirror.example.com/inference/v1')
+    expect(normalizeOpenCodeBaseUrl('https://other.example/v1')).toBe('https://other.example/v1')
+  })
+})
+
 describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
   const requestOptions = (over: Record<string, unknown>) => ({
     baseUrl: 'https://opencode.example.com/zen/v1',

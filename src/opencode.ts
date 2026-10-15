@@ -9,12 +9,28 @@ import {
   responsesToChatBody,
   STUB_SWALLOW_NOTE,
   STUB_TOOL_NAMES,
+  stubToolParameters,
   zenModelNeedsResponses,
 } from './opencode-responses'
+import { normalizeOpenCodeBaseUrl } from './config'
+
+export { normalizeOpenCodeBaseUrl } from './config'
 
 const OPENCODE_PROVIDER_ID = 'opencode'
 
-const OPENCODE_VERSION = '1.18.31'
+// 对齐 OpenCode 1.19.0: 每协议的 ai-sdk 包内嵌的 provider-utils 版本不同
+// (从官方发布二进制的请求里捕获, 与 magpie zen-free 插件一致)。
+const OPENCODE_VERSION = '1.19.0'
+const PROVIDER_UTILS_VERSION: Record<string, string> = {
+  chat: '4.0.23',
+  responses: '4.0.40',
+  anthropic: '4.0.46',
+}
+
+export function opencodeUserAgent(protocol: keyof typeof PROVIDER_UTILS_VERSION = 'chat'): string {
+  const utils = PROVIDER_UTILS_VERSION[protocol] ?? PROVIDER_UTILS_VERSION.chat
+  return `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/${utils} runtime/bun/1.3.14`
+}
 // 响应头超时（毫秒）：镜像逐个串行尝试，单个镜像最坏等待。30000ms（30s）足够
 // 一个正常上游返回响应头，又能让挂掉的镜像快速放弃、换下一个出口。
 const OPENCODE_TIMEOUT_MS = 30000
@@ -98,7 +114,13 @@ function randomBase62(length: number): string {
   return Array.from(getRandomBytes(length), (b) => BASE62_ALPHABET[b % 62]).join('')
 }
 
-const SESSION_ID_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+/** OpenCode 1.19.0 会话 ID 形态: 前 12 位 hex 的低 12 位是位反转的毫秒内计数,
+ *  计数必须很小(0xfff - 计数 < 16); 哈希裁剪出来的伪 ID 过不了上游校验。 */
+export function isOpenCodeRealSessionId(value: string): boolean {
+  const match = /^ses_([0-9a-f]{12})[0-9A-Za-z]{14}$/.exec(value)
+  if (!match) return false
+  return 0xfff - (parseInt(match[1], 16) & 0xfff) < 16
+}
 
 let lastSessionTimestamp = 0
 let sessionCounter = 0
@@ -181,24 +203,34 @@ function firstUserText(parsed: Record<string, unknown> | null): string {
  * 保持会话稳定; 无文本时每请求生成合法时间序 ID。
  */
 export function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
-  if (clientSessionId && SESSION_ID_RE.test(clientSessionId)) return clientSessionId
+  // 仅复用上游校验会通过的官方形态 ID (计数合法), 其余按会话内容重新派生。
+  if (clientSessionId && isOpenCodeRealSessionId(clientSessionId)) return clientSessionId
   const text = firstUserText(parsed)
   if (text) return getOrCreateConversationSession(`opencode-session:${text}`)
   return generateOpenCodeId('ses')
 }
 
-function createRequestHeaders(apiKey: string, requestId: string, sessionId: string): Headers {
-  return new Headers({
+function createRequestHeaders(
+  apiKey: string,
+  requestId: string,
+  sessionId: string,
+  protocol: 'chat' | 'responses' = 'chat'
+): Headers {
+  // 只发 OpenCode 1.19.0 自己会发的头集合 (packages/opencode/src/session/llm/
+  // request.ts): 多发一个 x-session-affinity/X-Session-Id 也会被上游识别为
+  // 非 OpenCode 请求而拒之门外 (403 FreeTierError, 已实测)。
+  const headers = new Headers({
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${apiKey}`,
-    'User-Agent': `opencode/${OPENCODE_VERSION}`,
+    'Accept': '*/*',
+    'User-Agent': opencodeUserAgent(protocol),
     'x-opencode-client': 'cli',
     'x-opencode-project': 'global',
     'x-opencode-request': requestId,
     'x-opencode-session': sessionId,
-    'x-session-affinity': sessionId,
-    'X-Session-Id': sessionId,
+    'x-opencode-session-id': sessionId,
   })
+  headers.set('Authorization', `Bearer ${apiKey}`)
+  return headers
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +245,8 @@ function freeLaneGateTool(name: string) {
     type: 'function',
     function: {
       name,
-      description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
+      description: 'Not available. Never call this tool.',
+      parameters: stubToolParameters(name),
     },
   }
 }
@@ -278,6 +310,12 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
   body.tools = tools
   const hadTools = Array.isArray(parsed.tools) ? (parsed.tools as unknown[]).length > 0 : false
   if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
+  // OpenCode 官方 chat 请求固定带 stream_options.include_usage (照搬 usage 数据)。
+  const prevOptions = body.stream_options
+  body.stream_options = {
+    ...(prevOptions && typeof prevOptions === 'object' && !Array.isArray(prevOptions) ? prevOptions as Record<string, unknown> : {}),
+    include_usage: true,
+  }
   return { body, clientWantsStream, stubOnly: !hadTools, back, injectedStubs }
 }
 
@@ -285,8 +323,8 @@ function freeLaneGateResponsesTool(name: string) {
   return {
     type: 'function',
     name,
-    description: 'Reserved for the host runtime; do not call it.',
-    parameters: { type: 'object', properties: {} },
+    description: 'Not available. Never call this tool.',
+    parameters: stubToolParameters(name),
   }
 }
 
@@ -880,7 +918,7 @@ async function requestUpstream(
   )
   let response: Response
   try {
-    const headers = createRequestHeaders(apiKey, requestId, sessionId)
+    const headers = createRequestHeaders(apiKey, requestId, sessionId, options.subPath.endsWith('responses') ? 'responses' : 'chat')
     if (options.modelHeader) headers.set('x-opencode-model', options.modelHeader)
     response = await fetcher(url, {
       method: options.method,
@@ -1013,6 +1051,7 @@ async function proxyOpenCodeResponses(
   const clientWantsStream = chatBody.stream === true
   const response = await proxyOpenCodeUpstream({
     ...options,
+    baseUrl: normalizeOpenCodeBaseUrl(options.baseUrl),
     subPath: options.subPath.replace(/chat\/completions$/, 'responses'),
     body: JSON.stringify(responsesBody),
     modelHeader: model,

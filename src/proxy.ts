@@ -3,7 +3,7 @@ import { getProvider, getProviders } from './storage'
 import { readCappedText } from './http'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
 import type { Env, ProxyRequestBody } from './types'
-import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
+import { isOpenCodeProvider, normalizeOpenCodeBaseUrl, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 
 // ===== Key 健康状态类型和辅助函数 =====
 
@@ -340,11 +340,12 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     const subPath = url.pathname.replace(/^\/v1\/?/, '') || 'chat/completions'
 
     if (isOpenCodeProvider(providerId)) {
-      // 客户端会话标识透传: 官方格式则上游复用, 否则按会话内容确定性派生。
-      const sessionHeaders = ['x-opencode-session', 'x-session-affinity', 'x-session-id', 'session_id', 'session-id']
+      // 客户端会话标识透传: 官方形态的会话 ID 才能通过上游风控; 头列表只收
+      // OpenCode 可能带的会话头(不含 x-session-affinity —— 官方自己不发它)。
+      const sessionHeaders = ['x-opencode-session', 'x-opencode-session-id', 'x-session-id', 'session_id', 'session-id']
       const clientSessionId = sessionHeaders.map((h) => c.req.header(h)?.trim()).find(Boolean)
       const response = await proxyOpenCodeRequest({
-        baseUrl: provider.baseUrl,
+        baseUrl: normalizeOpenCodeBaseUrl(provider.baseUrl),
         apiKeys: enabledKeys,
         method: c.req.method,
         subPath,

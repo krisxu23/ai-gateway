@@ -47,8 +47,28 @@ export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn
  *  这里按行（而非事件）卡，因为本转换是按行解析的。 */
 const MAX_SSE_LINE_CHARS = 8 * 1024 * 1024
 
-/** 免费通道的桩工具名：gate 注入与吞噬判定共用同一定义，避免两处分叉。 */
-export const STUB_TOOL_NAMES = ['bash', 'read'] as const
+// 免费通道的桩工具名: 上游免费档要求 bash/edit/glob/grep/read 五个核心工具
+// 恰好按 OpenCode 的形状出现(空 properties 或缺工具都会被拒), 注入与吞噬
+// 判定共用同一定义, 避免两处分叉。
+export const STUB_TOOL_NAMES = ['bash', 'edit', 'glob', 'grep', 'read'] as const
+
+/** 每个核心工具至少要有一个参数, 参数名取 OpenCode 自家工具的第一个参数。 */
+export const STUB_TOOL_PARAMETER: Record<string, string> = {
+  bash: 'command',
+  edit: 'filePath',
+  glob: 'pattern',
+  grep: 'pattern',
+  read: 'filePath',
+}
+
+/** 桩工具参数 schema (chat 形态): 与 OpenCode 工具同构的最小形状。 */
+export function stubToolParameters(name: string): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: { [STUB_TOOL_PARAMETER[name] ?? 'input']: { type: 'string' } },
+    additionalProperties: false,
+  }
+}
 
 /** 桩工具名判定(吞噬用)。大小写归一: 上游可能输出首字母大写的 Bash/Read。 */
 export function isStubToolName(name: unknown): boolean {

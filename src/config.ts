@@ -15,7 +15,13 @@ export const SESSION_TTL = 7 * 24 * 60 * 60
 
 export const PROXY_KEY_PREFIX = 'sk_cf_'
 
-export const OPENCODE_DEFAULT_URL = 'https://opencode.ai/zen/v1'
+export const OPENCODE_DEFAULT_URL = 'https://opencode.ai/inference/v1'
+
+// 官方 2026-10 中旬起免费档只在 /inference/v1 服务，旧 /zen/v1 一律 403
+// FreeTierError。存量部署的 KV 里 provider.baseUrl 还是旧值，请求前改写。
+export function normalizeOpenCodeBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/zen\/v1\/?$/, '/inference/v1')
+}
 
 // Key 降权后自动恢复的冷却时间 (毫秒)
 export const KEY_HEALTH_COOLDOWN_MS = 5 * 60 * 1000
@@ -44,14 +50,17 @@ export const DEFAULT_PROVIDERS: Provider[] = [
   {
     id: 'opencode',
     name: 'OpenCode',
-    baseUrl: 'https://opencode.ai/zen/v1',
+    baseUrl: 'https://opencode.ai/inference/v1',
     apiType: 'openai',
     apiKeys: [],
     models: [
-      { id: 'deepseek-v4-flash-free', enabled: true },
-      { id: 'mimo-v2.5-free', enabled: true },
-      { id: 'nemotron-3-ultra-free', enabled: true },
-      { id: 'hy3-free', enabled: true },
+      { id: 'big-pickle', enabled: true },
+      { id: 'mimo-v2.6-flash-free', enabled: true },
+      { id: 'nemotron-3.5-lightning-free', enabled: true },
+      { id: 'deepseek-v4.1-flash-free', enabled: true },
+      { id: 'cat-jam-free', enabled: true },
+      { id: 'space-bunny-free', enabled: true },
+      { id: 'muse-spark-1.3-contributor-free', enabled: true },
     ],
     enabled: true,
     createdAt: new Date().toISOString(),
