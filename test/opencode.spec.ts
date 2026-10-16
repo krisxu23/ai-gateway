@@ -49,6 +49,139 @@ describe('responses 通道 + 非流式客户端', () => {
   })
 })
 
+// 上游 /responses 只认 tool_choice:"auto"（其余一律 400），归一化被迫保留，但
+// 降级不能静默：客户端传 "none"（明确禁止工具调用）却被改成 "auto" 时，响应必须
+// 带响应头 +（非流式）JSON 顶层字段。
+describe('responses 路径 tool_choice 降级标注', () => {
+  // 上游 responses SSE：正文增量 + 终态（缺终态会被折叠成 502）
+  const responsesSse = () => sseResponse([
+    'data: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'hi' }) + '\n\n',
+    'data: ' + JSON.stringify({ type: 'response.completed', response: {} }) + '\n\n',
+  ])
+
+  const museRequest = (extra: Record<string, unknown>, fetcher: typeof fetch) =>
+    proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'muse-spark-1.2-free',
+        messages: [{ role: 'user', content: 'hi' }],
+        ...extra,
+      }),
+      mirrorUrls: [],
+      fetcher,
+    })
+
+  it('tool_choice:"none" 非流式：上游收到 auto，客户端拿到显式降级标注', async () => {
+    const seen = { body: null as Record<string, unknown> | null }
+    const fetcher = (async (_url: string | URL, init?: RequestInit) => {
+      seen.body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return responsesSse()
+    }) as typeof fetch
+    const res = await museRequest({ stream: false, tool_choice: 'none' }, fetcher)
+    // 归一化保留（去掉它会直接 400），但必须留存证据
+    expect(seen.body!.tool_choice).toBe('auto')
+    const json = (await res.json()) as Record<string, unknown>
+    expect(json.tool_choice_downgraded).toEqual({ from: 'none', to: 'auto' })
+    // 原响应体照常翻译（不是用一个标注体替换掉答案）
+    expect(json.choices).toBeDefined()
+    expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBe('none->auto')
+  })
+
+  it('命名函数选择（对象）降级时头里的 from 归一为 object（header 不含非 ASCII）', async () => {
+    const seen = { body: null as Record<string, unknown> | null }
+    const fetcher = (async (_url: string | URL, init?: RequestInit) => {
+      seen.body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return responsesSse()
+    }) as typeof fetch
+    const res = await museRequest(
+      { stream: false, tool_choice: { type: 'function', function: { name: '计算' } } },
+      fetcher
+    )
+    expect(seen.body!.tool_choice).toBe('auto')
+    expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBe('object->auto')
+    const json = (await res.json()) as { tool_choice_downgraded: unknown }
+    // from 是归一化前 responses 体里的值（chat 形态的命名函数已被翻译为
+    // {type:'function', name}），原样带出
+    expect(json.tool_choice_downgraded).toEqual({
+      from: { type: 'function', name: '计算' },
+      to: 'auto',
+    })
+  })
+
+  it('tool_choice:"auto" 或不传：无降级即不打扰（无字段、无响应头）', async () => {
+    for (const choice of ['auto', undefined]) {
+      const seen = { body: null as Record<string, unknown> | null }
+      const fetcher = (async (_url: string | URL, init?: RequestInit) => {
+        seen.body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return responsesSse()
+      }) as typeof fetch
+      const extra: Record<string, unknown> = { stream: false }
+      if (choice !== undefined) extra.tool_choice = choice
+      const res = await museRequest(extra, fetcher)
+      // 没有降级时上游看到的就是客户端原值
+      expect(seen.body!.tool_choice).toBe(choice)
+      const json = (await res.json()) as Record<string, unknown>
+      expect(json.tool_choice_downgraded).toBeUndefined()
+      expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBeNull()
+    }
+  })
+
+  it('上游直接回 responses JSON（非 SSE）时同样标注（第三个返回点）', async () => {
+    const seen = { body: null as Record<string, unknown> | null }
+    const fetcher = (async (_url: string | URL, init?: RequestInit) => {
+      seen.body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response(
+        JSON.stringify({
+          id: 'r1',
+          model: 'muse-spark-1.2-free',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'hi' }] }],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }) as typeof fetch
+    const res = await museRequest({ stream: false, tool_choice: 'none' }, fetcher)
+    expect(seen.body!.tool_choice).toBe('auto')
+    const json = (await res.json()) as {
+      tool_choice_downgraded: unknown
+      choices: Array<{ message: { content: string } }>
+    }
+    expect(json.tool_choice_downgraded).toEqual({ from: 'none', to: 'auto' })
+    expect(json.choices[0].message.content).toBe('hi')
+    expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBe('none->auto')
+  })
+
+  it('折叠落 502（上游失败帧）时照样标注——降级确实发生过', async () => {
+    const fetcher = (async () =>
+      sseResponse([
+        'data: ' + JSON.stringify({ type: 'response.failed', response: { error: { message: 'quota exceeded' } } }) + '\n\n',
+      ])) as typeof fetch
+    const res = await museRequest({ stream: false, tool_choice: 'none' }, fetcher)
+    expect(res.status).toBe(502)
+    expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBe('none->auto')
+    const json = (await res.json()) as { error: { message: string }; tool_choice_downgraded: unknown }
+    expect(json.error.message).toContain('quota exceeded')
+    expect(json.tool_choice_downgraded).toEqual({ from: 'none', to: 'auto' })
+  })
+
+  it('流式 + tool_choice:"none"：只在响应头标注，SSE 体不加字段', async () => {
+    const seen = { body: null as Record<string, unknown> | null }
+    const fetcher = (async (_url: string | URL, init?: RequestInit) => {
+      seen.body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return responsesSse()
+    }) as typeof fetch
+    const res = await museRequest({ stream: true, tool_choice: 'none' }, fetcher)
+    expect(seen.body!.tool_choice).toBe('auto')
+    expect(res.headers.get('x-ai-gateway-tool-choice-downgraded')).toBe('none->auto')
+    // body 是未消费的流：头是唯一标注（不解析、不重写 SSE）
+    const text = await res.text()
+    expect(text).toContain('hi')
+    expect(text).not.toContain('tool_choice_downgraded')
+  })
+})
+
 describe('resolveOpenCodeUrls', () => {
   it('兼容换行/逗号/空格分隔并去重', () => {
     const env = { OPENCODE_MIRRORS_URL: 'https://a.example.com\nhttps://b.example.com, https://a.example.com' }
@@ -861,7 +994,9 @@ describe('collapseChatSseToJson: 流式字节边界', () => {
   })
 
   it('末段没有空行结尾时仍被消费', async () => {
-    const text = 'data: {"choices":[{"index":0,"delta":{"content":"尾巴"}}]}'
+    // 末段自带 finish_reason：既证明末段被解析到（否则收尾会因缺完成标记
+    // 落 502），也保证这条用例只验证"尾段补齐边界"这一件事
+    const text = 'data: {"choices":[{"index":0,"delta":{"content":"尾巴"},"finish_reason":"stop"}]}'
     expect(await contentOf(await collapseChatSseToJson(chunkedResponse(text, 8), 'm', false))).toBe('尾巴')
   })
 
@@ -896,5 +1031,114 @@ describe('collapseChatSseToJson: 无边界长流的上限', () => {
     )
     expect(res.status).toBe(413)
     expect(await res.text()).toContain('过大')
+  })
+})
+
+// 上游错误帧 / 截断流曾被折叠成 200 + 空正文 + finish_reason:'stop'：客户端把
+// 它当成"模型正常回了空回答"，既不重试也无从区分故障。参照 FreeX：折叠期任何
+// 错误、以及没有完成标记的流，都落 502。
+describe('collapseChatSseToJson: 上游错误透传', () => {
+  it('responses 通道翻译出的 error 帧折叠为 502 并保留原始信息', async () => {
+    // 模拟 createResponsesToChatStream 对 response.failed/error 的下发帧
+    const res = await collapseChatSseToJson(sseResponse([
+      chunk('partial'),
+      'data: {"error":{"message":"boom","type":"upstream_error","code":"upstream_error"}}\n\n',
+      'data: [DONE]\n\n',
+    ]), 'm', false)
+    expect(res.status).not.toBe(200)
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { message: string; type: string; code: string } }
+    expect(body.error.message).toContain('boom')
+    expect(body.error.type).toBe('upstream_error')
+    expect(body.error.code).toBe('upstream_error')
+  })
+
+  it('response.failed 帧（错误藏在 response.error 里）同样折叠为 502', async () => {
+    const res = await collapseChatSseToJson(sseResponse([
+      'data: {"type":"response.failed","response":{"error":{"message":"quota exceeded","code":"insufficient_quota"}}}\n\n',
+      'data: [DONE]\n\n',
+    ]), 'm', false)
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { message: string; code: string } }
+    expect(body.error.message).toContain('quota exceeded')
+    expect(body.error.code).toBe('insufficient_quota')
+  })
+
+  it('type:"error" 且 error 为字符串时也能带出文案', async () => {
+    const res = await collapseChatSseToJson(sseResponse([
+      'data: {"type":"error","error":"upstream engine crashed"}\n\n',
+    ]), 'm', false)
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { message: string } }
+    expect(body.error.message).toContain('upstream engine crashed')
+  })
+
+  it('错误帧后不再拼装正常 payload（不返回部分正文）', async () => {
+    const res = await collapseChatSseToJson(sseResponse([
+      chunk('half answer'),
+      'data: {"error":{"message":"reset by peer"}}\n\n',
+      'data: [DONE]\n\n',
+    ]), 'm', false)
+    const text = await res.text()
+    expect(res.status).toBe(502)
+    expect(text).not.toContain('half answer')
+    expect(text).not.toContain('chat.completion')
+  })
+})
+
+describe('collapseChatSseToJson: 缺少完成标记', () => {
+  const contentOf = async (res: Response) =>
+    (await res.json() as { choices: Array<{ message: { content: string | null } }> }).choices[0].message.content
+
+  it('只有 content 增量、无 finish_reason、无 [DONE]、流正常结束 → 502', async () => {
+    const res = await collapseChatSseToJson(sseResponse([
+      chunk('真'),
+      chunk('半截'),
+    ]), 'm', false)
+    // 默认的 'stop' 是假完成：残缺正文不能冒充完整回答
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { type: string; code: string; message: string } }
+    expect(body.error.code).toBe('upstream_incomplete')
+    expect(body.error.type).toBe('upstream_incomplete')
+    expect(body.error.message).toContain('完成标记')
+  })
+
+  it('中途 reader 抛错且无终态标记 → 502（可重试），不是残缺 200', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(chunk('half')))
+        c.error(new Error('socket reset'))
+      },
+    })
+    const res = await collapseChatSseToJson(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+      'm',
+      false
+    )
+    expect(res.status).toBe(502)
+    const body = await res.json() as { error: { code: string } }
+    expect(body.error.code).toBe('upstream_incomplete')
+  })
+
+  it('正常路径不受影响：content 增量 + finish_reason + [DONE] → 200', async () => {
+    const res = await collapseChatSseToJson(sseResponse([
+      chunk('hello '),
+      'data: {"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ]), 'm', false)
+    expect(res.status).toBe(200)
+    const body = await res.json() as {
+      object: string
+      choices: Array<{ finish_reason: string; message: { content: string | null } }>
+    }
+    expect(body.object).toBe('chat.completion')
+    expect(body.choices[0].finish_reason).toBe('stop')
+    expect(body.choices[0].message.content).toBe('hello world')
+  })
+
+  it('只有 [DONE] 没有 finish_reason 仍算完成（客户端习惯以 [DONE] 收尾）→ 200', async () => {
+    const res = await collapseChatSseToJson(sseResponse([chunk('ok'), 'data: [DONE]\n\n']), 'm', false)
+    expect(res.status).toBe(200)
+    expect(await contentOf(res)).toBe('ok')
   })
 })

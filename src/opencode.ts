@@ -394,6 +394,13 @@ interface CollapseState {
   overflowSlot: Map<string, number>
   /** 是否已遇到 data: [DONE]，之后的事件一律忽略 */
   done: boolean
+  /** 上游错误帧（error/response.failed）的内容: 折叠时不能伪装成 200 + 空正文 +
+   *  stop(客户端会误认为模型正常回了空回答)，收尾一律按 502 透传 */
+  upstreamError?: { message: string; type: string; code: string }
+  /** 是否真实观察到终态标记（data: [DONE] 或任意事件的 finish_reason）。
+   *  注意 done 已表示 [DONE]；本字段只记录 finish_reason 的观察，用于识别
+   *  "流被截断、从未给出完成标记"（此时默认的 finishReason 'stop' 是假的） */
+  sawFinishReason: boolean
 }
 
 /** 在字节缓冲里找下一个 SSE 事件边界（\n\n 或 \r\n\r\n）。
@@ -459,6 +466,32 @@ function applySseEvent(rawEvent: string, st: CollapseState): void {
     if (data === '[DONE]') { st.done = true; return }
     let evt: Record<string, unknown>
     try { evt = JSON.parse(data) as Record<string, unknown> } catch { continue }
+    // 上游错误帧必须被接住并终止折叠：responses 通道会把 response.failed/error
+    // 翻译成 data: {"error":{...}}（见 opencode-responses.ts），原生 chat 上游也
+    // 可能直接下发 error。放过去就等于 200 + 空正文 + finish_reason:'stop'。
+    const errField = evt.error as unknown
+    const respField = evt.response as Record<string, unknown> | undefined
+    if (
+      errField !== undefined ||
+      evt.type === 'error' ||
+      evt.type === 'response.failed' ||
+      respField?.status === 'failed'
+    ) {
+      // 错误信息可能藏在 evt.error（对象或字符串）、evt.response.error，或
+      // evt.response 本身；逐层回退，全都没有就用兜底文案
+      const errObj: unknown = errField ?? respField?.error ?? respField
+      const rec = (typeof errObj === 'object' && errObj !== null ? errObj : {}) as Record<string, unknown>
+      const rawMsg = rec.message ?? rec.code ?? errObj
+      const rawType = rec.type
+      const rawCode = rec.code
+      st.upstreamError = {
+        message: typeof rawMsg === 'string' && rawMsg ? rawMsg : '上游推理失败',
+        type: typeof rawType === 'string' && rawType ? rawType : 'upstream_error',
+        code: typeof rawCode === 'string' && rawCode ? rawCode : 'upstream_error',
+      }
+      st.done = true
+      return
+    }
     const choice = (evt.choices as Array<Record<string, unknown>> | undefined)?.[0]
     if (choice) {
       const delta = choice.delta as Record<string, unknown> | undefined
@@ -495,7 +528,10 @@ function applySseEvent(rawEvent: string, st: CollapseState): void {
           }
         }
       }
-      if (typeof choice.finish_reason === 'string' && choice.finish_reason) st.finishReason = choice.finish_reason
+      if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+        st.finishReason = choice.finish_reason
+        st.sawFinishReason = true
+      }
     }
     if (evt.usage && typeof evt.usage === 'object') st.usage = evt.usage
   }
@@ -527,6 +563,8 @@ export async function collapseChatSseToJson(
     argBufs: [],
     overflowSlot: new Map(),
     done: false,
+    upstreamError: undefined,
+    sawFinishReason: false,
   }
 
   const reader = response.body?.getReader()
@@ -560,8 +598,8 @@ export async function collapseChatSseToJson(
         }
       }
     } catch {
-      // 流中断：已解析的部分仍有价值（与旧实现 response.text() 抛错后落 500
-      // 不同，这里保留残缺但结构合法的响应）
+      // 流中断：不再保留残缺但结构合法的 200 响应（客户端会把半截正文当成
+      // 完整回答）。读到一半又拿不到终态标记的响应在收尾处统一落 502（可重试）。
     }
     // 最后一段可能没有以空行收尾，补一个边界让它也能被解析
     if (!st.done && pending.length > 0) {
@@ -571,6 +609,28 @@ export async function collapseChatSseToJson(
       withTail[pending.length + 1] = 10
       consumeSseBytes(withTail, st)
     }
+  }
+
+  // 上游错误优先：错误帧之后不再有正常回答可拼，直接把错误透传出去
+  if (st.upstreamError) {
+    return new Response(JSON.stringify({ error: st.upstreamError }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  // 从未见到终态标记（[DONE] 或 finish_reason）却把流读完了：默认的 'stop' 是
+  // 假完成，残缺正文不能当完整回答返回，落 502 让客户端重试
+  if (!st.done && !st.sawFinishReason) {
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: '上游流中断：缺少完成标记（[DONE]/finish_reason），响应可能不完整',
+          type: 'upstream_incomplete',
+          code: 'upstream_incomplete',
+        },
+      }),
+      { status: 502, headers: { 'Content-Type': 'application/json' } }
+    )
   }
 
   const { toolCalls, argBufs, content, usage } = st
@@ -1031,6 +1091,50 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
   return proxyOpenCodeUpstream(normalizedOptions)
 }
 
+/** 降级标注的响应头名：值恒为 `<from>->auto`（纯 ASCII）。 */
+const TOOL_CHOICE_DOWNGRADE_HEADER = 'x-ai-gateway-tool-choice-downgraded'
+
+/**
+ * responses 路径发生了 tool_choice 降级时，在响应上显式标注（响应头 + JSON 体字段），不静默。
+ *
+ * 标注 = 响应头 `x-ai-gateway-tool-choice-downgraded: <from>->auto`；
+ * 非流式 JSON 体另外在顶层加 `tool_choice_downgraded: {from, to:'auto'}`。
+ * 流式（SSE）体是未消费的流，不动 body —— 头是唯一标注。
+ * 头里的 `<from>` 取 `typeof from === 'string' ? from : 'object'`：命名函数选择是
+ * 对象，原始值里的非 ASCII/换行会让 header 直接抛错。
+ */
+async function annotateToolChoiceDowngrade(response: Response, from: unknown): Promise<Response> {
+  const headers = new Headers(response.headers)
+  headers.set(TOOL_CHOICE_DOWNGRADE_HEADER, `${typeof from === 'string' ? from : 'object'}->auto`)
+  const contentType = response.headers.get('content-type') || ''
+  if (!contentType.includes('application/json')) {
+    // 流式（SSE）：body 未消费，原样透传
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    })
+  }
+  const raw = await response.text()
+  let body = raw
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      // 原始值原样带出（字符串 'none'/'required' 或命名函数选择对象），客户端据此
+      // 知道自己的约束被改了
+      ;(parsed as Record<string, unknown>).tool_choice_downgraded = { from, to: 'auto' }
+      body = JSON.stringify(parsed)
+    }
+  } catch {
+    // 上游给了 application/json 却不是合法 JSON（镜像错误页等）：只加头，不动 body
+  }
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
 async function proxyOpenCodeResponses(
   options: OpenCodeRequestOptions,
   chatBody: Record<string, unknown>,
@@ -1046,8 +1150,19 @@ async function proxyOpenCodeResponses(
   // bash/read 工具, 缺一即 FreeTierError。
   responsesBody.stream = true
   ensureResponsesFreeLaneShape(responsesBody)
-  // 上游 /responses 只支持 tool_choice:"auto"; 客户端传 "none"/"required"/
-  // 命名函数会被 400, 这里统一归一为 "auto"。
+  // 归一化前留档原始值：改写是静默语义改写（客户端说“禁止调用工具”会被无声
+  // 放开），下游响应必须靠它显式标注，见 annotateToolChoiceDowngrade。
+  const originalToolChoice = responsesBody.tool_choice
+  const toolChoiceDowngraded = originalToolChoice !== undefined && originalToolChoice !== 'auto'
+  // 上游 /responses 只支持 tool_choice:"auto"，归一化被迫保留：
+  // 2026-10-16 实测（探针直连 https://opencode.ai/inference/v1，伪装 UA
+  // opencode/1.19.0 + Bearer public，muse-spark-1.3-contributor-free），
+  // tool_choice:'none' 返回 HTTP 400：
+  // {"error":{"message":"only `\"auto\"` is supported for `tool_choice`. `\"none\"`,
+  //  `\"required\"`, and named function choices are not currently supported",
+  //  "param":"tool_choice","type":"invalid_request_error"}}（'auto' 则 200）。
+  // 但静默改写会丢失客户端语义，因此下游响应必须标注降级（响应头 + 非流式 JSON
+  // 顶层字段 tool_choice_downgraded: {from, to}）。
   if (responsesBody.tool_choice !== undefined && responsesBody.tool_choice !== 'auto') {
     responsesBody.tool_choice = 'auto'
   }
@@ -1083,8 +1198,13 @@ async function proxyOpenCodeResponses(
       headers: translatedHeaders,
     })
     // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
-    if (clientWantsStream) return translated
-    return collapseChatSseToJson(translated, model, stubOnly, back, injectedStubs)
+    // 降级标注：流式体是未消费的 SSE 流，只加响应头。
+    if (clientWantsStream) {
+      return toolChoiceDowngraded ? annotateToolChoiceDowngrade(translated, originalToolChoice) : translated
+    }
+    const collapsed = await collapseChatSseToJson(translated, model, stubOnly, back, injectedStubs)
+    // 折叠也可能落 502，但降级确实发生过，照样标注（头 + JSON 顶层字段）
+    return toolChoiceDowngraded ? annotateToolChoiceDowngrade(collapsed, originalToolChoice) : collapsed
   }
   // 上游可能返回 HTML/纯文本（镜像错误页）：JSON 解析失败时原样透传状态与正文，
   // 否则异常会冒泡成网关 500 并丢掉上游真实错误
@@ -1099,11 +1219,16 @@ async function proxyOpenCodeResponses(
       headers: { 'Content-Type': response.headers.get('content-type') || 'text/plain; charset=utf-8' },
     })
   }
-  return new Response(translatedBody, {
+  // 直接 JSON 返回点：降级标注同样只在 toolChoiceDowngraded 时加，字段由
+  // helper 统一写入（这里不自己拼字段，避免重复/分叉）。
+  const translatedResponse = new Response(translatedBody, {
     status: response.status,
     statusText: response.statusText,
     headers: { 'Content-Type': 'application/json' },
   })
+  return toolChoiceDowngraded
+    ? annotateToolChoiceDowngrade(translatedResponse, originalToolChoice)
+    : translatedResponse
 }
 
 async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<Response> {
