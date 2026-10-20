@@ -18,9 +18,9 @@ export { normalizeOpenCodeBaseUrl } from './config'
 
 const OPENCODE_PROVIDER_ID = 'opencode'
 
-// 对齐 OpenCode 1.19.0: 每协议的 ai-sdk 包内嵌的 provider-utils 版本不同
+// 对齐 OpenCode 1.19.3: 每协议的 ai-sdk 包内嵌的 provider-utils 版本不同
 // (从官方发布二进制的请求里捕获, 与 magpie zen-free 插件一致)。
-const OPENCODE_VERSION = '1.19.0'
+const OPENCODE_VERSION = '1.19.3'
 const PROVIDER_UTILS_VERSION: Record<string, string> = {
   chat: '4.0.23',
   responses: '4.0.40',
@@ -114,7 +114,7 @@ function randomBase62(length: number): string {
   return Array.from(getRandomBytes(length), (b) => BASE62_ALPHABET[b % 62]).join('')
 }
 
-/** OpenCode 1.19.0 会话 ID 形态: 前 12 位 hex 的低 12 位是位反转的毫秒内计数,
+/** OpenCode 1.19.3 会话 ID 形态: 前 12 位 hex 的低 12 位是位反转的毫秒内计数,
  *  计数必须很小(0xfff - 计数 < 16); 哈希裁剪出来的伪 ID 过不了上游校验。 */
 export function isOpenCodeRealSessionId(value: string): boolean {
   const match = /^ses_([0-9a-f]{12})[0-9A-Za-z]{14}$/.exec(value)
@@ -216,7 +216,7 @@ function createRequestHeaders(
   sessionId: string,
   protocol: 'chat' | 'responses' = 'chat'
 ): Headers {
-  // 只发 OpenCode 1.19.0 自己会发的头集合 (packages/opencode/src/session/llm/
+  // 只发 OpenCode 1.19.3 自己会发的头集合 (packages/opencode/src/session/llm/
   // request.ts): 多发一个 x-session-affinity/X-Session-Id 也会被上游识别为
   // 非 OpenCode 请求而拒之门外 (403 FreeTierError, 已实测)。
   const headers = new Headers({
@@ -1156,7 +1156,7 @@ async function proxyOpenCodeResponses(
   const toolChoiceDowngraded = originalToolChoice !== undefined && originalToolChoice !== 'auto'
   // 上游 /responses 只支持 tool_choice:"auto"，归一化被迫保留：
   // 2026-10-16 实测（探针直连 https://opencode.ai/inference/v1，伪装 UA
-  // opencode/1.19.0 + Bearer public，muse-spark-1.3-contributor-free），
+  // opencode/1.19.3 + Bearer public，muse-spark-1.3-contributor-free），
   // tool_choice:'none' 返回 HTTP 400：
   // {"error":{"message":"only `\"auto\"` is supported for `tool_choice`. `\"none\"`,
   //  `\"required\"`, and named function choices are not currently supported",

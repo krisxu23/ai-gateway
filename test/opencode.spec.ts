@@ -732,7 +732,7 @@ describe('generateOpenCodeId & resolveSessionId', () => {
   })
 })
 
-describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.0', () => {
+describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.3', () => {
   it('isOpenCodeRealSessionId 只接受低 12 位反转计数很小的官方形态 ID', async () => {
     const { isOpenCodeRealSessionId } = await import('../src/opencode')
     // 自己生成的 ID 必定合法（计数 1~15）
@@ -767,7 +767,7 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.0', () => {
     expect((stubToolParameters('read') as Record<string, unknown>).properties).toHaveProperty('filePath')
   })
 
-  it('chat 请求带 stream_options.include_usage，头集合与 OpenCode 1.19.0 一致且不含多余会话头', async () => {
+  it('chat 请求带 stream_options.include_usage，头集合与 OpenCode 1.19.3 一致且不含多余会话头', async () => {
     const seen: Array<{ headers: Headers; body: Record<string, unknown> }> = []
     const fetcher = async (_url: string | URL | Request, init?: RequestInit) => {
       seen.push({ headers: new Headers(init?.headers), body: JSON.parse(String(init?.body)) })
@@ -791,7 +791,7 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.0', () => {
     const h = seen[0].headers
     // 旧 /zen/v1 baseUrl 请求前改写为新端点
     expect(seen).toHaveLength(1)
-    expect(h.get('user-agent')).toBe('opencode/1.19.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14')
+    expect(h.get('user-agent')).toBe('opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14')
     expect(h.get('accept')).toBe('*/*')
     expect(h.get('authorization')).toBe('Bearer public')
     expect(h.get('x-opencode-client')).toBe('cli')
