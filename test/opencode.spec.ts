@@ -643,6 +643,100 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     expect(out).toContain('hello')
     expect(out).toContain('world')
   })
+
+  // FreeX 378f378 同步: 旧式顶层 functions 数组(chat 遗留形态)是上游不读的
+  // 声明, 并入 tools 后删除 —— 上游只读 tools。
+  it('旧式 functions 并入 tools 且从上游 body 删除', async () => {
+    let upstreamBody: Record<string, unknown> | null = null
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+        functions: [{ name: 'myfunc', description: 'calc', parameters: { type: 'object' } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    // functions 已删除, 声明进了 tools(写成 chat 形态)
+    expect(upstreamBody!.functions).toBeUndefined()
+    const tools = upstreamBody!.tools as Array<{ type: string; function: { name: string; description: string; parameters: unknown } }>
+    const names = tools.map((t) => t.function.name)
+    expect(names).toEqual(expect.arrayContaining(['myfunc', 'bash', 'read']))
+    const folded = tools.find((t) => t.function.name === 'myfunc')!
+    expect(folded.type).toBe('function')
+    expect(folded.function.description).toBe('calc')
+    expect(folded.function.parameters).toEqual({ type: 'object' })
+    // 客户端声明了工具(旧式), 不加 tool_choice:'none'
+    expect(upstreamBody!.tool_choice).toBeUndefined()
+    expect(upstreamBody!.stream).toBe(true)
+  })
+
+  it('tools 与 functions 同名时只保留一份', async () => {
+    let upstreamBody: Record<string, unknown> | null = null
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ type: 'function', function: { name: 'myfunc', description: 'from tools', parameters: {} } }],
+        functions: [{ name: 'myfunc', description: 'from functions', parameters: {} }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const tools = upstreamBody!.tools as Array<{ function: { name: string; description: string } }>
+    const mine = tools.filter((t) => t.function.name === 'myfunc')
+    expect(mine).toHaveLength(1)
+    // tools 里的优先保留, functions 里的同名声明被丢弃
+    expect(mine[0].function.description).toBe('from tools')
+    expect(upstreamBody!.functions).toBeUndefined()
+  })
+
+  it('旧式 functions 里的 Bash 大小写变体同样被改名为 bash', async () => {
+    let upstreamBody: Record<string, unknown> | null = null
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'mimo-free',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+        functions: [{ name: 'Bash', description: 'run', parameters: {} }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const tools = upstreamBody!.tools as Array<{ function: { name: string } }>
+    const names = tools.map((t) => t.function.name)
+    // 折叠后参与改名: Bash -> bash, 不再额外注入 bash 桩
+    expect(names.filter((n) => n === 'bash')).toHaveLength(1)
+    expect(names).not.toContain('Bash')
+    expect(names).toContain('read')
+    expect(upstreamBody!.functions).toBeUndefined()
+  })
 })
 
 // 回归（R10-C）：越界/非整数的 tool_call.index 曾被当成新的一条并复用

@@ -280,6 +280,30 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
     const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
     return typeof fn?.name === 'string' ? fn.name : undefined
   }))
+  // FreeX 378f378 同步: 旧式顶层 functions 数组(chat 协议的遗留声明形态)是
+  // 上游不读的声明 —— 留在原地, 上游门禁(只读 tools)看不到它, 还会和 tools
+  // 里的同名声明各出现一次。并入 tools(写成 chat 形态 {type:'function',
+  // function:{name,description,parameters}}, 同名去重)后删除, 与 FreeX
+  // normalizeTools 的 legacyChat 处理对齐。折叠发生在改名/桩注入之前, 因此
+  // 旧式声明的 Bash/Read 同样会被改名映射, 也参与 hadTools 判定。
+  // 注意这里只处理 chat 路径; Responses 路径走 ensureResponsesFreeLaneShape,
+  // FreeX 在 responses 协议下同样不做折叠。
+  let foldedLegacyFunctions = 0
+  const legacyFunctions = Array.isArray(body.functions) ? (body.functions as unknown[]) : []
+  if (legacyFunctions.length > 0) {
+    for (const item of legacyFunctions) {
+      const rec = (item !== null && typeof item === 'object' ? item : null) as Record<string, unknown> | null
+      const name = rec?.name
+      if (typeof name !== 'string' || names.has(name)) continue
+      names.add(name)
+      foldedLegacyFunctions += 1
+      tools.push({
+        type: 'function',
+        function: { name, description: rec?.description, parameters: rec?.parameters },
+      })
+    }
+    delete body.functions
+  }
   // 上游工具名 → 客户端原名。用无原型对象: 上游可能报 __proto__/constructor
   // 这类名字, 在 {} 上查 back[name] 会命中 Object.prototype 而被误判成“改过名”。
   const back: Record<string, string> = Object.create(null)
@@ -308,7 +332,10 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
     injectedStubs.add(gateName)
   }
   body.tools = tools
-  const hadTools = Array.isArray(parsed.tools) ? (parsed.tools as unknown[]).length > 0 : false
+  // 旧式 functions 已折叠进 tools, 故计入"客户端带了工具": 否则纯旧式声明的
+  // 客户端会被误判为零 tools 而加上 tool_choice:'none', 模型反而调不了它
+  // 声明的工具(与 FreeX 不碰 tool_choice 的行为对齐)。
+  const hadTools = rawTools.length > 0 || foldedLegacyFunctions > 0
   if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
   // OpenCode 官方 chat 请求固定带 stream_options.include_usage (照搬 usage 数据)。
   const prevOptions = body.stream_options
