@@ -2,7 +2,6 @@ import type { ApiKeyEntry, Env } from './types'
 import { readCappedBytes } from './http'
 import {
   chatBodyToResponsesBody,
-  contentText,
   createResponsesToChatStream,
   isStubToolName,
   mapFreeLaneClientTools,
@@ -48,8 +47,8 @@ interface OpenCodeRequestOptions {
   /** Responses 专用模型: 额外透传 x-opencode-model 头(内容为 zen 模型 ID) */
   modelHeader?: string
   /**
-   * 客户端请求头透传的会话标识(x-opencode-session 等)。
-   * 符合官方格式则原样复用, 否则按会话内容确定性派生。
+   * 客户端请求头透传的会话标识(x-opencode-session / conversation_id 等)。
+   * 官方形态的 ses_ 原样复用; 非官方形态的非空信号也按信号派生(不丢弃)。
    */
   clientSessionId?: string
   /** 客户端断开信号：透传到上游 fetch（含镜像与匿名兜底），客户端走了就不再消耗额度 */
@@ -181,32 +180,122 @@ function getOrCreateConversationSession(seed: string): string {
 }
 
 /**
- * 提取首条 user 文本: 兼容 chat 形态(messages[])与 Responses 形态(input[])。
+ * 提取首条 user 所在的「对话开场」: 兼容 chat 形态(messages[])与 Responses 形态
+ * (input[])。对齐 FreeX 的 conversationSeed —— 系统提示(顶层 system /
+ * instructions、开场处的 system/developer 消息)与首条 user 回合共同构成开场,
+ * 避免两个模板化首问("hi")相同但系统提示不同的对话撞到同一个上游会话。
  */
-function firstUserText(parsed: Record<string, unknown> | null): string {
-  if (!parsed) return ''
-  for (const key of ['messages', 'input'] as const) {
-    const list = parsed[key]
-    if (!Array.isArray(list)) continue
-    for (const item of list) {
-      if (item && typeof item === 'object' && (item as Record<string, unknown>).role === 'user') {
-        const text = contentText((item as Record<string, unknown>).content)
-        if (text) return text
+function conversationSeed(parsed: Record<string, unknown> | null): string | undefined {
+  if (!parsed) return undefined
+  const system: unknown[] = []
+  for (const field of ['system', 'instructions'] as const) {
+    const value = parsed[field]
+    if (value !== undefined && value !== null) system.push(value)
+  }
+  const opening = parsed.messages ?? parsed.input
+  let first: unknown
+  if (Array.isArray(opening)) {
+    for (const item of opening) {
+      if (item && typeof item === 'object') {
+        const record = item as Record<string, unknown>
+        if (record.role === 'system' || record.role === 'developer') {
+          system.push(record.content)
+          continue
+        }
+        if (record.role === 'user') {
+          first = record.content
+          break
+        }
       }
     }
+  } else {
+    first = opening
   }
-  return ''
+  // 空开场没有可键化的东西: 与 FreeX 一致, 空字符串 / 缺失 / null 都算无开场。
+  if (first === '' || first === undefined || first === null) return undefined
+  return JSON.stringify({ system, first })
+}
+
+const CLAUDE_CODE_SESSION_ID_RE = /_session_([0-9A-Fa-f-]{36})$/
+
+/**
+ * 从 metadata.user_id 提取 Claude Code 的会话标识(对齐 FreeX 的 claudeSessionID):
+ * Claude Code 把对话名放在 `user_<hash>_account_<uuid>_session_<uuid>` 尾部,
+ * 只有最后一段是按对话的; 同一字段也见过直接是携带 session_id 的 JSON。
+ */
+function claudeSessionIdFromUserId(userId: unknown): string | undefined {
+  if (typeof userId === 'string' && userId !== '') {
+    const match = CLAUDE_CODE_SESSION_ID_RE.exec(userId)
+    if (match) return match[1]
+    try {
+      const parsed = JSON.parse(userId) as unknown
+      if (parsed && typeof parsed === 'object') {
+        const named = (parsed as Record<string, unknown>).session_id
+        if (typeof named === 'string' && named !== '') return named
+      }
+    } catch {
+      // 不是 JSON, 上面的下划线形态是它唯一的另一种可能
+    }
+    return undefined
+  }
+  if (userId && typeof userId === 'object') {
+    const named = (userId as Record<string, unknown>).session_id
+    if (typeof named === 'string' && named !== '') return named
+  }
+  return undefined
 }
 
 /**
- * 会话 ID 解析: 客户端透传的符合官方格式则原样复用; 否则按首条 user 文本
- * 保持会话稳定; 无文本时每请求生成合法时间序 ID。
+ * body 侧的会话信号(对齐 FreeX 的读取顺序): 客户端的 conversation_id 优先,
+ * 然后是 metadata.session_id, 最后是 metadata.user_id 里的 Claude 会话段。
+ * 空字符串不是名字, 只有非空才算信号。
+ */
+function bodyConversationSignal(parsed: Record<string, unknown> | null): string | undefined {
+  if (!parsed) return undefined
+  if (typeof parsed.conversation_id === 'string' && parsed.conversation_id !== '')
+    return parsed.conversation_id
+  const metadata = parsed.metadata
+  if (metadata && typeof metadata === 'object') {
+    const record = metadata as Record<string, unknown>
+    if (typeof record.session_id === 'string' && record.session_id !== '')
+      return record.session_id
+    const claudeSession = claudeSessionIdFromUserId(record.user_id)
+    if (claudeSession) return claudeSession
+  }
+  return undefined
+}
+
+/**
+ * 会话 ID 解析(对齐 FreeX 的会话身份规则):
+ * 1. 客户端直传官方形态 ses_ → 原样复用(上游风控只认这种, body 侧的官方形态同理);
+ * 2. 对话自己的名字(头信号 > body.conversation_id > metadata.session_id >
+ *    Claude user_id 会话段): 各自独立命名空间确定性派生, 互不串扰;
+ * 3. 无信号时按「开场」(系统提示 + 首条 user)派生;
+ * 4. Responses 续写(previous_response_id)按回复 ID 派生 —— 宿主丢掉历史只发
+ *    previous_response_id 时仍保持上游会话亲和;
+ * 5. 全无信号时每请求生成合法时间序 ID。
  */
 export function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
-  // 仅复用上游校验会通过的官方形态 ID (计数合法), 其余按会话内容重新派生。
+  // 官方形态直传: 上游校验会通过, 原样复用。
   if (clientSessionId && isOpenCodeRealSessionId(clientSessionId)) return clientSessionId
-  const text = firstUserText(parsed)
-  if (text) return getOrCreateConversationSession(`opencode-session:${text}`)
+
+  // 信号是对话自己的名字: 空名不是名, 非空信号优先于开场。
+  const signal = (clientSessionId !== undefined && clientSessionId !== '')
+    ? clientSessionId
+    : bodyConversationSignal(parsed)
+  if (signal !== undefined && signal !== '') {
+    // body 侧也可能是官方自己铸的 ID: 形态合法就直传, 不做哈希。
+    if (isOpenCodeRealSessionId(signal)) return signal
+    return getOrCreateConversationSession(`opencode-signal:${signal}`)
+  }
+
+  const seed = conversationSeed(parsed)
+  if (seed !== undefined) return getOrCreateConversationSession(`opencode-opening:${seed}`)
+
+  const previousResponseId = parsed?.previous_response_id
+  if (typeof previousResponseId === 'string' && previousResponseId !== '')
+    return getOrCreateConversationSession(`opencode-prev-response:${previousResponseId}`)
+
   return generateOpenCodeId('ses')
 }
 

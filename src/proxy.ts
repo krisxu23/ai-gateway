@@ -342,7 +342,8 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     if (isOpenCodeProvider(providerId)) {
       // 客户端会话标识透传: 官方形态的会话 ID 才能通过上游风控; 头列表只收
       // OpenCode 可能带的会话头(不含 x-session-affinity —— 官方自己不发它)。
-      const sessionHeaders = ['x-opencode-session', 'x-opencode-session-id', 'x-session-id', 'session_id', 'session-id']
+      // conversation_id / conversation-id: 对齐 FreeX 新增读取的会话信号名。
+      const sessionHeaders = ['x-opencode-session', 'x-opencode-session-id', 'x-session-id', 'session_id', 'session-id', 'conversation_id', 'conversation-id']
       const clientSessionId = sessionHeaders.map((h) => c.req.header(h)?.trim()).find(Boolean)
       const response = await proxyOpenCodeRequest({
         baseUrl: normalizeOpenCodeBaseUrl(provider.baseUrl),

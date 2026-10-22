@@ -814,15 +814,64 @@ describe('generateOpenCodeId & resolveSessionId', () => {
     expect(Number(decodedMsFromMsg)).toBe(expectedMod36)
   })
 
-  it('resolveSessionId 保持会话稳定且格式合法', () => {
-    const nativeSes = 'ses_eca971329ffeVVACPYm6ZjF6tv'
-    expect(resolveSessionId(nativeSes, null)).toBe(nativeSes)
+  it('resolveSessionId 按 FreeX 会话身份规则读取 body 信号', () => {
+    // body.conversation_id 优先于开场: 同一 conversation_id 即使开场不同也复用
+    const a = resolveSessionId(undefined, {
+      conversation_id: 'conv-42',
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    const b = resolveSessionId(undefined, {
+      conversation_id: 'conv-42',
+      messages: [{ role: 'user', content: 'totally different' }],
+    })
+    expect(a).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(a).toBe(b)
 
-    // 同一对话的首条 user 文本在有效时间内复用同一个合法时间戳 ID
-    const ses1 = resolveSessionId(undefined, { messages: [{ role: 'user', content: 'hello conversation' }] })
-    const ses2 = resolveSessionId(undefined, { messages: [{ role: 'user', content: 'hello conversation' }, { role: 'assistant', content: 'hi' }] })
-    expect(ses1).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
-    expect(ses1).toBe(ses2)
+    // 不同的 conversation_id 互不串扰
+    const c = resolveSessionId(undefined, { conversation_id: 'conv-43' })
+    expect(c).not.toBe(a)
+
+    // body 侧的官方形态 ID 原样复用(不哈希)
+    const nativeSes = 'ses_eca971329ffeVVACPYm6ZjF6tv'
+    expect(resolveSessionId(undefined, { conversation_id: nativeSes })).toBe(nativeSes)
+
+    // metadata.session_id 官方形态同样直传
+    expect(resolveSessionId(undefined, { metadata: { session_id: nativeSes } })).toBe(nativeSes)
+
+    // Claude Code 的 metadata.user_id 尾部会话段被识别为同一对话
+    const u1 = 'user_abc123_account_550e8400-e29b-41d4-a716-446655440000_session_11111111-2222-3333-4444-555555555555'
+    const u2 = 'user_def456_account_550e8400-e29b-41d4-a716-446655440000_session_11111111-2222-3333-4444-555555555555'
+    const s1 = resolveSessionId(undefined, { metadata: { user_id: u1 }, messages: [{ role: 'user', content: 'x' }] })
+    const s2 = resolveSessionId(undefined, { metadata: { user_id: u2 }, messages: [{ role: 'user', content: 'y' }] })
+    expect(s1).toBe(s2)
+
+    // 头信号优先于 body 信号
+    const viaHeader = resolveSessionId('header-signal-1', { conversation_id: 'conv-42' })
+    expect(viaHeader).not.toBe(a)
+
+    // Responses 续写只带 previous_response_id 时保持亲和
+    const p1 = resolveSessionId(undefined, { previous_response_id: 'resp_abc' })
+    const p2 = resolveSessionId(undefined, { previous_response_id: 'resp_abc' })
+    expect(p1).toBe(p2)
+    expect(p1).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+  })
+
+  it('resolveSessionId 的开场包含系统提示(同首问不同系统提示不撞会话)', () => {
+    const withA = resolveSessionId(undefined, {
+      system: 'you are a pirate',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    const withB = resolveSessionId(undefined, {
+      system: 'you are a banker',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(withA).not.toBe(withB)
+    // 同一开场复用
+    const withA2 = resolveSessionId(undefined, {
+      system: 'you are a pirate',
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(withA2).toBe(withA)
   })
 })
 
