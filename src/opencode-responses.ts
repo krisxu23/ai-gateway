@@ -4,11 +4,16 @@
 // 只在 /v1/responses 端点提供服务, /v1/chat/completions 对它们直接崩成上游
 // 500 "Internal server error"。opencode 官方客户端对该家族使用
 // @ai-sdk/openai(即 OpenAI Responses API), 所以官方能用而按 chat 转发的
-// 网关全灭。免费档另要求会话身份头(x-opencode-session/request), 本项目
+// 网关全灭。免费档另要求会话身份头(x-opencode-session 等), 本项目
 // createRequestHeaders 已带。
+//
+// 工具塑形在 opencode-official.ts 的 reshapeTools 里做: 客户端工具改名 clint_、
+// 追加完整官方 2.x 集、改写 body 内所有引用。本文件只做 chat<->responses 双向
+// 翻译, 并按 back 还原线上名、把官方集工具调用吞噬掉。
 //
 // 策略: 静态规则(muse-* 且 -free 结尾)直接改写为 /responses 请求并双向翻译,
 // 对客户端完全透明。范围刻意收窄: 其他 -free 模型(mimo 等)在 chat 上正常。
+import { OFFICIAL_TOOL_NAMES } from './opencode-official'
 
 export function zenModelNeedsResponses(modelId: string): boolean {
   return /^muse-[A-Za-z0-9.-]*-free$/.test(modelId)
@@ -38,8 +43,8 @@ export function contentText(content: unknown): string {
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh']
 
 /**
- * 桩工具调用被吞噬后, 空回复的替代正文(与 magpie 的 zenReply 行为一致):
- * 模型调了我们注入的桩 bash/read, 不把空调用透给客户端, 而以普通 stop 结束。
+ * 官方集工具调用被吞噬后, 空回复的替代正文(与 magpie 的 zenReply 行为一致):
+ * 模型调了我们注入的官方 2.x 工具, 不把空调用透给客户端, 而以普通 stop 结束。
  */
 export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn\'t have.)'
 
@@ -47,34 +52,10 @@ export const STUB_SWALLOW_NOTE = '(The model asked for a tool this session doesn
  *  这里按行（而非事件）卡，因为本转换是按行解析的。 */
 const MAX_SSE_LINE_CHARS = 8 * 1024 * 1024
 
-// 免费通道的桩工具名: 上游免费档要求 bash/edit/glob/grep/read 五个核心工具
-// 恰好按 OpenCode 的形状出现(空 properties 或缺工具都会被拒), 注入与吞噬
-// 判定共用同一定义, 避免两处分叉。
-export const STUB_TOOL_NAMES = ['bash', 'edit', 'glob', 'grep', 'read'] as const
-
-/** 每个核心工具至少要有一个参数, 参数名取 OpenCode 自家工具的第一个参数。 */
-export const STUB_TOOL_PARAMETER: Record<string, string> = {
-  bash: 'command',
-  edit: 'filePath',
-  glob: 'pattern',
-  grep: 'pattern',
-  read: 'filePath',
-}
-
-/** 桩工具参数 schema (chat 形态): 与 OpenCode 工具同构的最小形状。 */
-export function stubToolParameters(name: string): Record<string, unknown> {
-  return {
-    type: 'object',
-    properties: { [STUB_TOOL_PARAMETER[name] ?? 'input']: { type: 'string' } },
-    additionalProperties: false,
-  }
-}
-
-/** 桩工具名判定(吞噬用)。大小写归一: 上游可能输出首字母大写的 Bash/Read。 */
-export function isStubToolName(name: unknown): boolean {
-  if (typeof name !== 'string') return false
-  return (STUB_TOOL_NAMES as readonly string[]).includes(name.toLowerCase())
-}
+// 官方 2.x 工具集名(12 个): 追加注入与响应吞噬共用同一定义, 避免两处分叉。
+// 导出名沿用旧名(历史上这里放的是「注入的桩名」), 语义已改为官方集工具名;
+// 判定与参数 schema 一律用官方定义(opencode-official.ts), 不再造极简桩。
+export const STUB_TOOL_NAMES: readonly string[] = OFFICIAL_TOOL_NAMES
 
 // normalizeReasoningEffort 把客户端的 reasoning_effort 归一为 Responses 的
 // reasoning.effort; 未指定或非法时默认 low。
@@ -87,37 +68,6 @@ export function normalizeReasoningEffort(value: unknown): string {
 }
 
 // ============ 请求转换: OpenAI chat -> Responses ============
-
-// 与 magpie 同构的「工具改名」: 客户端工具名 Bash/Read(任意大小写变体)会被改名为
-// 小写的 bash/read 发给上游, 返回值里的 back 记录 上游名→客户端原名 映射, 供下游
-// 把模型调用改回原名透传。客户端没有该工具时才注入桩(在 opencode.ts 的 gate 里做)。
-export function mapFreeLaneClientTools(chat: Rec): Record<string, string> {
-  // 无原型对象: 上游可能报 __proto__/constructor 这类名字, 在 {} 上查
-  // back[name] 会命中 Object.prototype, 被误判成“客户端改过名”而损坏输出
-  const back: Record<string, string> = Object.create(null)
-  if (!Array.isArray(chat.tools)) return back
-  const tools = chat.tools as unknown[]
-  const names = new Set(
-    tools.map((t) => {
-      const fn = asRecord(t)?.function as Rec | undefined
-      return typeof fn?.name === 'string' ? fn.name : undefined
-    }).filter((n): n is string => typeof n === 'string')
-  )
-  for (const gateName of STUB_TOOL_NAMES) {
-    if (names.has(gateName)) continue
-    const variant = tools.find((t) => {
-      const fn = asRecord(t)?.function as Rec | undefined
-      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
-    })
-    if (variant) {
-      const fn = asRecord(variant)!.function as Rec
-      back[gateName] = String(fn.name)
-      fn.name = gateName
-      names.add(gateName)
-    }
-  }
-  return back
-}
 
 export function chatBodyToResponsesBody(chat: Rec): Rec {
   const out: Rec = {}
@@ -210,15 +160,31 @@ export function chatBodyToResponsesBody(chat: Rec): Rec {
 
 // ============ 响应转换: Responses -> OpenAI chat ============
 
+import { isOfficialToolName } from './opencode-official'
+
+/** 响应侧还原 + 吞噬判定。
+ *  back 命中(线上名 → 客户端原名)的按客户端原名透传, 客户端据此调本地工具;
+ *  没命中而名字落在官方 2.x 集里的, 一律是我们注入的、宿主实现不了的工具, 吞噬。
+ *  back 键是 clint_ 前缀的线上名, 所以两个键值都是小写; 仍保留按原名查一次,
+ *  兼容上游忽略 tools 数组直接吐客户端原名的情况。 */
+export function resolveCallName(
+  raw: unknown,
+  back: Record<string, string>
+): { name: string; swallow: boolean } {
+  const name = typeof raw === 'string' ? raw : ''
+  const client = back[name.toLowerCase()] ?? back[name]
+  if (typeof client === 'string' && client) return { name: client, swallow: false }
+  return { name, swallow: isOfficialToolName(name) }
+}
+
 export function responsesToChatBody(
   resp: Rec,
-  swallowStubs = false,
-  back: Record<string, string> = {},
-  injectedStubs: ReadonlySet<string> = new Set()
+  back: Record<string, string> = {}
 ): Rec {
   const model = typeof resp.model === 'string' ? resp.model : ''
   let text = ''
   const toolCalls: Rec[] = []
+  let swallowedAny = false
   if (Array.isArray(resp.output)) {
     for (const oi of resp.output) {
       const item = asRecord(oi)
@@ -229,12 +195,13 @@ export function responsesToChatBody(
           if (p && p.type === 'output_text' && typeof p.text === 'string') text += p.text
         }
       } else if (item.type === 'function_call') {
-        // 客户端改名来的 bash/read(back 有映射)改回原名; 桩(back 无映射)保持原名,
-        // 交给下面的 swallowStubs 过滤。
-        let name = typeof item.name === 'string' ? item.name : ''
-        // 大小写归一后再查改名映射: back 键为小写, 上游可能输出大写 Bash/Read。
-        const lower = name.toLowerCase()
-        if (name && (back[lower] || back[name])) name = back[lower] || back[name]
+        // 客户端改名来的调用(back 命中)按客户端原名透传; 名字落在官方 2.x 集里的
+        // 都是我们注入的、宿主实现不了的, 一律吞掉。
+        const { name, swallow } = resolveCallName(item.name, back)
+        if (swallow) {
+          swallowedAny = true
+          continue
+        }
         toolCalls.push({
           id: item.call_id ?? item.id ?? '',
           type: 'function',
@@ -244,30 +211,17 @@ export function responsesToChatBody(
     }
   }
 
-  // swallowStubs: 客户端原本零 tools 时过滤掉全部 bash/read 桩调用; 混合场景下
-  // (客户端带自己的工具)只按 injectedStubs 过滤我们注入的桩, 不透给客户端。
-  // 只有真实观察到桩调用时才提示; 空正文也可能是推理吃光预算等原因, 不误报。
-  const finalToolCalls = toolCalls.filter((tc) => {
-    const name = asRecord(tc.function)?.name
-    if (typeof name !== 'string') return true
-    const lower = name.toLowerCase()
-    if (back[lower] || back[name]) return true
-    if (injectedStubs.size > 0) return !injectedStubs.has(lower) && !injectedStubs.has(name)
-    return !(swallowStubs && isStubToolName(name))
-  })
-  const swallowedAny = toolCalls.length > finalToolCalls.length
-
   let finish = 'stop'
   const inc = asRecord(resp.incomplete_details)
   if (inc && inc.reason === 'max_output_tokens') finish = 'length'
   // tool_calls 优先于 length: 截断前已产生完整函数调用项, 客户端需要执行它
-  if (finalToolCalls.length > 0) finish = 'tool_calls'
+  if (toolCalls.length > 0) finish = 'tool_calls'
   // 整轮只调了桩: 以普通 stop + 提示句结束, 不把空调用透给客户端。
-  if (swallowedAny && finalToolCalls.length === 0 && !text) finish = 'stop'
+  if (swallowedAny && toolCalls.length === 0 && !text) finish = 'stop'
 
   const message: Rec = { role: 'assistant' }
-  if (finalToolCalls.length > 0) {
-    message.tool_calls = finalToolCalls
+  if (toolCalls.length > 0) {
+    message.tool_calls = toolCalls
     // 正文与工具调用可以并存（模型先说一句再调工具）：与流式路径保持一致，
     // 否则非流式客户端会丢掉前导文本
     if (text) message.content = text
@@ -307,9 +261,9 @@ function sseChunk(model: string, id: string, delta: Rec, finish?: string, usage?
 
 export function createResponsesToChatStream(
   model: string,
-  swallowStubs = false,
+  _swallowStubs: boolean,
   back: Record<string, string> = {},
-  injectedStubs: ReadonlySet<string> = new Set()
+  _injectedStubs: ReadonlySet<string> = new Set()
 ): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
@@ -361,20 +315,12 @@ export function createResponsesToChatStream(
     if (args === acc) return ''
     return args.startsWith(acc) ? args.slice(acc.length) : args
   }
-  // 工具名归一: 客户端改名的 bash/read(back 有映射)改回原名透传; 我们注入的桩
-  // (back 无映射且名在 injectedStubs 里)要吞掉, 不下发给客户端。
-  // 大小写归一: back 键为小写, 上游可能输出大写 Bash/Read。
+  // 工具名归一: 客户端改名的 (back 有映射)改回原名透传; 官方集未映射的吞噬
   const resolveToolName = (raw: string): { name: string; isStub: boolean } => {
+    const { name, swallow } = resolveCallName(raw, back)
     const lower = raw.toLowerCase()
-    const isRenamed = !!(raw && (back[lower] || back[raw]))
-    const name = isRenamed ? (back[lower] || back[raw]) : raw
-    const isStub =
-      isStubToolName(name) &&
-      !isRenamed &&
-      (injectedStubs.size > 0
-        ? injectedStubs.has(lower) || injectedStubs.has(name)
-        : swallowStubs)
-    return { name, isStub }
+    if (back[lower] || back[raw]) return { name: back[lower] || back[raw], isStub: false }
+    return { name, isStub: swallow }
   }
 
   // 用终态信息合成完整调用(上游没发 output_item.added, 或 added 始终没到):

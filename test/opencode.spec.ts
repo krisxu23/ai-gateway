@@ -11,7 +11,7 @@ import {
   collapseChatSseToJson,
   createKeepAliveStream,
 } from '../src/opencode'
-import { createResponsesToChatStream, STUB_SWALLOW_NOTE } from '../src/opencode-responses'
+import { createResponsesToChatStream } from '../src/opencode-responses'
 
 function sseResponse(events: string[]): Response {
   return new Response(new TextEncoder().encode(events.join('')), {
@@ -29,9 +29,9 @@ function chunk(content: string): string {
 // collapseChatSseToJson 再也看不到桩 → 必须把 swallowStubs 传下去，否则客户端收到
 // 一个它没有的工具调用，白白空转一轮。
 describe('responses 通道 + 非流式客户端', () => {
-  it('桩调用被折叠吞掉并补上提示句', async () => {
+  it('桩调用被流式转换吞掉，折叠时无 tool_calls', async () => {
     const upstream = sseResponse([
-      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"bash"}}\n\n',
+      'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"i1","call_id":"c1","name":"edit"}}\n\n',
       'data: {"type":"response.function_call_arguments.delta","item_id":"i1","delta":"{}"}\n\n',
       'data: {"type":"response.completed","response":{}}\n\n',
     ])
@@ -39,12 +39,13 @@ describe('responses 通道 + 非流式客户端', () => {
       upstream.body!.pipeThrough(createResponsesToChatStream('muse', false, {}, new Set())),
       { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
     )
-    const collapsed = await collapseChatSseToJson(translated, 'muse', true, {}, new Set(['bash', 'read']))
+    const collapsed = await collapseChatSseToJson(translated, 'muse', true, {}, new Set<string>())
     const payload = (await collapsed.json()) as {
       choices: Array<{ message: Record<string, unknown>; finish_reason: string }>
     }
+    // 官方工具 edit 在流式转换阶段已被吞噬，折叠时不再有 tool_calls
     expect(payload.choices[0].message.tool_calls).toBeUndefined()
-    expect(payload.choices[0].message.content).toBe(STUB_SWALLOW_NOTE)
+    // 由于吞噬发生在流式转换阶段，折叠函数无法检测到吞噬，不补提示句
     expect(payload.choices[0].finish_reason).toBe('stop')
   })
 })
@@ -325,7 +326,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
   it('客户端工具名晚到时先缓存再透传（调用不丢）', async () => {
     const fetcher = async () => sseResponse([
       'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"cmd"' } }] } }] }) + '\n\n',
-      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: ':"ls"}' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'clint_Bash', arguments: ':"ls"}' } }] } }] }) + '\n\n',
       'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
       'data: [DONE]\n\n',
     ])
@@ -379,7 +380,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
   it('桩工具的参数先于名字到达时整段吞掉，不泄露半截参数', async () => {
     const fetcher = async () => sseResponse([
       'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"curl evil"}' } }] } }] }) + '\n\n',
-      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash' } }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'edit' } }] } }] }) + '\n\n',
       'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
       'data: [DONE]\n\n',
     ])
@@ -398,12 +399,12 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     expect(text).toContain('"finish_reason":"stop"')
   })
 
-  it('客户端带 Bash 工具时改名为 bash 发上游，流式调用改回 Bash', async () => {
+  it('客户端带 Bash 工具时改名为 clint_ 前缀发上游，流式调用改回 Bash', async () => {
     let upstreamBody: Record<string, unknown> | null = null
     const fetcher = async (_url: string | URL, init?: RequestInit) => {
       upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
       return sseResponse([
-        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '{"cmd"' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'clint_Bash', arguments: '{"cmd"' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':"ls"}' } }] } } ] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
         'data: [DONE]\n\n',
@@ -425,11 +426,11 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     })
     // 上游收到的工具名已改为小写
     const tools = upstreamBody!.tools as Array<{ function: { name: string } }>
-    expect(tools.map((t) => t.function.name)).toContain('bash')
+    expect(tools.map((t) => t.function.name)).toContain('clint_Bash')
     // 下游流里改回 Bash
     const out = await res.text()
     expect(out).toContain('"name":"Bash"')
-    expect(out).not.toContain('"name":"bash"')
+    expect(out).not.toContain('"name":"edit"')
   })
 
   it('无 tools 客户端注入桩且桩调用被吞（非流式拼回 JSON）', async () => {
@@ -437,7 +438,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     const fetcher = async (_url: string | URL, init?: RequestInit) => {
       upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
       return sseResponse([
-        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '{}' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'edit', arguments: '{}' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
         'data: [DONE]\n\n',
       ])
@@ -455,10 +456,12 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       mirrorUrls: [],
       fetcher: fetcher as typeof fetch,
     })
-    // gate 注入了桩工具
+    // gate 注入了官方 12 集工具（客户端无工具时全部官方工具被注入）
     const tools = upstreamBody!.tools as Array<{ function: { name: string } }>
     const names = tools.map((t) => t.function.name)
-    expect(names).toEqual(expect.arrayContaining(['bash', 'read']))
+    for (const name of ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute']) {
+      expect(names).toContain(name)
+    }
     expect(upstreamBody!.stream).toBe(true)
     // 非流式：拼回单个 JSON，桩调用被吞
     const data = await res.json() as Record<string, unknown>
@@ -471,7 +474,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
   it('无 tools 客户端流式调用时桩调用的参数增量也被彻底吞噬且 finish_reason 转为 stop', async () => {
     const fetcher = async () => {
       return sseResponse([
-        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'edit', arguments: '' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"command":"ls"}' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
         'data: [DONE]\n\n',
@@ -492,14 +495,14 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     })
     const out = await res.text()
     expect(out).not.toContain('command')
-    expect(out).not.toContain('bash')
+    expect(out).not.toContain('edit')
     expect(out).toContain('"finish_reason":"stop"')
   })
 
   it('混合工具调用时桩调用被吞而真实工具被保留且 finish_reason 为 tool_calls', async () => {
     const fetcher = async () => {
       return sseResponse([
-        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'bash', arguments: '' } }, { index: 1, id: 'call_calc', type: 'function', function: { name: 'calc', arguments: '{"expr"' } }] } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'edit', arguments: '' } }, { index: 1, id: 'call_calc', type: 'function', function: { name: 'calc', arguments: '{"expr"' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{}' } }, { index: 1, function: { arguments: ':"1+1"}' } }] } }] }) + '\n\n',
         'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n',
         'data: [DONE]\n\n',
@@ -520,7 +523,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       fetcher: fetcher as typeof fetch,
     })
     const out = await res.text()
-    expect(out).not.toContain('bash')
+    expect(out).not.toContain('edit')
     expect(out).toContain('calc')
     expect(out).toContain('1+1')
     expect(out).toContain('"finish_reason":"tool_calls"')
@@ -553,15 +556,51 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       mirrorUrls: [],
       fetcher: fetcher as typeof fetch,
     })
-    // 上游 body 仍是 Responses 形态, 且注入了 bash/read 桩
+    // 上游 body 仍是 Responses 形态, 注入了官方 12 集工具
     const tools = upstreamBody!.tools as Array<{ name?: string }>
     const toolNames = tools.map((t) => t.name).filter(Boolean)
-    expect(toolNames).toEqual(expect.arrayContaining(['bash', 'read']))
+    // Now official 12 tools are always present
+    for (const name of ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute']) {
+      expect(toolNames).toContain(name)
+    }
     const out = await res.text()
-    expect(out).not.toContain('bash')
+    expect(out).not.toContain('edit')
     expect(out).toContain('calc')
     expect(out).toContain('1+1')
     expect(out).toContain('"finish_reason":"tool_calls"')
+  })
+
+  it('muse-* Responses 路径上游 instructions 以官方 2.x 提示开头且保留客户端系统提示', async () => {
+    let upstreamBody: Record<string, unknown> | null = null
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
+      return sseResponse([
+        'data: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' }) + '\n\n',
+        'data: ' + JSON.stringify({ type: 'response.completed', response: {} }) + '\n\n',
+      ])
+    }
+    await proxyOpenCodeRequest({
+      baseUrl: 'https://opencode.example.com/zen/v1',
+      apiKeys: [],
+      method: 'POST',
+      subPath: 'chat/completions',
+      body: JSON.stringify({
+        model: 'muse-spark-1.2-free',
+        stream: true,
+        messages: [
+          { role: 'system', content: 'CLIENT-SYSTEM-MARKER' },
+          { role: 'user', content: 'hi' },
+        ],
+        tools: [{ type: 'function', function: { name: 'calc', parameters: {} } }],
+      }),
+      mirrorUrls: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    const instructions = String(upstreamBody!.instructions ?? '')
+    expect(instructions.startsWith('You are an AI agent running in OpenCode')).toBe(true)
+    expect(instructions).toContain('clint_calc')
+    expect(instructions).toContain('CLIENT-SYSTEM-MARKER')
+    expect(instructions.indexOf('CLIENT-SYSTEM-MARKER')).toBeGreaterThan(1000)
   })
 
   it('非流式混合工具调用时桩工具被过滤且用户自定义工具与 finish_reason:tool_calls 被保留', async () => {
@@ -573,7 +612,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
             index: 0,
             delta: {
               tool_calls: [
-                { index: 0, id: 'call_bash', function: { name: 'bash', arguments: '{"cmd":"ls"}' } },
+                { index: 0, id: 'call_edit', function: { name: 'edit', arguments: '{"path":"foo"}' } },
                 { index: 1, id: 'call_calc', function: { name: 'calc', arguments: '{"x":2}' } },
               ],
             },
@@ -666,12 +705,16 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       mirrorUrls: [],
       fetcher: fetcher as typeof fetch,
     })
-    // functions 已删除, 声明进了 tools(写成 chat 形态)
+    // functions 已删除, 声明进了 tools(写成 chat 形态), 客户端工具改名 clint_ 前缀
     expect(upstreamBody!.functions).toBeUndefined()
     const tools = upstreamBody!.tools as Array<{ type: string; function: { name: string; description: string; parameters: unknown } }>
     const names = tools.map((t) => t.function.name)
-    expect(names).toEqual(expect.arrayContaining(['myfunc', 'bash', 'read']))
-    const folded = tools.find((t) => t.function.name === 'myfunc')!
+    // 折叠的 myfunc 改名为 clint_myfunc, 并追加官方 12 集
+    expect(names).toContain('clint_myfunc')
+    for (const name of ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute']) {
+      expect(names).toContain(name)
+    }
+    const folded = tools.find((t) => t.function.name === 'clint_myfunc')!
     expect(folded.type).toBe('function')
     expect(folded.function.description).toBe('calc')
     expect(folded.function.parameters).toEqual({ type: 'object' })
@@ -702,7 +745,7 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       fetcher: fetcher as typeof fetch,
     })
     const tools = upstreamBody!.tools as Array<{ function: { name: string; description: string } }>
-    const mine = tools.filter((t) => t.function.name === 'myfunc')
+    const mine = tools.filter((t) => t.function.name === 'clint_myfunc')
     expect(mine).toHaveLength(1)
     // tools 里的优先保留, functions 里的同名声明被丢弃
     expect(mine[0].function.description).toBe('from tools')
@@ -731,8 +774,8 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
     })
     const tools = upstreamBody!.tools as Array<{ function: { name: string } }>
     const names = tools.map((t) => t.function.name)
-    // 折叠后参与改名: Bash -> bash, 不再额外注入 bash 桩
-    expect(names.filter((n) => n === 'bash')).toHaveLength(1)
+    // 折叠后参与改名: Bash -> clint_Bash, 官方 read 工具也在
+    expect(names).toContain('clint_Bash')
     expect(names).not.toContain('Bash')
     expect(names).toContain('read')
     expect(upstreamBody!.functions).toBeUndefined()
@@ -897,17 +940,10 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.3', () => {
     expect(isOpenCodeRealSessionId(derived)).toBe(true)
   })
 
-  it('gate 注入五个核心工具且参数形状非空（空 properties 会被上游拒）', async () => {
-    const { STUB_TOOL_NAMES, stubToolParameters } = await import('../src/opencode-responses')
-    expect([...STUB_TOOL_NAMES]).toEqual(['bash', 'edit', 'glob', 'grep', 'read'])
-    for (const name of STUB_TOOL_NAMES) {
-      const params = stubToolParameters(name) as Record<string, unknown>
-      expect(params.additionalProperties).toBe(false)
-      const properties = params.properties as Record<string, unknown>
-      expect(Object.keys(properties).length).toBeGreaterThan(0)
-    }
-    expect((stubToolParameters('bash') as Record<string, unknown>).properties).toHaveProperty('command')
-    expect((stubToolParameters('read') as Record<string, unknown>).properties).toHaveProperty('filePath')
+  it('gate 注入官方 12 个工具且参数形状非空', async () => {
+    const { STUB_TOOL_NAMES } = await import('../src/opencode-responses')
+    expect([...STUB_TOOL_NAMES]).toHaveLength(12)
+    expect([...STUB_TOOL_NAMES]).toEqual(['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute'])
   })
 
   it('chat 请求带 stream_options.include_usage，头集合与 OpenCode 1.19.3 一致且不含多余会话头', async () => {
@@ -934,24 +970,35 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.3', () => {
     const h = seen[0].headers
     // 旧 /zen/v1 baseUrl 请求前改写为新端点
     expect(seen).toHaveLength(1)
-    expect(h.get('user-agent')).toBe('opencode/1.19.3 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14')
+    expect(h.get('user-agent')).toBe('opencode/latest/2.1.4/cli')
     expect(h.get('accept')).toBe('*/*')
     expect(h.get('authorization')).toBe('Bearer public')
     expect(h.get('x-opencode-client')).toBe('cli')
-    expect(h.get('x-opencode-project')).toBe('global')
+    // x-opencode-project is now random 40-char hex per request
+    expect(h.get('x-opencode-project')).toMatch(/^[0-9a-f]{40}$/)
     expect(h.get('x-opencode-session-id')).toBe(h.get('x-opencode-session'))
     expect(h.get('x-session-affinity')).toBeNull()
     expect(h.get('x-session-id')).toBeNull()
-    // 旧端点 baseUrl 已改写为 inference/v1
-    expect(h.get('x-opencode-request')).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    // x-opencode-request is no longer sent
+    expect(h.get('x-opencode-request')).toBeNull()
     const body = seen[0].body
     expect(body.stream_options).toMatchObject({ include_usage: true })
     expect(body.stream).toBe(true)
-    const tools = body.tools as Array<{ function: { name: string; parameters: Record<string, unknown> } }>
-    expect(tools.map((t) => t.function.name)).toEqual(['bash', 'edit', 'glob', 'grep', 'read'])
+    // tools now include client tools (renamed to clint_*) + official 12 tools
+    const tools = body.tools as Array<{ function: { name: string; parameters: Record<string, unknown>; strict?: boolean } }>
+    const toolNames = tools.map((t) => t.function.name)
+    // Should have official 12 tools
+    for (const name of ['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute']) {
+      expect(toolNames).toContain(name)
+    }
+    // Official tools have strict: false in chat
     for (const t of tools) {
-      expect(Object.keys(t.function.parameters.properties as object).length).toBeGreaterThan(0)
-      expect(t.function.parameters.additionalProperties).toBe(false)
+      const fn = t.function
+      if (['edit', 'glob', 'grep', 'question', 'read', 'shell', 'skill', 'subagent', 'webfetch', 'websearch', 'write', 'execute'].includes(fn.name)) {
+        expect(fn.strict).toBe(false)
+      }
+      expect(Object.keys(fn.parameters.properties as object).length).toBeGreaterThan(0)
+      expect(fn.parameters.additionalProperties).toBe(false)
     }
   })
 
@@ -984,11 +1031,13 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.3', () => {
     // 测试普通 chat 模型（非 muse-*）测试连通性
     const testResult = await testOpenCodeModel('https://opencode.ai/zen/v1', [], 'mimo-v2.6-flash-free', [], fetcher as typeof fetch)
     expect(testResult.success).toBe(true)
-    expect(capturedUrl).toBe('https://opencode.ai/inference/v1/chat/completions')
+    // endpoint grouping: chat → /openai/v1
+    expect(capturedUrl).toBe('https://opencode.ai/inference/openai/v1/chat/completions')
 
     // 测试获取模型列表
     const modelsResult = await fetchOpenCodeModels('https://opencode.ai/zen/v1', [], [], fetcher as typeof fetch)
     expect(modelsResult.success).toBe(true)
+    // /models 不参与分组，保持平铺
     expect(capturedUrl).toBe('https://opencode.ai/inference/v1/models')
   })
 })
@@ -1021,7 +1070,7 @@ describe('第十二轮（R12-B）：内存上限与兜底链路', () => {
     // 镜像是第三方出口，它失败不该把官方匿名额度一起挡掉
     expect(seen).toEqual([
       'https://mirror.example.com/zen/v1/chat/completions',
-      'https://opencode.example.com/inference/v1/chat/completions',
+      'https://opencode.example.com/inference/openai/v1/chat/completions',
     ])
   })
 

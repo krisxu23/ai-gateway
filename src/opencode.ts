@@ -3,32 +3,30 @@ import { readCappedBytes } from './http'
 import {
   chatBodyToResponsesBody,
   createResponsesToChatStream,
-  isStubToolName,
-  mapFreeLaneClientTools,
   responsesToChatBody,
   STUB_SWALLOW_NOTE,
-  STUB_TOOL_NAMES,
-  stubToolParameters,
   zenModelNeedsResponses,
 } from './opencode-responses'
 import { normalizeOpenCodeBaseUrl } from './config'
+import {
+  OFFICIAL_TOOL_NAMES,
+  OPENCODE_USER_AGENT,
+  encodeChatBody,
+  injectChatPrompt,
+  injectResponsesPrompt,
+  reshapeTools,
+  ensureCompletionLimit,
+} from './opencode-official'
 
 export { normalizeOpenCodeBaseUrl } from './config'
 
-const OPENCODE_PROVIDER_ID = 'opencode'
+export const OPENCODE_PROVIDER_ID = 'opencode'
 
-// 对齐 OpenCode 1.19.3: 每协议的 ai-sdk 包内嵌的 provider-utils 版本不同
-// (从官方发布二进制的请求里捕获, 与 magpie zen-free 插件一致)。
-const OPENCODE_VERSION = '1.19.3'
-const PROVIDER_UTILS_VERSION: Record<string, string> = {
-  chat: '4.0.23',
-  responses: '4.0.40',
-  anthropic: '4.0.46',
-}
+// 所有协议 (chat / responses / anthropic) 统一的出站 User-Agent：opencode/latest/2.1.4/cli
+export const OPENCODE_VERSION = '2.1.4'
 
-export function opencodeUserAgent(protocol: keyof typeof PROVIDER_UTILS_VERSION = 'chat'): string {
-  const utils = PROVIDER_UTILS_VERSION[protocol] ?? PROVIDER_UTILS_VERSION.chat
-  return `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/${utils} runtime/bun/1.3.14`
+export function opencodeUserAgent(_protocol: 'chat' | 'responses' | 'anthropic' = 'chat'): string {
+  return OPENCODE_USER_AGENT
 }
 // 响应头超时（毫秒）：镜像逐个串行尝试，单个镜像最坏等待。30000ms（30s）足够
 // 一个正常上游返回响应头，又能让挂掉的镜像快速放弃、换下一个出口。
@@ -97,8 +95,26 @@ function getMirrorOrder(urls: string[], random: () => number): string[] {
   ]
 }
 
-function buildUrl(baseUrl: string, subPath: string, search = ''): string {
-  return `${baseUrl.replace(/\/+$/, '')}/${subPath.replace(/^\/+/, '')}${search}`
+
+function upstreamUrl(baseUrl: string, subPath: string, search = ''): string {
+  const base = baseUrl.replace(/\/+$/, '')
+  if (!base.endsWith('/inference/v1')) {
+    return `${base}/${subPath.replace(/^\/+/, '')}${search}`
+  }
+  const root = base.slice(0, -'/v1'.length)
+  // 只有 chat/responses/messages 参与分组，其他路径（models 等）保持平铺
+  if (subPath.includes('messages')) {
+    const target = `${root}/anthropic/v1/${subPath.replace(/^\/+/, '')}`
+    // search 是 url.search（以 '?' 开头）时直接续 '&beta=true'，原参数不能丢
+    if (search) return `${target}${search}&beta=true`
+    return `${target}?beta=true`
+  }
+  if (subPath.includes('chat/completions') || subPath.includes('responses')) {
+    const target = `${root}/openai/v1/${subPath.replace(/^\/+/, '')}`
+    return `${target}${search}`
+  }
+  // 其他路径保持平铺
+  return `${base}/${subPath.replace(/^\/+/, '')}${search}`
 }
 
 const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -113,12 +129,20 @@ function randomBase62(length: number): string {
   return Array.from(getRandomBytes(length), (b) => BASE62_ALPHABET[b % 62]).join('')
 }
 
+function randomProjectId(): string {
+  const bytes = getRandomBytes(20)
+  let out = ''
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0')
+  return out
+}
+
 /** OpenCode 1.19.3 会话 ID 形态: 前 12 位 hex 的低 12 位是位反转的毫秒内计数,
  *  计数必须很小(0xfff - 计数 < 16); 哈希裁剪出来的伪 ID 过不了上游校验。 */
 export function isOpenCodeRealSessionId(value: string): boolean {
   const match = /^ses_([0-9a-f]{12})[0-9A-Za-z]{14}$/.exec(value)
   if (!match) return false
-  return 0xfff - (parseInt(match[1], 16) & 0xfff) < 16
+  const counter = 0xfff - (parseInt(match[1], 16) & 0xfff)
+  return counter >= 1 && counter <= 63
 }
 
 let lastSessionTimestamp = 0
@@ -274,6 +298,9 @@ function bodyConversationSignal(parsed: Record<string, unknown> | null): string 
  * 4. Responses 续写(previous_response_id)按回复 ID 派生 —— 宿主丢掉历史只发
  *    previous_response_id 时仍保持上游会话亲和;
  * 5. 全无信号时每请求生成合法时间序 ID。
+ *
+ * 注：请求路径已改为每请求新铸 generateOpenCodeId('ses')（见 proxyOpenCodeUpstream），
+ * 本函数保留导出仅作兼容/参考，不再在请求路径调用。
  */
 export function resolveSessionId(clientSessionId: string | undefined, parsed: Record<string, unknown> | null): string {
   // 官方形态直传: 上游校验会通过, 原样复用。
@@ -301,20 +328,20 @@ export function resolveSessionId(clientSessionId: string | undefined, parsed: Re
 
 function createRequestHeaders(
   apiKey: string,
-  requestId: string,
+  _requestId: string,
   sessionId: string,
-  protocol: 'chat' | 'responses' = 'chat'
+  projectId: string,
+  protocol: 'chat' | 'responses' | 'anthropic' = 'chat'
 ): Headers {
-  // 只发 OpenCode 1.19.3 自己会发的头集合 (packages/opencode/src/session/llm/
-  // request.ts): 多发一个 x-session-affinity/X-Session-Id 也会被上游识别为
-  // 非 OpenCode 请求而拒之门外 (403 FreeTierError, 已实测)。
+  // 对齐 FreeX outboundHeaders：保留 Content-Type/Accept/User-Agent/x-opencode-client
+  // 及 x-opencode-session/x-opencode-session-id（两头同值）；删除 x-opencode-request；
+  // x-opencode-project 每请求随机 40 位 hex（与同请求多次重试/镜像共用同一个值）。
   const headers = new Headers({
     'Content-Type': 'application/json',
-    'Accept': '*/*',
+    Accept: '*/*',
     'User-Agent': opencodeUserAgent(protocol),
     'x-opencode-client': 'cli',
-    'x-opencode-project': 'global',
-    'x-opencode-request': requestId,
+    'x-opencode-project': projectId,
     'x-opencode-session': sessionId,
     'x-opencode-session-id': sessionId,
   })
@@ -327,18 +354,7 @@ function createRequestHeaders(
 // bash/read 两个 function tools, 缺一即 FreeTierError。
 // ---------------------------------------------------------------------------
 
-const FREE_LANE_GATE_TOOL_NAMES = STUB_TOOL_NAMES
 
-function freeLaneGateTool(name: string) {
-  return {
-    type: 'function',
-    function: {
-      name,
-      description: 'Not available. Never call this tool.',
-      parameters: stubToolParameters(name),
-    },
-  }
-}
 
 /**
  * 上游匿名通道的 body 门禁: 强制 stream:true; 缺失 bash/read 时注入桩工具。
@@ -357,29 +373,26 @@ function freeLaneGateTool(name: string) {
 function applyFreeLaneGate(parsed: Record<string, unknown>): {
   body: Record<string, unknown>
   clientWantsStream: boolean
-  stubOnly: boolean
+  hadClientTools: boolean
   back: Record<string, string>
   injectedStubs: Set<string>
 } {
   const clientWantsStream = parsed.stream === true
   const body: Record<string, unknown> = { ...parsed, stream: true }
-  const rawTools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const tools = [...rawTools]
-  const names = new Set(tools.map((t) => {
-    const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
-    return typeof fn?.name === 'string' ? fn.name : undefined
-  }))
-  // FreeX 378f378 同步: 旧式顶层 functions 数组(chat 协议的遗留声明形态)是
-  // 上游不读的声明 —— 留在原地, 上游门禁(只读 tools)看不到它, 还会和 tools
-  // 里的同名声明各出现一次。并入 tools(写成 chat 形态 {type:'function',
-  // function:{name,description,parameters}}, 同名去重)后删除, 与 FreeX
-  // normalizeTools 的 legacyChat 处理对齐。折叠发生在改名/桩注入之前, 因此
-  // 旧式声明的 Bash/Read 同样会被改名映射, 也参与 hadTools 判定。
-  // 注意这里只处理 chat 路径; Responses 路径走 ensureResponsesFreeLaneShape,
-  // FreeX 在 responses 协议下同样不做折叠。
+
+  // 折叠 legacy functions（chat 旧式声明形态）→ 并入 tools，去重后删除 body.functions
   let foldedLegacyFunctions = 0
   const legacyFunctions = Array.isArray(body.functions) ? (body.functions as unknown[]) : []
   if (legacyFunctions.length > 0) {
+    const existing = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
+    const tools = [...existing]
+    const names = new Set(
+      tools.map((t) => {
+        const rec = t as Record<string, unknown> | null
+        const fn = rec?.function as Record<string, unknown> | undefined
+        return typeof fn?.name === 'string' ? fn.name : typeof (t as any)?.name === 'string' ? (t as any).name : undefined
+      })
+    )
     for (const item of legacyFunctions) {
       const rec = (item !== null && typeof item === 'object' ? item : null) as Record<string, unknown> | null
       const name = rec?.name
@@ -391,103 +404,44 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
         function: { name, description: rec?.description, parameters: rec?.parameters },
       })
     }
+    body.tools = tools
     delete body.functions
   }
-  // 上游工具名 → 客户端原名。用无原型对象: 上游可能报 __proto__/constructor
-  // 这类名字, 在 {} 上查 back[name] 会命中 Object.prototype 而被误判成“改过名”。
-  const back: Record<string, string> = Object.create(null)
-  // injectedStubs: 我们注入的桩名(仅当客户端没有同名/变体工具时才注入)。
-  // 吞噬按名判定: 无论客户端是否带了自己的工具，只要这个 bash/read 是我们注入
-  // 的桩，模型对它的调用都必须被吞，混合场景下才不会把残缺调用泄给客户端。
-  const injectedStubs = new Set<string>()
-  for (const gateName of FREE_LANE_GATE_TOOL_NAMES) {
-    // 已有恰好小写名的工具: 直接命中, 不改名。
-    if (names.has(gateName)) continue
-    // 大小写不敏感变体(如 Bash / READ): 改名为标准小写, 记回映射。
-    const variant = tools.find((t) => {
-      const fn = (t as Record<string, unknown> | null)?.function as Record<string, unknown> | undefined
-      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
-    })
-    if (variant) {
-      const fn = (variant as Record<string, unknown>).function as Record<string, unknown>
-      back[gateName] = String(fn.name)
-      fn.name = gateName
-      names.add(gateName)
-      continue
-    }
-    // 完全没有: 注入桩。
-    tools.push(freeLaneGateTool(gateName))
-    names.add(gateName)
-    injectedStubs.add(gateName)
-  }
-  body.tools = tools
-  // 旧式 functions 已折叠进 tools, 故计入"客户端带了工具": 否则纯旧式声明的
-  // 客户端会被误判为零 tools 而加上 tool_choice:'none', 模型反而调不了它
-  // 声明的工具(与 FreeX 不碰 tool_choice 的行为对齐)。
-  const hadTools = rawTools.length > 0 || foldedLegacyFunctions > 0
-  if (!hadTools && body.tool_choice === undefined) body.tool_choice = 'none'
-  // OpenCode 官方 chat 请求固定带 stream_options.include_usage (照搬 usage 数据)。
+
+  // 按规格第4节重写：改名 → 追加官方集 → 改写引用
+  const shaped = reshapeTools(body, 'chat')
+  const hadClientTools = shaped.hadClientTools || foldedLegacyFunctions > 0
+
+  // 客户端没带 tools 时不再自动加 tool_choice:'none'（真实 2.1.4 抓包没有该字段；
+  // 官方集总是存在，'none' 与指纹冲突）。客户端自带的值原样保留（命名函数形态
+  // 已由 reshapeTools 按改名映射改写）。
+
+  // OpenCode 官方 chat 请求固定带 stream_options.include_usage
   const prevOptions = body.stream_options
   body.stream_options = {
-    ...(prevOptions && typeof prevOptions === 'object' && !Array.isArray(prevOptions) ? prevOptions as Record<string, unknown> : {}),
+    ...(prevOptions && typeof prevOptions === 'object' && !Array.isArray(prevOptions) ? (prevOptions as Record<string, unknown>) : {}),
     include_usage: true,
   }
-  return { body, clientWantsStream, stubOnly: !hadTools, back, injectedStubs }
-}
 
-function freeLaneGateResponsesTool(name: string) {
   return {
-    type: 'function',
-    name,
-    description: 'Not available. Never call this tool.',
-    parameters: stubToolParameters(name),
+    body,
+    clientWantsStream,
+    hadClientTools,
+    back: shaped.back,
+    injectedStubs: new Set<string>(),
   }
 }
+
 
 /**
- * Responses 形态的 free-lane body 门禁: 缺 bash/read 时按 Responses 工具
- * 格式({type:'function', name, ...})注入桩; 原本无 tools 时 tool_choice 置 'none'。
+ * Responses 形态：按规格第7节塑形。工具改名 clint_、追加官方 12 集、改写引用。
+ * instructions 注入由调用方处理（proxyOpenCodeResponses）。
  */
-function ensureResponsesFreeLaneShape(body: Record<string, unknown>): void {
-  const rawTools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const tools = [...rawTools]
-  const names = new Set(tools.map((t) => {
-    const rec = (t !== null && typeof t === 'object' ? t : null) as Record<string, unknown> | null
-    return typeof rec?.name === 'string' ? rec.name : undefined
-  }))
-  for (const name of FREE_LANE_GATE_TOOL_NAMES) {
-    if (!names.has(name)) tools.push(freeLaneGateResponsesTool(name))
-  }
-  body.tools = tools
-  // 注意: /responses 端点只支持 tool_choice:"auto", 不支持 "none",
-  // 这里只注入桩工具, 不碰 tool_choice。
-}
 
 /**
  * 计算我们实际注入的桩名集合(客户端没有 bash/read 或其大小写变体时才注入)。
  * 与 mapFreeLaneClientTools 的改名逻辑对齐: 改名的不算注入, 只有桩才算。
  */
-function computeInjectedStubs(chatBody: Record<string, unknown>): ReadonlySet<string> {
-  const injected = new Set<string>()
-  if (!Array.isArray(chatBody.tools)) {
-    for (const n of FREE_LANE_GATE_TOOL_NAMES) injected.add(n)
-    return injected
-  }
-  const tools = chatBody.tools as unknown[]
-  const names = new Set(tools.map((t) => {
-    const fn = (t !== null && typeof t === 'object' ? (t as Record<string, unknown>) : null)?.function as Record<string, unknown> | undefined
-    return typeof fn?.name === 'string' ? fn.name : undefined
-  }))
-  for (const gateName of FREE_LANE_GATE_TOOL_NAMES) {
-    if (names.has(gateName)) continue
-    const hasVariant = tools.some((t) => {
-      const fn = (t !== null && typeof t === 'object' ? (t as Record<string, unknown>) : null)?.function as Record<string, unknown> | undefined
-      return typeof fn?.name === 'string' && fn.name.toLowerCase() === gateName
-    })
-    if (!hasVariant) injected.add(gateName)
-  }
-  return injected
-}
 
 /** 查找 SSE 块的结束边界 (兼容 \n\n 与 CRLF \r\n\r\n) */
 function findSseBoundary(buf: string): { index: number; length: number } | null {
@@ -656,7 +610,7 @@ function applySseEvent(rawEvent: string, st: CollapseState): void {
 /**
  * 把上游 chat completions SSE 流拼成单个非流式 chat.completion JSON。
  * 客户端要 stream:false 但上游被强制 stream:true 时用, 保证 OpenAI 契约不断。
- * swallowStubs 为 true 时(客户端原本零 tools): 启用按名过滤 bash/read 桩,
+ * 官方集工具调用一律按名过滤（back 命中的客户端工具改回原名透传）,
  * 若过滤后无 tool_calls 且正文为空, 以提示句 + stop 结束, 不把空调用透给客户端。
  *
  * 流式消费：早期实现是 response.text() 整包读入再 split('\n\n')，一个几十 MB 的
@@ -667,9 +621,11 @@ function applySseEvent(rawEvent: string, st: CollapseState): void {
 export async function collapseChatSseToJson(
   response: Response,
   model: string,
-  swallowStubs = false,
+  // 旧参数（桩场景标志/注入桩名集合）保留签名兼容：2.x 起吞噬一律按名判定
+  // （官方集工具名且不在 back 映射里），不再需要这两个开关。
+  _swallowStubs = false,
   back: Record<string, string> = {},
-  injectedStubs: ReadonlySet<string> = new Set()
+  _injectedStubs: ReadonlySet<string> = new Set()
 ): Promise<Response> {
   const st: CollapseState = {
     content: '',
@@ -765,17 +721,14 @@ export async function collapseChatSseToJson(
     }
     fn.arguments = argBufs[i] ?? ''
   }
-  // 桩判定: bash/read 且不在改名映射里。
-  // 既支持纯桩场景 (swallowStubs)，也支持混合场景 (injectedStubs.has)。
+  // 桩判定: 未在 back 映射的官方集工具一律视为注入的工具并吞噬
   const isStub = (name: string) => {
     const lower = name.toLowerCase()
-    if (!isStubToolName(name)) return false
     if (back[lower] || back[name]) return false
-    return injectedStubs.size > 0
-      ? (injectedStubs.has(lower) || injectedStubs.has(name))
-      : swallowStubs
+    return typeof name === 'string' && OFFICIAL_TOOL_NAMES.includes(name.toLowerCase())
   }
-  const shouldFilter = swallowStubs || injectedStubs.size > 0
+  // Always filter: official 12 tools are always present and should be swallowed
+  const shouldFilter = true
   // 上游跳过 index 时数组会留空洞: 先压紧, 否则 JSON.stringify 会写出 null,
   // 而空洞还会被误算成“吞掉了桩”(swallowedAny)
   const denseCalls = toolCalls.filter((tc): tc is Record<string, unknown> => Boolean(tc))
@@ -833,7 +786,7 @@ export async function collapseChatSseToJson(
  */
 function createStubSwallowingChatStream(
   back: Record<string, string> = {},
-  injectedStubs: ReadonlySet<string> = new Set(),
+  _injectedStubs: ReadonlySet<string> = new Set(),
   hadClientTools = false
 ): TransformStream<Uint8Array, Uint8Array> {
   const encoder = new TextEncoder()
@@ -871,16 +824,19 @@ function createStubSwallowingChatStream(
             const fn = (call.function ?? {}) as Record<string, unknown>
             const name = typeof fn.name === 'string' ? fn.name : ''
             const lower = name.toLowerCase()
-            const isStubCandidate = isStubToolName(name)
+            const isOfficial = typeof name === 'string' && OFFICIAL_TOOL_NAMES.includes(name.toLowerCase())
             if (idx >= 0) {
               seenIndexes.add(idx)
-              // 桩(我们注入、back 无映射) → 吞噬; 客户端改名来的 → 改回原名保留。
-              if (isStubCandidate) {
+              // 官方集工具(无 back 映射) → 吞噬; 客户端改名来的(有 back 映射) → 改回原名保留
+              if (isOfficial) {
                 if (back[lower] || back[name]) {
                   fn.name = back[lower] || back[name]
-                } else if (injectedStubs.has(lower) || injectedStubs.has(name) || !hadClientTools) {
+                } else {
                   stubIndexes.add(idx)
                 }
+              } else if (back[lower] || back[name]) {
+                // 客户端工具(已改名为 clint_*)：恢复原名
+                fn.name = back[lower] || back[name]
               }
               if (stubIndexes.has(idx)) {
                 // 整段丢掉已缓存的增量, 不能让桩露一半出去
@@ -899,11 +855,11 @@ function createStubSwallowingChatStream(
                 pendingCalls.delete(idx)
                 kept.push(...queued)
               }
-            } else if (isStubCandidate) {
-              // 无 index 的调用: 桩直接丢弃; 改名来的改回原名。
+            } else if (isOfficial) {
+              // 无 index 的调用: 官方集工具直接丢弃; 客户端改名来的改回原名。
               if (back[lower] || back[name]) {
                 fn.name = back[lower] || back[name]
-              } else if (injectedStubs.has(lower) || injectedStubs.has(name) || !hadClientTools) {
+              } else {
                 continue
               }
             }
@@ -1078,7 +1034,8 @@ async function requestUpstream(
   apiKey: string,
   options: OpenCodeRequestOptions,
   requestId: string,
-  sessionId: string
+  sessionId: string,
+  projectId: string
 ): Promise<Response> {
   // 超时只约束"等待响应头"阶段；headers 到手后立即取消计时，body 流式
   // 消费不再受硬顶限制——长回答不会在流中途被掐断（客户端侧的空闲
@@ -1094,7 +1051,10 @@ async function requestUpstream(
   )
   let response: Response
   try {
-    const headers = createRequestHeaders(apiKey, requestId, sessionId, options.subPath.endsWith('responses') ? 'responses' : 'chat')
+    const isResponses = options.subPath.endsWith('responses')
+    const isMessages = /\/messages$/.test(options.subPath)
+    const protocol = isMessages ? 'anthropic' : isResponses ? 'responses' : 'chat'
+    const headers = createRequestHeaders(apiKey, requestId, sessionId, projectId, protocol)
     if (options.modelHeader) headers.set('x-opencode-model', options.modelHeader)
     response = await fetcher(url, {
       method: options.method,
@@ -1256,34 +1216,21 @@ async function proxyOpenCodeResponses(
   chatBody: Record<string, unknown>,
   model: string
 ): Promise<Response> {
-  // 工具改名: 客户端的 Bash/Read 先改名为上游要的 bash/read, back 记录
-  // 上游名→客户端原名, 下游把模型调用改回原名。injectedStubs 是我们注入的
-  // 桩名(客户端缺对应工具时才注入), 下游据此按名吞桩 —— 混合场景下同样生效。
-  const back = mapFreeLaneClientTools(chatBody)
-  const injectedStubs = computeInjectedStubs(chatBody)
-  const responsesBody = chatBodyToResponsesBody(chatBody)
-  // Free-lane body gate (Responses 形态): 上游同样要求 stream:true 且带
-  // bash/read 工具, 缺一即 FreeTierError。
+  const chatCopy: Record<string, unknown> = JSON.parse(JSON.stringify(chatBody))
+  const shaped = reshapeTools(chatCopy, 'responses')
+  const back = shaped.back
+  const responsesBody = chatBodyToResponsesBody(chatCopy)
+  // 官方提示注入必须在翻译之后做：chat 形态没有 instructions 字段，翻译前注入
+  // 会落在 chatCopy.instructions 上被翻译层丢弃。翻译后 instructions 里是客户端
+  // 原系统提示，官方提示拼在它前面（已含官方标记时 injectResponsesPrompt 不动）。
+  injectResponsesPrompt(responsesBody, typeof chatCopy.model === 'string' ? chatCopy.model : model)
   responsesBody.stream = true
-  ensureResponsesFreeLaneShape(responsesBody)
-  // 归一化前留档原始值：改写是静默语义改写（客户端说“禁止调用工具”会被无声
-  // 放开），下游响应必须靠它显式标注，见 annotateToolChoiceDowngrade。
   const originalToolChoice = responsesBody.tool_choice
   const toolChoiceDowngraded = originalToolChoice !== undefined && originalToolChoice !== 'auto'
-  // 上游 /responses 只支持 tool_choice:"auto"，归一化被迫保留：
-  // 2026-10-16 实测（探针直连 https://opencode.ai/inference/v1，伪装 UA
-  // opencode/1.19.3 + Bearer public，muse-spark-1.3-contributor-free），
-  // tool_choice:'none' 返回 HTTP 400：
-  // {"error":{"message":"only `\"auto\"` is supported for `tool_choice`. `\"none\"`,
-  //  `\"required\"`, and named function choices are not currently supported",
-  //  "param":"tool_choice","type":"invalid_request_error"}}（'auto' 则 200）。
-  // 但静默改写会丢失客户端语义，因此下游响应必须标注降级（响应头 + 非流式 JSON
-  // 顶层字段 tool_choice_downgraded: {from, to}）。
   if (responsesBody.tool_choice !== undefined && responsesBody.tool_choice !== 'auto') {
     responsesBody.tool_choice = 'auto'
   }
-  // 客户端原本零 tools 时桩全由我们注入, 下游可据此吞噬桩工具调用。
-  const stubOnly = !Array.isArray(chatBody.tools) || chatBody.tools.length === 0
+  const hadClientTools = shaped.hadClientTools
   const clientWantsStream = chatBody.stream === true
   const response = await proxyOpenCodeUpstream({
     ...options,
@@ -1296,38 +1243,29 @@ async function proxyOpenCodeResponses(
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('text/event-stream') && response.body) {
-    // 同上：翻译后的 body 长度/编码都与上游响应头不符
     const translatedHeaders = new Headers(response.headers)
     translatedHeaders.delete('content-encoding')
     translatedHeaders.delete('content-length')
-    // 非流式客户端下面还要再把 SSE 折叠回 JSON, 由折叠那一步吞桩并补
-    // STUB_SWALLOW_NOTE(流式路径自己吞掉, 没有折叠步骤可补提示句), 所以这里
-    // 先让桩调用穿过流式翻译。
     const translated = new Response(response.body.pipeThrough(createResponsesToChatStream(
       model,
-      clientWantsStream && stubOnly,
+      clientWantsStream && !hadClientTools,
       back,
-      clientWantsStream ? injectedStubs : new Set<string>()
+      new Set<string>()
     )), {
       status: response.status,
       statusText: response.statusText,
       headers: translatedHeaders,
     })
-    // 上游被强制 stream:true; 客户端要非流式时把翻译后的 chat SSE 拼回 JSON。
-    // 降级标注：流式体是未消费的 SSE 流，只加响应头。
     if (clientWantsStream) {
       return toolChoiceDowngraded ? annotateToolChoiceDowngrade(translated, originalToolChoice) : translated
     }
-    const collapsed = await collapseChatSseToJson(translated, model, stubOnly, back, injectedStubs)
-    // 折叠也可能落 502，但降级确实发生过，照样标注（头 + JSON 顶层字段）
+    const collapsed = await collapseChatSseToJson(translated, model, !hadClientTools, back, new Set<string>())
     return toolChoiceDowngraded ? annotateToolChoiceDowngrade(collapsed, originalToolChoice) : collapsed
   }
-  // 上游可能返回 HTML/纯文本（镜像错误页）：JSON 解析失败时原样透传状态与正文，
-  // 否则异常会冒泡成网关 500 并丢掉上游真实错误
   const raw = await response.text()
   let translatedBody: string
   try {
-    translatedBody = JSON.stringify(responsesToChatBody(JSON.parse(raw) as Record<string, unknown>, stubOnly, back, injectedStubs))
+    translatedBody = JSON.stringify(responsesToChatBody(JSON.parse(raw) as Record<string, unknown>, back))
   } catch {
     return new Response(raw, {
       status: response.status,
@@ -1335,8 +1273,6 @@ async function proxyOpenCodeResponses(
       headers: { 'Content-Type': response.headers.get('content-type') || 'text/plain; charset=utf-8' },
     })
   }
-  // 直接 JSON 返回点：降级标注同样只在 toolChoiceDowngraded 时加，字段由
-  // helper 统一写入（这里不自己拼字段，避免重复/分叉）。
   const translatedResponse = new Response(translatedBody, {
     status: response.status,
     statusText: response.statusText,
@@ -1362,28 +1298,33 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     }
   }
 
-  const requestId = generateOpenCodeId('msg')
-  // 会话确定性: 客户端透传官方格式 session 则复用, 否则按首条 user 文本派生,
-  // 无文本回退随机。requestId 仍每请求随机。
-  const sessionId = resolveSessionId(options.clientSessionId, parsedBody)
+  const _requestId = generateOpenCodeId('msg')
+  // 每请求新铸会话（上游把烧痕记在会话账上；被拒过的会话会连累下一请求）
+  const sessionId = generateOpenCodeId('ses')
+  // 项目 ID 每请求随机一个（40 位 hex）：配额按 project+出口记账，写死的
+  // 'global' 是全网共用桶；同一请求的多次尝试（换 key/镜像/匿名兜底）共用同一个。
+  const projectId = randomProjectId()
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
   let lastTransportError: unknown = null
 
-  // Free-lane body gate: 上游匿名通道要求 body 同时满足 stream:true 且带
-  // bash/read 工具, 缺一即 FreeTierError。所有上游尝试(官方 key / mirror)
-  // 共用同一份 gated body。
+  // Free-lane body gate + 官方 2.x 塑形
   let upstreamOptions = options
   let clientWantsStream = true
   let gateModel = 'opencode'
-  let stubOnly = false
+  let hadClientTools = false
   let back: Record<string, string> = {}
   let injectedStubs: ReadonlySet<string> = new Set()
   if (parsedBody && Array.isArray(parsedBody.messages)) {
     const gated = applyFreeLaneGate(parsedBody)
-    upstreamOptions = { ...options, body: JSON.stringify(gated.body) }
+    // 提示注入接入 gate（先改名后注入）
+    injectChatPrompt(gated.body, typeof gated.body.model === 'string' ? gated.body.model : parsedBody.model)
+    // chat 键序 + max_completion_tokens 补全
+    ensureCompletionLimit(gated.body)
+    const chatBodyStr = encodeChatBody(gated.body)
+    upstreamOptions = { ...options, body: chatBodyStr }
     clientWantsStream = gated.clientWantsStream
-    stubOnly = gated.stubOnly
+    hadClientTools = gated.hadClientTools
     back = gated.back
     injectedStubs = gated.injectedStubs
     if (typeof parsedBody.model === 'string' && parsedBody.model) gateModel = parsedBody.model
@@ -1395,15 +1336,15 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     const contentType = response.headers.get('content-type') || ''
     const isSse = contentType.includes('text/event-stream') && !!response.body
     if (!clientWantsStream && isSse) {
-      return collapseChatSseToJson(response, gateModel, stubOnly, back, injectedStubs)
+      return collapseChatSseToJson(response, gateModel, !hadClientTools, back, new Set<string>())
     }
-    if (clientWantsStream && (injectedStubs.size > 0 || Object.keys(back).length > 0) && isSse) {
+    if (clientWantsStream && (Object.keys(back).length > 0 || !hadClientTools) && isSse) {
       // body 被重新编码过，不能再声称压缩与原长度：客户端会按 content-encoding
       // 解压已解压过的流而报错（与 storeFailure 同理）
       const headers = new Headers(response.headers)
       headers.delete('content-encoding')
       headers.delete('content-length')
-      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back, injectedStubs, stubOnly === false)), {
+      return new Response(response.body!.pipeThrough(createStubSwallowingChatStream(back, injectedStubs, hadClientTools)), {
         status: response.status,
         statusText: response.statusText,
         headers,
@@ -1413,7 +1354,8 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   }
 
   const enabledKeys = options.apiKeys.filter((entry) => entry.enabled && entry.key)
-  const officialUrl = buildUrl(normalizeOpenCodeBaseUrl(options.baseUrl), options.subPath, options.search)
+  const normalizedBase = normalizeOpenCodeBaseUrl(options.baseUrl)
+  const officialUrl = upstreamUrl(normalizedBase, options.subPath, options.search)
 
   for (const entry of enabledKeys) {
     try {
@@ -1422,8 +1364,9 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
         officialUrl,
         entry.key,
         upstreamOptions,
-        requestId,
-        sessionId
+        _requestId,
+        sessionId,
+        projectId
       )
       if (response.ok) return passthroughOk(response)
 
@@ -1440,11 +1383,12 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     try {
       const response = await requestUpstream(
         fetcher,
-        buildUrl(mirror, options.subPath, options.search),
+        upstreamUrl(mirror, options.subPath, options.search),
         'public',
         upstreamOptions,
-        requestId,
-        sessionId
+        _requestId,
+        sessionId,
+        projectId
       )
       if (response.ok) return passthroughOk(response)
       mirrorFailure = await storeFailure(response)
@@ -1467,8 +1411,9 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
         officialUrl,
         'public',
         upstreamOptions,
-        requestId,
-        sessionId
+        _requestId,
+        sessionId,
+        projectId
       )
       if (response.ok) return passthroughOk(response)
       officialFailure = await storeFailure(response)

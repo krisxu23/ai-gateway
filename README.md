@@ -24,9 +24,9 @@
 
 | 层 | 做法 |
 |---|---|
-| 请求头 | `User-Agent: opencode/1.18.31`（裸 UA，版本须 ≥ 1.18.0 否则 426；以 `src/opencode.ts` 的 `OPENCODE_VERSION` 为准）；`x-opencode-client` / `x-opencode-session` / `x-opencode-request` / `x-opencode-project`；`x-session-affinity` / `X-Session-Id`；`Authorization: Bearer public` |
-| Session | `ses_` + 12 位小写 hex（时间戳）+ 14 位 base62（官方标识符格式）；优先复用客户端透传的会话头，否则按首条 user 消息在 isolate 内缓存一个会话 ID（内存 30 分钟，**跨 isolate 不保证一致**）；request ID 用 `msg_` + 12 位 hex + 14 位 base62 |
-| Body 门禁 | 强制上游 `stream:true`；缺 `bash`/`read` 时注入桩 function tools（chat 路径在客户端无 tools 时补 `tool_choice:"none"`；responses 路径只认 `"auto"`，统一归一） |
+| 请求头 | `User-Agent: opencode/latest/2.1.4/cli`（2.x 形态，所有协议统一；1.x 通道已于 2026-10-25 退役）；`x-opencode-client` / `x-opencode-session` / `x-opencode-session-id`（两头同值）；`x-opencode-project` 每请求随机 40 位 hex；`Authorization: Bearer public` |
+| Session | `ses_` + 12 位小写 hex（时间戳）+ 14 位 base62（官方标识符格式）；每请求新铸（上游把会话的用量记在会话账上，被拒过的会话会连累后续请求，不再做对话亲和复用） |
+| Body 门禁 | 强制上游 `stream:true`；客户端工具全部改名 `clint_` 前缀发上游（响应按映射改回原名），并追加完整官方 2.x 工具集（12 个）与官方系统提示词；官方工具调用在响应侧一律吞噬；chat 补 `max_completion_tokens=32000` 并固定 JSON 键序；responses 路径只认 `"auto"`，统一归一 |
 | 非流式兼容 | 客户端 `stream:false` 时，网关把上游 SSE 拼回单个 `chat.completion` JSON |
 | Responses 家族 | `muse-*-free` 在上游只提供 Responses 接口（走 chat 会 500），网关自动改写为 `/responses` 请求并双向翻译；`max_tokens` 自动补足上游下限 16；`reasoning_effort` 默认 `low`（可用 `reasoning_effort` 覆盖 minimal/low/medium/high/xhigh） |
 
