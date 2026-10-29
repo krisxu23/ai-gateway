@@ -24,7 +24,7 @@
 
 | 层 | 做法 |
 |---|---|
-| 请求头 | `User-Agent: opencode/latest/2.1.4/cli`（2.x 形态，所有协议统一；1.x 通道已于 2026-10-25 退役）；`x-opencode-client` / `x-opencode-session` / `x-opencode-session-id`（两头同值）；`x-opencode-project` 每请求随机 40 位 hex；`Authorization: Bearer public` |
+| 请求头 | `User-Agent: opencode/latest/2.2.0/desktop`（2.x 形态，所有协议统一；1.x 通道已于 2026-10-25 退役）；`x-opencode-client` / `x-opencode-session` / `x-opencode-session-id`（两头同值）；`x-opencode-project` 每请求随机 40 位 hex；`Authorization: Bearer public` |
 | Session | `ses_` + 12 位小写 hex（时间戳）+ 14 位 base62（官方标识符格式）；每请求新铸（上游把会话的用量记在会话账上，被拒过的会话会连累后续请求，不再做对话亲和复用） |
 | Body 门禁 | 强制上游 `stream:true`；客户端工具全部改名 `clint_` 前缀发上游（响应按映射改回原名），并追加完整官方 2.x 工具集（12 个）与官方系统提示词；官方工具调用在响应侧一律吞噬；chat 补 `max_completion_tokens=32000` 并固定 JSON 键序；responses 路径只认 `"auto"`，统一归一 |
 | 非流式兼容 | 客户端 `stream:false` 时，网关把上游 SSE 拼回单个 `chat.completion` JSON |

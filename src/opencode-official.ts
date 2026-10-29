@@ -1,5 +1,5 @@
 // ============================================================================
-// OpenCode 2.1.4 官方伪装素材 + 请求塑形逻辑
+// OpenCode 2.2.0 官方伪装素材 + 请求塑形逻辑
 //
 // 本文件的「数据段」不是手写的，由 FreeX f4f0af5 的本地副本逐字嵌入生成：
 //   OPENCODE_PROMPT_V2    <- freex-f4f0af5/opencode-prompt-v2.txt
@@ -545,12 +545,15 @@ export const OFFICIAL_TOOLS_2X: Record<string, OfficialToolDefinition> = {
 // 逻辑段
 // --------------------------------------------------------------------------
 
-export const OPENCODE_VERSION = '2.1.4'
+export const OPENCODE_VERSION = '2.2.0'
 
 /** 所有协议 (chat / responses / anthropic) 统一的出站 User-Agent：
- *  channel=latest、opencode=2.1.4、client=cli；无 provider-utils、无 runtime 段。
+ *  channel=latest、opencode=2.2.0、client=desktop；无 provider-utils、无 runtime 段。
+ *  （FreeX 57c43c3：fingerprint.json 的 2.x agent 由 2.1.4/cli 变为 2.2.0/desktop；
+ *   其 provider.mjs 的 outboundHeaders 仍硬编码 cli，与 genuine-2.2.0-request.json
+ *   实测的 x-opencode-client: desktop 不一致——以实测抓包为准，取 desktop。）
  *  1.x 通道已于 2026-10-25 退役，不再按客户端工具名推断代际。 */
-export const OPENCODE_USER_AGENT: string = `opencode/latest/${OPENCODE_VERSION}/cli`
+export const OPENCODE_USER_AGENT: string = `opencode/latest/${OPENCODE_VERSION}/desktop`
 
 export interface OfficialToolDefinition {
   description: string

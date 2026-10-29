@@ -970,10 +970,10 @@ describe('2026-10 伪装升级：inference/v1 + OpenCode 1.19.3', () => {
     const h = seen[0].headers
     // 旧 /zen/v1 baseUrl 请求前改写为新端点
     expect(seen).toHaveLength(1)
-    expect(h.get('user-agent')).toBe('opencode/latest/2.1.4/cli')
+    expect(h.get('user-agent')).toBe('opencode/latest/2.2.0/desktop')
     expect(h.get('accept')).toBe('*/*')
     expect(h.get('authorization')).toBe('Bearer public')
-    expect(h.get('x-opencode-client')).toBe('cli')
+    expect(h.get('x-opencode-client')).toBe('desktop')
     // x-opencode-project is now random 40-char hex per request
     expect(h.get('x-opencode-project')).toMatch(/^[0-9a-f]{40}$/)
     expect(h.get('x-opencode-session-id')).toBe(h.get('x-opencode-session'))

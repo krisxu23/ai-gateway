@@ -22,8 +22,8 @@ export { normalizeOpenCodeBaseUrl } from './config'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
-// 所有协议 (chat / responses / anthropic) 统一的出站 User-Agent：opencode/latest/2.1.4/cli
-export const OPENCODE_VERSION = '2.1.4'
+// 所有协议 (chat / responses / anthropic) 统一的出站 User-Agent：opencode/latest/2.2.0/desktop
+export const OPENCODE_VERSION = '2.2.0'
 
 export function opencodeUserAgent(_protocol: 'chat' | 'responses' | 'anthropic' = 'chat'): string {
   return OPENCODE_USER_AGENT
@@ -334,13 +334,14 @@ function createRequestHeaders(
   protocol: 'chat' | 'responses' | 'anthropic' = 'chat'
 ): Headers {
   // 对齐 FreeX outboundHeaders：保留 Content-Type/Accept/User-Agent/x-opencode-client
+  // （client 取 genuine-2.2.0 抓包的 desktop，而非 FreeX provider.mjs 仍硬编码的 cli）
   // 及 x-opencode-session/x-opencode-session-id（两头同值）；删除 x-opencode-request；
   // x-opencode-project 每请求随机 40 位 hex（与同请求多次重试/镜像共用同一个值）。
   const headers = new Headers({
     'Content-Type': 'application/json',
     Accept: '*/*',
     'User-Agent': opencodeUserAgent(protocol),
-    'x-opencode-client': 'cli',
+    'x-opencode-client': 'desktop',
     'x-opencode-project': projectId,
     'x-opencode-session': sessionId,
     'x-opencode-session-id': sessionId,
@@ -412,7 +413,7 @@ function applyFreeLaneGate(parsed: Record<string, unknown>): {
   const shaped = reshapeTools(body, 'chat')
   const hadClientTools = shaped.hadClientTools || foldedLegacyFunctions > 0
 
-  // 客户端没带 tools 时不再自动加 tool_choice:'none'（真实 2.1.4 抓包没有该字段；
+  // 客户端没带 tools 时不再自动加 tool_choice:'none'（真实 2.2.0 抓包没有该字段；
   // 官方集总是存在，'none' 与指纹冲突）。客户端自带的值原样保留（命名函数形态
   // 已由 reshapeTools 按改名映射改写）。
 
