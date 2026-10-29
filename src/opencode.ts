@@ -42,6 +42,11 @@ interface OpenCodeRequestOptions {
   body?: string
   fetcher?: typeof fetch
   random?: () => number
+  /**
+   * 测试注入：覆盖腿内重试的全部等待（毫秒）。生产调用不传，走 FreeX 默认的
+   * 退避表；测试传 0 可避免 429 重试用例被真实等待拖慢。
+   */
+  retryWaitMsOverride?: number
   /** Responses 专用模型: 额外透传 x-opencode-model 头(内容为 zen 模型 ID) */
   modelHeader?: string
   /**
@@ -336,7 +341,8 @@ function createRequestHeaders(
   // 对齐 FreeX outboundHeaders：保留 Content-Type/Accept/User-Agent/x-opencode-client
   // （client 取 genuine-2.2.0 抓包的 desktop，而非 FreeX provider.mjs 仍硬编码的 cli）
   // 及 x-opencode-session/x-opencode-session-id（两头同值）；删除 x-opencode-request；
-  // x-opencode-project 每请求随机 40 位 hex（与同请求多次重试/镜像共用同一个值）。
+  // x-opencode-project 每请求随机 40 位 hex（同一请求的首发各腿共用；
+  // 腿内 429/传输重试时重铸，见 proxyOpenCodeUpstream 的 runLeg）。
   const headers = new Headers({
     'Content-Type': 'application/json',
     Accept: '*/*',
@@ -1284,6 +1290,81 @@ async function proxyOpenCodeResponses(
     : translatedResponse
 }
 
+// ---------------------------------------------------------------------------
+// FreeX B 类可用性行为同步（2026-10-27 重试逻辑、2026-10-28 首发/重试区分、
+// 2026-10-28 60 秒身份窗口与 Retry-After/pacing 的重评，见提交说明）。
+// 只同步“同一请求内”的行为；跨请求共享身份窗口不在此列（多租户隔离，见下）。
+// ---------------------------------------------------------------------------
+
+/** 腿内重试上限：FreeX 默认 2 次（OPENCODE_ZEN_FREE_RETRY_429 默认值）。 */
+const OPENCODE_RETRY_429_MAX = 2
+/** 首等：FreeX 默认 1200ms，之后倍增。 */
+const OPENCODE_RETRY_WAIT_FIRST_MS = 1200
+/** 倍增上限：FreeX 默认 5000ms。 */
+const OPENCODE_RETRY_WAIT_CEILING_MS = 5000
+/** Retry-After 命名窗口硬顶：FreeX 的 RETRY_WAIT_MAX_LIMIT_MS（120s）。 */
+const OPENCODE_RETRY_AFTER_MAX_MS = 120_000
+
+// FreeX 的 IP 滥用措辞判定（provider.mjs 的 isIPAbuseRefusal）：
+// “abusive traffic”类措辞，或“free models aren't available”+“from your current
+// network”成对出现，才是出口 IP 被封；单句“free models aren't available”是
+// 退役通知而非封禁。被封的出口换身份也无用，故 429 此时不重试。
+const IP_ABUSE_PATTERNS = [/abusive traffic/i, /abuse traffic/i, /abuse of traffic/i]
+const FREE_MODELS_UNAVAILABLE = /free models aren['’]t available/i
+const FROM_CURRENT_NETWORK = /from your current network/i
+
+function isIPAbuseRefusalText(text: string): boolean {
+  return (
+    IP_ABUSE_PATTERNS.some((pattern) => pattern.test(text)) ||
+    (FREE_MODELS_UNAVAILABLE.test(text) && FROM_CURRENT_NETWORK.test(text))
+  )
+}
+
+/**
+ * 解析 Retry-After 头为毫秒（FreeX retryAfterHeaderMs 的规则）：
+ * 只认整数秒（`retry-after: 30`）与 RFC 1123 日期（以星期缩写开头）两种拼写，
+ * 其他拼写（小数、单词、空串）一律返回 undefined（= 路由无意见，走退避表）；
+ * 过去的日期返回 0（路由已说“可以走”，不是无意见）。
+ */
+export function parseRetryAfterHeaderMs(value: string | null, now = Date.now()): number | undefined {
+  if (value === null) return undefined
+  const trimmed = value.trim()
+  if (trimmed === '') return undefined
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000
+  if (!/^[A-Za-z]{3},/.test(trimmed)) return undefined
+  const at = Date.parse(trimmed)
+  if (!Number.isFinite(at)) return undefined
+  return Math.max(0, at - now)
+}
+
+/**
+ * 可中断的等待：调用方断开时立即返回 false（不继续重试），否则等满返回 true。
+ * 等待本身不占 CPU；Workers 侧的等待时长受客户端/中间层超时约束，故
+ * Retry-After 的命名窗口另有 120s 硬顶（见 OPENCODE_RETRY_AFTER_MAX_MS）。
+ */
+function pauseRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false)
+  if (ms <= 0) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let done = false
+    const finish = (value: boolean) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(value)
+    }
+    const onAbort = () => finish(false)
+    const timer = setTimeout(() => finish(true), ms)
+    signal?.addEventListener('abort', onAbort)
+  })
+}
+
+type UpstreamLegOutcome =
+  | { kind: 'ok'; response: Response }
+  | { kind: 'failure'; failure: StoredFailure }
+  | { kind: 'transport'; error: unknown }
+
 async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<Response> {
   const fetcher = options.fetcher ?? fetch
   const random = options.random ?? Math.random
@@ -1303,8 +1384,12 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   // 每请求新铸会话（上游把烧痕记在会话账上；被拒过的会话会连累下一请求）
   const sessionId = generateOpenCodeId('ses')
   // 项目 ID 每请求随机一个（40 位 hex）：配额按 project+出口记账，写死的
-  // 'global' 是全网共用桶；同一请求的多次尝试（换 key/镜像/匿名兜底）共用同一个。
+  // 'global' 是全网共用桶。同一请求的首发各腿（换 key/镜像/匿名兜底）共用
+  // 这对身份；腿内重试时重铸（见 runLeg），重铸后的身份成为本请求的当前
+  // 身份、后续腿从它起步——只在本请求内流转，不跨请求共享，不破坏隔离。
   const projectId = randomProjectId()
+  let currentSessionId = sessionId
+  let currentProjectId = projectId
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
   let lastTransportError: unknown = null
@@ -1358,44 +1443,91 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
   const normalizedBase = normalizeOpenCodeBaseUrl(options.baseUrl)
   const officialUrl = upstreamUrl(normalizedBase, options.subPath, options.search)
 
-  for (const entry of enabledKeys) {
-    try {
-      const response = await requestUpstream(
-        fetcher,
-        officialUrl,
-        entry.key,
-        upstreamOptions,
-        _requestId,
-        sessionId,
-        projectId
-      )
-      if (response.ok) return passthroughOk(response)
-
-      officialFailure = await storeFailure(response)
-      // 5xx 也换下一个 Key: 单个 Key 的上游抖动/过载不该让官方线路整体放弃
-      if (response.status < 500 && response.status !== 401 && response.status !== 403 && response.status !== 429) break
-    } catch (error) {
-      lastTransportError = error
-      break
+  // 一条腿（一个 key / 一个镜像 / 匿名兜底）内的 FreeX 式重试。
+  // 首发用本请求的当前身份；只有两类失败值得在腿内重问，且重问必重铸身份：
+  //  - 429 且响应体不是 IP 滥用措辞：免费额度按 project+出口记账，FreeX
+  //    2026-10-26 实测证明同一出口换新 project 常能拿到新桶；同身份重问
+  //    只会命中同一个已烧干的桶（旧行为正是如此：换 key 不换身份）。
+  //  - 传输失败（fetch 抛错、未拿到响应）：请求根本没被记账，重问无害。
+  // 其余一律不重问：403 是指纹/IP 问题、426 是版本问题、5xx 是端点故障、
+  // 其他 4xx 是请求本身问题，换身份都不会变好；调用方断开（AbortError /
+  // clientSignal）也不重问。等待是退避表（1200ms 起、倍增、上限 5000ms），
+  // 429 响应若带 Retry-After 则该次等待改用它命名的窗口（硬顶 120s），
+  // 下一次回落退避表。等待间隔本身就是 FreeX 要求的重试 pacing：立即
+  // 连发的新身份会被上游按突发直接拒掉。
+  // 注意本函数不跨腿：换 key/换镜像/匿名兜底是换凭证/换路由的兜底链，
+  // 不是“同一请求重问”，故 403/5xx 仍按旧规则走兜底链（见各循环的注释）。
+  const runLeg = async (url: string, apiKey: string): Promise<UpstreamLegOutcome> => {
+    let wait = OPENCODE_RETRY_WAIT_FIRST_MS
+    for (let attempt = 0; ; attempt += 1) {
+      let response: Response
+      try {
+        response = await requestUpstream(
+          fetcher,
+          url,
+          apiKey,
+          upstreamOptions,
+          _requestId,
+          currentSessionId,
+          currentProjectId
+        )
+      } catch (error) {
+        // AbortError 覆盖两类：调用方断开（无意义再问），以及 requestUpstream
+        // 自身的 30s 响应头超时——后者走换腿兜底（镜像/匿名）比在原地再等
+        // 30s 更快，故也不做腿内重试。
+        if (options.clientSignal?.aborted || (error as { name?: string } | null)?.name === 'AbortError') {
+          return { kind: 'transport', error }
+        }
+        if (attempt >= OPENCODE_RETRY_429_MAX) return { kind: 'transport', error }
+        // 传输重试同样重铸：FreeX 的 attemptHeaders 对 attempts > 0 一律 rotate。
+        currentSessionId = generateOpenCodeId('ses')
+        currentProjectId = randomProjectId()
+        const waited = await pauseRetry(options.retryWaitMsOverride ?? wait, options.clientSignal)
+        wait = Math.min(wait * 2, OPENCODE_RETRY_WAIT_CEILING_MS)
+        if (!waited) return { kind: 'transport', error }
+        continue
+      }
+      if (response.ok) return { kind: 'ok', response }
+      const failure = await storeFailure(response)
+      const bodyText = new TextDecoder().decode(failure.body)
+      const retryable429 = failure.status === 429 && !isIPAbuseRefusalText(bodyText)
+      if (!retryable429 || attempt >= OPENCODE_RETRY_429_MAX) {
+        return { kind: 'failure', failure }
+      }
+      // Retry-After 只替换本次等待，不改退避表本身。
+      let hold = wait
+      const named = parseRetryAfterHeaderMs(failure.headers.get('retry-after'))
+      if (named !== undefined) hold = Math.min(named, OPENCODE_RETRY_AFTER_MAX_MS)
+      currentSessionId = generateOpenCodeId('ses')
+      currentProjectId = randomProjectId()
+      const waited = await pauseRetry(options.retryWaitMsOverride ?? hold, options.clientSignal)
+      wait = Math.min(wait * 2, OPENCODE_RETRY_WAIT_CEILING_MS)
+      if (!waited) return { kind: 'failure', failure }
     }
   }
 
-  for (const mirror of getMirrorOrder(options.mirrorUrls, random)) {
-    try {
-      const response = await requestUpstream(
-        fetcher,
-        upstreamUrl(mirror, options.subPath, options.search),
-        'public',
-        upstreamOptions,
-        _requestId,
-        sessionId,
-        projectId
-      )
-      if (response.ok) return passthroughOk(response)
-      mirrorFailure = await storeFailure(response)
-    } catch (error) {
-      lastTransportError = error
+  for (const entry of enabledKeys) {
+    const outcome = await runLeg(officialUrl, entry.key)
+    if (outcome.kind === 'ok') return passthroughOk(outcome.response)
+    if (outcome.kind === 'transport') {
+      lastTransportError = outcome.error
+      break
     }
+    officialFailure = outcome.failure
+    // 5xx 也换下一个 Key: 单个 Key 的上游抖动/过载不该让官方线路整体放弃。
+    // 这是换凭证的兜底链，不是腿内重试：上面 runLeg 已保证 403/426/5xx
+    // 不在同一腿内换身份重问。
+    if (outcome.failure.status < 500 && outcome.failure.status !== 401 && outcome.failure.status !== 403 && outcome.failure.status !== 429) break
+  }
+
+  for (const mirror of getMirrorOrder(options.mirrorUrls, random)) {
+    const outcome = await runLeg(upstreamUrl(mirror, options.subPath, options.search), 'public')
+    if (outcome.kind === 'ok') return passthroughOk(outcome.response)
+    if (outcome.kind === 'transport') {
+      lastTransportError = outcome.error
+      continue
+    }
+    mirrorFailure = outcome.failure
   }
 
   // 兜底：官方匿名额度。当“没有配置任何 Key”时（全新部署），官方带 Key 的
@@ -1406,20 +1538,12 @@ async function proxyOpenCodeUpstream(options: OpenCodeRequestOptions): Promise<R
     enabledKeys.length === 0 ||
     ((officialFailure?.status === 401 || officialFailure?.status === 403) && !mirrorFailure)
   if (shouldTryAnonymous) {
-    try {
-      const response = await requestUpstream(
-        fetcher,
-        officialUrl,
-        'public',
-        upstreamOptions,
-        _requestId,
-        sessionId,
-        projectId
-      )
-      if (response.ok) return passthroughOk(response)
-      officialFailure = await storeFailure(response)
-    } catch (error) {
-      lastTransportError = error
+    const outcome = await runLeg(officialUrl, 'public')
+    if (outcome.kind === 'ok') return passthroughOk(outcome.response)
+    if (outcome.kind === 'transport') {
+      lastTransportError = outcome.error
+    } else {
+      officialFailure = outcome.failure
     }
   }
 

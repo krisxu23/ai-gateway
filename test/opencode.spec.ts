@@ -10,6 +10,7 @@ import {
   resolveSessionId,
   collapseChatSseToJson,
   createKeepAliveStream,
+  parseRetryAfterHeaderMs,
 } from '../src/opencode'
 import { createResponsesToChatStream } from '../src/opencode-responses'
 
@@ -296,6 +297,8 @@ describe('proxyOpenCodeRequest: chat 路径', () => {
       body: JSON.stringify({ model: 'mimo-free', messages: [{ role: 'user', content: 'hi' }] }),
       mirrorUrls: ['https://mirror.example.com/zen/v1'],
       random: () => 0,
+      // 镜像 429 现在会腿内重试（2 次）：等待覆盖为 0，否则本用例被真实退避拖慢
+      retryWaitMsOverride: 0,
       fetcher: fetcher as typeof fetch,
     })
     // 官方线路先失败、镜像随后失败、无 Key 时官方匿名兜底最后失败：回放的是最后
@@ -1332,5 +1335,161 @@ describe('collapseChatSseToJson: 缺少完成标记', () => {
     const res = await collapseChatSseToJson(sseResponse([chunk('ok'), 'data: [DONE]\n\n']), 'm', false)
     expect(res.status).toBe(200)
     expect(await contentOf(res)).toBe('ok')
+  })
+})
+
+// FreeX B 类重试行为同步（2026-10-27/28/29 重评）：腿内重试只认 429（非 IP
+// 滥用措辞）与传输失败，重问必重铸身份；403/426/5xx 与调用方断开不重问。
+describe('proxyOpenCodeRequest: 腿内重试（FreeX B 类同步）', () => {
+  const chatBody = () => JSON.stringify({ model: 'mimo-free', messages: [{ role: 'user', content: 'hi' }] })
+  const base = {
+    baseUrl: 'https://opencode.example.com/zen/v1',
+    method: 'POST',
+    subPath: 'chat/completions',
+    mirrorUrls: [] as string[],
+    retryWaitMsOverride: 0,
+  }
+
+  it('429 后换新身份重问并成功：两次请求的 ses/project 均不同', async () => {
+    const seen: Array<{ session: string | null; project: string | null }> = []
+    let n = 0
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      const h = init?.headers as Headers
+      seen.push({ session: h.get('x-opencode-session'), project: h.get('x-opencode-project') })
+      n += 1
+      if (n === 1) return new Response('{"error":{"message":"FreeUsageLimitError"}}', { status: 429 })
+      return sseResponse([chunk('recovered'), 'data: [DONE]\n\n'])
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.ok).toBe(true)
+    expect(seen).toHaveLength(2)
+    expect(seen[0].session).not.toBe(seen[1].session)
+    expect(seen[0].project).not.toBe(seen[1].project)
+    expect(seen[1].session).toMatch(/^ses_/)
+    expect(seen[1].project).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  it('429 耗尽重试（2 次）后返回最后一次 429，不无限重问', async () => {
+    let n = 0
+    const fetcher = async () => {
+      n += 1
+      return new Response('{"error":{"message":"FreeUsageLimitError"}}', { status: 429 })
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(429)
+    // 首发 + 2 次重试 = 3 次；无镜像、无匿名（有 key 且非 401/403）
+    expect(n).toBe(3)
+  })
+
+  it('429 带 IP 滥用措辞时不重试：换身份也救不了被封的出口', async () => {
+    let n = 0
+    const fetcher = async () => {
+      n += 1
+      return new Response('{"error":{"message":"abusive traffic from this network"}}', { status: 429 })
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(429)
+    // 无 key：只有匿名腿 1 次，无腿内重试
+    expect(n).toBe(1)
+  })
+
+  it('403 不在腿内重试，但仍走匿名兜底链（换凭证≠重问）', async () => {
+    const urls: string[] = []
+    const fetcher = async (url: string | URL) => {
+      urls.push(String(url))
+      return new Response('{"error":{"message":"FreeTierError"}}', {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(403)
+    // 带 key 腿 1 次 + 匿名腿 1 次；若腿内重试，次数会是 3/6 次
+    expect(urls).toHaveLength(2)
+  })
+
+  it('传输失败（fetch 抛错）后换新身份重问并成功', async () => {
+    const sessions: Array<string | null> = []
+    let n = 0
+    const fetcher = async (_url: string | URL, init?: RequestInit) => {
+      sessions.push((init?.headers as Headers).get('x-opencode-session'))
+      n += 1
+      if (n === 1) throw new TypeError('fetch failed')
+      return sseResponse([chunk('back'), 'data: [DONE]\n\n'])
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.ok).toBe(true)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[0]).not.toBe(sessions[1])
+  })
+
+  it('调用方断开（AbortError）不重试', async () => {
+    let n = 0
+    const fetcher = async () => {
+      n += 1
+      throw new DOMException('aborted', 'AbortError')
+    }
+    const controller = new AbortController()
+    controller.abort()
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      clientSignal: controller.signal,
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.status).toBe(502)
+    expect(n).toBe(1)
+  })
+
+  it('429 带 Retry-After 头时重试链路不受影响（等待本身由覆盖归零）', async () => {
+    let n = 0
+    const fetcher = async () => {
+      n += 1
+      if (n === 1) {
+        return new Response('{"error":{"message":"FreeUsageLimitError"}}', {
+          status: 429,
+          headers: { 'Retry-After': '30' },
+        })
+      }
+      return sseResponse([chunk('after-wait'), 'data: [DONE]\n\n'])
+    }
+    const res = await proxyOpenCodeRequest({
+      ...base, body: chatBody(), apiKeys: [{ key: 'sk-real', enabled: true }],
+      fetcher: fetcher as typeof fetch,
+    })
+    expect(res.ok).toBe(true)
+    expect(n).toBe(2)
+  })
+})
+
+describe('parseRetryAfterHeaderMs（FreeX retryAfterHeaderMs 规则）', () => {
+  it('整数秒 → 毫秒', () => {
+    expect(parseRetryAfterHeaderMs('30')).toBe(30000)
+    expect(parseRetryAfterHeaderMs(' 0 ')).toBe(0)
+  })
+  it('RFC 1123 日期 → 与 now 的差值；过去日期 → 0', () => {
+    const now = Date.parse('Wed, 01 Jan 2025 00:00:00 GMT')
+    expect(parseRetryAfterHeaderMs('Wed, 01 Jan 2025 00:01:00 GMT', now)).toBe(60000)
+    expect(parseRetryAfterHeaderMs('Tue, 31 Dec 2024 23:59:00 GMT', now)).toBe(0)
+  })
+  it('小数、单词、空串、无头一律无意见', () => {
+    expect(parseRetryAfterHeaderMs('1.5')).toBeUndefined()
+    expect(parseRetryAfterHeaderMs('soon')).toBeUndefined()
+    expect(parseRetryAfterHeaderMs('')).toBeUndefined()
+    expect(parseRetryAfterHeaderMs(null)).toBeUndefined()
   })
 })
